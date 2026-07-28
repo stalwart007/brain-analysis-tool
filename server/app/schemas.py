@@ -231,7 +231,20 @@ class TwinReaction(BaseModel):
 class SwarmAggregate(BaseModel):
     run_id: str
     scenario_preview: str
+    #: Twins whose reaction was actually USABLE. This is a survivor count, and
+    #: for a long time it was the only count reported — so a run where 180 of
+    #: 200 twins hit a 429 persisted as `twin_count: 20` and was byte-identical
+    #: to a healthy 20-twin run, including in the calibration report. Read it
+    #: together with `twins_requested` and `twins_failed`.
     twin_count: int
+    twins_requested: Optional[int] = Field(
+        default=None,
+        description="Twin calls dispatched. None on runs recorded before this was tracked.",
+    )
+    twins_failed: Optional[int] = Field(
+        default=None,
+        description="Twin calls that errored or returned unusable output.",
+    )
     cognitive_load: str
     mean_engagement: float
     mean_intent: float

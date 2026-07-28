@@ -136,7 +136,14 @@ export interface CognitionProfile {
 export interface SwarmAggregate {
   run_id: string;
   scenario_preview: string;
+  /** Twins whose reaction was USABLE — a survivor count. Always read it with
+   *  twins_requested/twins_failed: a run where most twins errored otherwise
+   *  looks identical to a healthy run of the smaller size. */
   twin_count: number;
+  /** Twin calls dispatched. Absent on runs recorded before this was tracked. */
+  twins_requested?: number | null;
+  /** Twin calls that errored or returned unusable output. */
+  twins_failed?: number | null;
   cognitive_load: string;
   mean_engagement: number;
   mean_intent: number;

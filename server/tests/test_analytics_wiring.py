@@ -176,3 +176,48 @@ def test_objection_theme_map_positions_are_semantic():
     assert dist > 0.5
     price_theme = next(t for t in result.theme_map if t["count"] == 2 and t["dealbreaker"])
     assert "expens" in price_theme["label"].lower() or "price" in price_theme["label"].lower()
+
+
+def test_aggregate_reports_the_shortfall_not_just_the_survivors():
+    """A run where 180 of 200 twins hit a 429 used to persist as
+    `twin_count: 20`, byte-identical to a healthy 20-twin run — including in
+    the calibration report. Every interval is computed over the survivors, so
+    the reader has to be told that is what they are looking at.
+    """
+    from app.schemas import TwinReaction
+    from app.swarm import aggregate_reactions
+
+    survivors = [
+        TwinReaction(
+            engagement=0.5,
+            intent_score=0.5,
+            action="continue",
+            dropoff_point=None,
+            friction_notes="none",
+            inner_monologue="fine",
+        )
+        for _ in range(20)
+    ]
+    agg = aggregate_reactions(survivors, "stimulus", "low", requested=200)
+    assert agg.twin_count == 20
+    assert agg.twins_requested == 200
+    assert agg.twins_failed == 180
+
+
+def test_a_healthy_run_reports_no_failures():
+    from app.schemas import TwinReaction
+    from app.swarm import aggregate_reactions
+
+    reactions = [
+        TwinReaction(
+            engagement=0.5,
+            intent_score=0.5,
+            action="continue",
+            dropoff_point=None,
+            friction_notes="none",
+            inner_monologue="fine",
+        )
+        for _ in range(12)
+    ]
+    agg = aggregate_reactions(reactions, "stimulus", "low", requested=12)
+    assert agg.twins_failed == 0 and agg.twins_requested == 12

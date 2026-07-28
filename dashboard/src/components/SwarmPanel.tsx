@@ -214,6 +214,19 @@ export default function SwarmPanel({
               <p className="max-w-44 text-xs text-muted">
                 {result.twin_count} twins · load {result.cognitive_load}
               </p>
+              {/* A silent shortfall is the whole bug: every mean and interval
+                  above is computed over the survivors, and a non-random
+                  subsample is not the sample the reader thinks they are
+                  looking at. Say so where the numbers are. */}
+              {!!result.twins_failed && (
+                <p
+                  className="max-w-44 text-xs text-critical"
+                  title="These twins errored or returned unusable output. The statistics above are computed over the survivors only."
+                >
+                  {result.twins_failed} of {result.twins_requested} failed —
+                  figures cover survivors
+                </p>
+              )}
             </div>
 
             <div className="min-h-44">

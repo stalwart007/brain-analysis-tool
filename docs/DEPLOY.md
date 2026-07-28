@@ -43,16 +43,13 @@ The dashboard has no such constraint and scales horizontally.
      volume /data     SQLite + WAL
 ```
 
-**The backend must not have a public address.** Two reasons, one of them
-active:
-
-1. The analysis surface exposes run history containing every twin's inner
-   monologue, and every endpoint that spends OpenAI credit.
-2. It currently has an **unauthenticated persona-eviction path** (200 ingests
-   push every profiled session out of the load window, and every study endpoint
-   then 400s) and **no tenant isolation at all** — `site_id` is written and
-   never read. Both are open. Keeping the backend private is what contains them
-   until they are fixed.
+**The backend must not have a public address.** The analysis surface exposes
+run history containing every twin's inner monologue, panel membership, and
+every endpoint that spends OpenAI credit. Tenant isolation and the
+persona-eviction path are now fixed, so this is defence in depth rather than
+the only thing standing between a tenant's data and the internet — but it is
+free, and it means the next hole found in that surface is not remotely
+reachable while it is being fixed.
 
 Telemetry still reaches it: the SDK posts to the dashboard's public
 `/api/ingest`, which forwards only that one path and injects no API key.
