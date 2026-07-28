@@ -407,6 +407,12 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
   const stage = useRef<HTMLElement | null>(null);
   const group = useRef<THREE.Group>(null);
   const spin = useRef(0);
+  /* The UNWARPED angle. `spin` holds the rotation actually applied, which the
+     interior stations read to carry their look targets through the brain's
+     pose; this is the linear phase that drives it. Kept as an accumulator
+     rather than derived from the clock so that leaving the hero and returning
+     resumes where it stopped instead of snapping to wherever time had got to. */
+  const phase = useRef(0);
 
   useEffect(() => {
     if (lastKey.current === stationKey) return;
@@ -463,27 +469,33 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
     // the recognisable three-quarter view, and staying within about ±35° of it
     // keeps the anatomy readable at every instant.
     //
-    // A TRIANGLE, not a sine. What made the old revolution feel alive was not
-    // its speed — 0.055 rad/s is slow — but that the speed was CONSTANT. A
-    // sine spends its time near the turnarounds, where angular velocity goes
-    // to zero: at a readable amplitude that parks the organ for about six
-    // seconds at each end, which reads as frozen. (Summing two sines is worse,
-    // not better — the cosine terms cancel and add dead moments: measured 20%
-    // of the time under 0.01 rad/s versus 16% for a single sine.)
+    // A FULL revolution, at a non-uniform rate.
     //
-    // `asin(sin(x))·2/π` is a triangle wave: constant |velocity| throughout,
-    // reversing only at the ends. Measured over ten minutes at these
-    // constants — peak yaw 31.5°, mean rate 0.063 rad/s (faster than the
-    // revolution it replaces), longest interval below 0.02 rad/s just 0.02s,
-    // i.e. the reversal itself and nothing more.
+    // Two things have to hold at once. It must actually go round — a bounded
+    // sway reads as a fidget, not an organ turning. And it must look like a
+    // brain throughout, which a constant revolution does not: yaw ±90° is the
+    // anterior/posterior face, where the hemispheres are symmetric to the
+    // viewer and the frontal pole, temporal lobe and cerebellum are all
+    // edge-on. At a constant rate a third of every turn is spent there.
     //
-    // The 15% sine blended in rounds that reversal so it eases rather than
-    // bouncing; it costs nothing in envelope, since both terms peak together.
+    // So the phase advances linearly and the ANGLE is warped:
+    //
+    //     yaw = φ − k·sin(2φ)      dyaw/dφ = 1 − 2k·cos(2φ)
+    //
+    // which is slowest at φ = 0 and π (the lateral profiles, where it should
+    // linger) and fastest at ±π/2 (the faces, which it should get past).
+    // Strictly increasing while 2k < 1, so it is a real revolution that never
+    // reverses and never parks.
+    //
+    // Measured over a full turn at these constants: 60s per revolution
+    // (against the old 114s), angular rate 0.038–0.172 rad/s, and within 55°
+    // of a lateral profile for 75% of the turn — up from 61% at a constant
+    // rate. `phase` accumulates rather than reading the clock so that
+    // returning from an interior station resumes instead of snapping.
     const s = station;
     if (s.inside === 0) {
-      const phase = t * 0.18;
-      const triangle = Math.asin(Math.sin(phase)) * (2 / Math.PI);
-      spin.current = (triangle * 0.85 + Math.sin(phase) * 0.15) * 0.55;
+      phase.current += dt * 0.105;
+      spin.current = phase.current - 0.32 * Math.sin(2 * phase.current);
     }
     if (group.current) group.current.rotation.y = spin.current;
 
