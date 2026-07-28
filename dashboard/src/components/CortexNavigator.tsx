@@ -448,10 +448,24 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
     axonMat.uniforms.uWellAmt.value = wellAmt;
     sparkMat.uniforms.uWellAmt.value = wellAmt;
 
-    // The brain spins in place while the camera holds a designed frame; an
+    // The brain turns in place while the camera holds a designed frame; an
     // orbiting camera slowly dragged the composition out of alignment.
+    //
+    // It SWAYS rather than revolves. A continuous 360° yaw spends about a
+    // third of every two-minute revolution presenting the anterior and
+    // posterior faces, where the hemispheres are symmetric to the viewer, the
+    // silhouette is a wide rounded lobe and the depth cues that make it
+    // legible — frontal pole, temporal lobe, cerebellum, brainstem — all
+    // disappear. Held there for thirty seconds at a time it stops reading as a
+    // brain and starts reading as a flattened blob.
+    //
+    // The designed camera already looks along the lateral axis, so yaw 0 is
+    // the recognisable three-quarter view. Swaying ±0.55 rad (~31°) around it
+    // keeps the anatomy readable at every instant while still being visibly
+    // alive, and it is one continuous function of the shared clock rather than
+    // a second animation with its own state.
     const s = station;
-    if (s.inside === 0) spin.current += dt * 0.055;
+    if (s.inside === 0) spin.current = Math.sin(t * 0.075) * 0.55;
     if (group.current) group.current.rotation.y = spin.current;
 
     if (s.inside === 0) {
