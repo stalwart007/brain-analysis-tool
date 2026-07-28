@@ -8,11 +8,20 @@ Design stance (deliberate, documented):
   it is not a clinical or individual claim.
 """
 
+import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- ingest
+
+# The zone vocabulary is the whole "whitelist-only" architectural claim, and it
+# was never actually enforced server-side. Lowercase alnum with dashes and
+# underscores admits every zone the SDK ships with (hero, pricing-table, cta,
+# checkout, content) and excludes the two things that made this a hole: an
+# email address or other identifier used as a zone name, and a sentence of
+# prose aimed at the model that reads the metrics block.
+_ZONE_KEY = re.compile(r"[a-z0-9_-]{1,32}")
 
 
 class FeaturePayload(BaseModel):
@@ -27,19 +36,57 @@ class FeaturePayload(BaseModel):
     rage_click_bursts: int = 0
     click_count: int = 0
     backtrack_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    zone_dwell_ms: dict[str, float] = Field(default_factory=dict)
-    zone_click_counts: dict[str, int] = Field(default_factory=dict)
-    # cognitive-modeling series (optional; older SDKs don't send them)
+
+    # Zone names are AUTHOR-SUPPLIED strings that travel a long way: they are
+    # json.dumps'd into the Layer-4 analyst prompt, and the analyst's output is
+    # interpolated verbatim into every twin's *system* message. `/v1/ingest`
+    # needs no API key, so without a key pattern this is an unauthenticated
+    # path from a `data-cs` attribute on any page to instructions inside every
+    # simulation — and a PII channel, since `data-cs="user-alice@corp.com"` was
+    # equally acceptable. The pattern is the trust boundary; `_ZONE_KEY` is
+    # enforced by the validator below.
+    zone_dwell_ms: dict[str, float] = Field(default_factory=dict, max_length=64)
+    zone_click_counts: dict[str, int] = Field(default_factory=dict, max_length=64)
+
+    # cognitive-modeling series (optional; older SDKs don't send them).
+    #
+    # Bounded because this is the only unauthenticated write endpoint in the
+    # product. A 10-second segment at the SDK's own sampling rates produces a
+    # few hundred points; these ceilings are an order of magnitude above any
+    # honest client and stop a single POST from being a memory amplifier.
     event_stream: list[list[float]] = Field(
         default_factory=list,
+        max_length=20_000,
         description="[[t_ms, symbol_id]] symbolic event stream; alphabet matches cognition.EVENT_SYMBOLS",
     )
     velocity_series: list[list[float]] = Field(
-        default_factory=list, description="[[t_ms, velocity]] scroll kinematics"
+        default_factory=list,
+        max_length=20_000,
+        description="[[t_ms, velocity]] scroll kinematics",
     )
     decision_latencies_ms: list[float] = Field(
-        default_factory=list, description="quiet-period → click decision latencies"
+        default_factory=list,
+        max_length=5_000,
+        description="quiet-period → click decision latencies",
     )
+
+    @field_validator("zone_dwell_ms", "zone_click_counts")
+    @classmethod
+    def _reject_unsafe_zone_keys(cls, v: dict) -> dict:
+        """Zone names must look like zone names.
+
+        Rejecting rather than sanitising: a payload with a key that does not
+        match is not a slightly-wrong payload from an honest SDK, it is either
+        a misconfigured integration or an injection attempt, and both deserve
+        a 422 rather than silent partial acceptance.
+        """
+        bad = [k for k in v if not _ZONE_KEY.fullmatch(k)]
+        if bad:
+            raise ValueError(
+                "zone names must match [a-z0-9_-]{1,32} (lowercase); "
+                f"rejected: {bad[:5]!r}"
+            )
+        return v
 
 
 class IngestEnvelope(BaseModel):

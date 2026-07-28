@@ -178,6 +178,30 @@ def list_sessions(limit: int = 200) -> list[dict[str, Any]]:
     return [_hydrate(r) for r in rows]
 
 
+def list_profiled_sessions(limit: int = 200) -> list[dict[str, Any]]:
+    """Sessions that actually carry a persona, filtered IN SQL.
+
+    The caller used to take the newest `limit` rows and filter for a persona in
+    Python, which made the persona pool an unauthenticated denial of service:
+    `POST /v1/ingest` needs no API key, so 200 empty segments pushed every
+    profiled session out of the window and every swarm, compare, walk and study
+    endpoint began answering `400 No profiled personas available`. Cost to the
+    attacker: 200 HTTP requests.
+
+    Filtering in SQL also fixes a quieter bug — past 200 sessions the default
+    audience was "whichever profiled sessions happen to be in the newest 200",
+    so the same scenario run a day apart silently ran against a different set
+    of personas with nothing in the stored result recording which.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM sessions WHERE persona IS NOT NULL "
+            "ORDER BY received_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_hydrate(r) for r in rows]
+
+
 def set_signal(session_id: str, signal: dict[str, Any]) -> None:
     with _conn() as c:
         c.execute("UPDATE sessions SET signal = ? WHERE id = ?", (json.dumps(signal), session_id))

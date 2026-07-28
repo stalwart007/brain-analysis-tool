@@ -343,7 +343,11 @@ def _load_personas(session_ids: list[str]) -> list[PersonaSeed]:
     candidates = (
         [storage.get_session(sid) for sid in session_ids]
         if session_ids
-        else storage.list_sessions()
+        # Filtered in SQL, not in Python after a LIMIT — see the note on
+        # list_profiled_sessions. Taking the newest 200 rows and *then* looking
+        # for personas meant 200 unauthenticated ingests disabled every study
+        # endpoint in the product.
+        else storage.list_profiled_sessions()
     )
     personas = [
         PersonaSeed(**s["persona"])
