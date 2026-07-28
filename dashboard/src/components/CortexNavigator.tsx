@@ -460,12 +460,31 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
     // brain and starts reading as a flattened blob.
     //
     // The designed camera already looks along the lateral axis, so yaw 0 is
-    // the recognisable three-quarter view. Swaying ±0.55 rad (~31°) around it
-    // keeps the anatomy readable at every instant while still being visibly
-    // alive, and it is one continuous function of the shared clock rather than
-    // a second animation with its own state.
+    // the recognisable three-quarter view, and staying within about ±35° of it
+    // keeps the anatomy readable at every instant.
+    //
+    // A TRIANGLE, not a sine. What made the old revolution feel alive was not
+    // its speed — 0.055 rad/s is slow — but that the speed was CONSTANT. A
+    // sine spends its time near the turnarounds, where angular velocity goes
+    // to zero: at a readable amplitude that parks the organ for about six
+    // seconds at each end, which reads as frozen. (Summing two sines is worse,
+    // not better — the cosine terms cancel and add dead moments: measured 20%
+    // of the time under 0.01 rad/s versus 16% for a single sine.)
+    //
+    // `asin(sin(x))·2/π` is a triangle wave: constant |velocity| throughout,
+    // reversing only at the ends. Measured over ten minutes at these
+    // constants — peak yaw 31.5°, mean rate 0.063 rad/s (faster than the
+    // revolution it replaces), longest interval below 0.02 rad/s just 0.02s,
+    // i.e. the reversal itself and nothing more.
+    //
+    // The 15% sine blended in rounds that reversal so it eases rather than
+    // bouncing; it costs nothing in envelope, since both terms peak together.
     const s = station;
-    if (s.inside === 0) spin.current = Math.sin(t * 0.075) * 0.55;
+    if (s.inside === 0) {
+      const phase = t * 0.18;
+      const triangle = Math.asin(Math.sin(phase)) * (2 / Math.PI);
+      spin.current = (triangle * 0.85 + Math.sin(phase) * 0.15) * 0.55;
+    }
     if (group.current) group.current.rotation.y = spin.current;
 
     if (s.inside === 0) {
