@@ -121,6 +121,9 @@ Expect roughly $10/mo: two shared-cpu-1x machines and a 3 GB volume.
 | `COGNISWARM_ALLOWED_ORIGINS` | customer origins that may POST telemetry, comma separated, scheme included. **Empty means the SDK silently drops everything** — see below |
 | `COGNISWARM_DB` | set to `/data/cogniswarm.db`. Defaults into the repo tree, which in a container is an ephemeral image layer |
 | `COGNISWARM_CONCURRENCY` | max concurrent twin calls, default 8 |
+| `COGNISWARM_MAX_TWINS_PER_RUN` | hard per-request fan-out ceiling, default 2000. A request over it is refused (413) with the computed number |
+| `COGNISWARM_INGEST_RATE_LIMIT` | segments per window per (site, client), default 120 |
+| `COGNISWARM_INGEST_RATE_WINDOW_S` | rate-limit window, default 60 |
 
 ### Dashboard
 
@@ -182,9 +185,13 @@ Origins match exactly: `https://acme.com` does not cover `https://www.acme.com`.
 
 Not blockers for a demo or early customers, but know them:
 
-- **No per-run cost ceiling.** Worst case from one request: 200 personas × 20
-  twins × 8 variants = 32,000 twin calls. Set a hard spend limit in your OpenAI
-  billing settings — that is currently the only backstop.
+- **Rate limiting is in-process and best-effort.** It is a backstop against a
+  script, not a defence against a distributed flood — that belongs at the edge.
+  Because the backend sits behind the dashboard passthrough, the socket peer is
+  the proxy for every request, so `X-Forwarded-For` is what distinguishes
+  callers and it is spoofable. The per-site half of the key still holds.
+- **Still set an OpenAI spend limit.** `COGNISWARM_MAX_TWINS_PER_RUN` bounds a
+  single request; it does not bound many requests.
 - **Anonymous mode is unscoped.** `COGNISWARM_ALLOW_ANONYMOUS=1` has no key to
   carry a tenant, so it sees everything. Correct for local development and
   single-tenant servers; never set it on a shared deployment.

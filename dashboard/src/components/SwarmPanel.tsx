@@ -88,7 +88,7 @@ export default function SwarmPanel({
   return (
     <div className="card flex h-full flex-col p-6">
       <div className="mb-4 flex items-baseline justify-between">
-        <h2 className="font-display text-lg font-medium tracking-tight">Run a swarm</h2>
+        <h2 className="font-display text-lg font-medium tracking-tight">Forecast response</h2>
         <span className="text-xs text-muted">
           {personaCount} persona{personaCount === 1 ? "" : "s"} seeded
         </span>
@@ -185,7 +185,7 @@ export default function SwarmPanel({
           onClick={run}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >
-          {busy ? "Simulating…" : "Run swarm"}
+          {busy ? "Forecasting…" : "Forecast response"}
         </motion.button>
       </div>
 

@@ -7,6 +7,9 @@ is ever refactored away.
 
 from __future__ import annotations
 
+import json
+import time
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -378,3 +381,95 @@ def test_one_unreadable_persona_does_not_disable_every_study():
     personas = _load_personas([], Caller(site_id="resil"))
     assert len(personas) == 1
     assert personas[0].persona_id == good["persona_id"]
+
+
+# ── capability tokens and path PII ────────────────────────────────────────
+
+
+def test_member_listing_does_not_hand_out_capability_urls():
+    """The listing stripped `token` from the dict and then rebuilt the full
+    capability URL from that same token one expression later, under a comment
+    saying tokens must not leak. That URL IS the capability — anyone holding it
+    can consent or revoke on the member's behalf.
+    """
+    created = client.post("/v1/panel/members", json={"label": "member-1"}).json()
+    token = created["token"]
+    assert created["disclosure_url"].endswith(token)  # once, at creation, on purpose
+
+    listed = client.get("/v1/panel/members").json()
+    blob = json.dumps(listed)
+    assert token not in blob, "a capability token leaked through the listing"
+    assert "disclosure_url" not in blob
+    assert any(m["token_hint"] == token[-4:] for m in listed)
+
+
+def test_identifier_path_segments_are_templated_before_storage():
+    """The SDK sends location.pathname, so the exposure is the PATH, not the
+    query — and paths routinely carry the identifiers the architecture promises
+    never to collect. A reset token in a telemetry table is a live credential.
+    """
+    from app.main import template_path
+
+    assert template_path("/invoice/8817") == "/invoice/:id"
+    assert template_path("/u/8f3a9c2b4d5e6f70") == "/u/:id"
+    assert (
+        template_path("/reset/550e8400-e29b-41d4-a716-446655440000") == "/reset/:id"
+    )
+    # and the parts the product actually groups by must survive intact
+    assert template_path("/pricing") == "/pricing"
+    assert template_path("/docs/getting-started") == "/docs/getting-started"
+
+
+def test_ingest_stores_the_templated_path():
+    from app import storage
+
+    r = client.post("/v1/ingest", json=_segment(page_path="/invoice/99321"))
+    assert r.status_code == 202
+    sid = r.json()["session_id"]
+    assert storage.get_session(sid)["page_path"] == "/invoice/:id"
+
+
+# ── ingest rate limiting ──────────────────────────────────────────────────
+
+
+def test_ingest_is_rate_limited_per_site_and_client(monkeypatch):
+    """The only endpoint that accepts writes without a key. Every accepted
+    segment is a row, and rows are what the persona window and the storage
+    volume are made of."""
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module, "_ingest_limiter", main_module._IngestLimiter(3, 60.0))
+
+    codes = [
+        client.post("/v1/ingest", json=_segment(site_id="rl-site")).status_code
+        for _ in range(5)
+    ]
+    assert codes[:3] == [202, 202, 202]
+    assert codes[3:] == [429, 429]
+
+
+def test_one_noisy_site_does_not_starve_another(monkeypatch):
+    """Keyed per (site, client), so a single misbehaving integration cannot
+    take another tenant's telemetry down with it."""
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module, "_ingest_limiter", main_module._IngestLimiter(2, 60.0))
+
+    for _ in range(3):
+        client.post("/v1/ingest", json=_segment(site_id="noisy"))
+    assert client.post("/v1/ingest", json=_segment(site_id="noisy")).status_code == 429
+    assert client.post("/v1/ingest", json=_segment(site_id="quiet")).status_code == 202
+
+
+def test_the_limiter_does_not_grow_without_bound(monkeypatch):
+    """A rotating source must not be able to grow the key table forever."""
+    from app import main as main_module
+
+    limiter = main_module._IngestLimiter(5, 0.01)
+    for i in range(50):
+        limiter.allow(f"site-{i}", "1.2.3.4")
+    time.sleep(0.05)
+    # a later call sweeps stale keys as it touches them
+    for i in range(50):
+        limiter.allow(f"site-{i}", "1.2.3.4")
+    assert all(len(v) <= 5 for v in limiter._hits.values())

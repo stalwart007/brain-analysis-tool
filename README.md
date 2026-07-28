@@ -59,7 +59,7 @@ Then:
    **Profile** one (OpenAI turns the feature vector into a behavioral segment +
    persona seed).
 3. Paste a scenario (ad copy, transcript, UI flow description), pick a
-   cognitive load, **Run swarm** → aggregated engagement/intent/drop-off/friction.
+   cognitive load, **Forecast response** → aggregated engagement/intent/drop-off/friction.
 
 Tests: `cd server && pytest` (no API key needed — LLM calls aren't exercised).
 

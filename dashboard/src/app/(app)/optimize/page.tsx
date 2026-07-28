@@ -52,7 +52,7 @@ export default function OptimizePage() {
   const seeded =
     personaCount > 0
       ? `Searching against ${personaCount} profiled persona${personaCount === 1 ? "" : "s"}.`
-      : "Profile at least one session on the Swarm station first — the search needs a swarm to score against.";
+      : "Profile at least one session on the Forecast station first — the search needs a swarm to score against.";
 
   return (
     <div className="mx-auto max-w-5xl px-6 pb-24">

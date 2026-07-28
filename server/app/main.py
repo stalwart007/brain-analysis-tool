@@ -20,6 +20,8 @@ import asyncio
 import hmac
 import logging
 import os
+import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +30,7 @@ from typing import Annotated, Optional
 import json
 
 import openai
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -266,7 +268,26 @@ def healthz() -> dict:
 
 
 @app.post("/v1/ingest", status_code=202)
-def ingest(envelope: IngestEnvelope) -> dict:
+def ingest(envelope: IngestEnvelope, request: Request) -> dict:
+    # Rate limit before anything else: this is the only endpoint that accepts
+    # writes without a key, and every accepted segment becomes a row.
+    #
+    # In the deployed topology the backend sits behind the dashboard's
+    # /api/ingest passthrough, so the socket peer is the proxy for every
+    # request — X-Forwarded-For is what distinguishes callers, and it is
+    # spoofable. That is accepted: this is a backstop against a script, and a
+    # real distributed flood is an edge-layer problem. The per-site component
+    # of the key still holds regardless, since site_id is in the payload.
+    client = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        request.client.host if request.client else "unknown"
+    )
+    if not _ingest_limiter.allow(envelope.site_id, client):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many telemetry segments; slow down.",
+            headers={"Retry-After": str(int(_ingest_limiter.window_s))},
+        )
+
     # Hard consent gate, server-side too: never trust the client alone.
     if envelope.consent is not True:
         raise HTTPException(status_code=403, detail="Telemetry without consent is rejected.")
@@ -283,7 +304,7 @@ def ingest(envelope: IngestEnvelope) -> dict:
 
     session_id = storage.insert_session(
         envelope.site_id,
-        envelope.page_path,
+        template_path(envelope.page_path),
         envelope.features.model_dump(),
         panel_member_id=panel_member_id,
     )
@@ -401,6 +422,79 @@ async def profile_stream(session_id: str, caller: CallerDep) -> StreamingRespons
 
 
 # ------------------------------------------------------------------ swarm
+
+
+class _IngestLimiter:
+    """Fixed-window rate limit for the one unauthenticated write endpoint.
+
+    In-process and best-effort, deliberately. The service already runs as a
+    single instance (jobs.py cannot be replicated), so a shared store would buy
+    nothing today, and the honest framing is that this is a cheap backstop
+    against a script — not a defence against a distributed flood, which belongs
+    at the edge. It bounds the damage from the amplification paths that remain:
+    every accepted segment is a row, and rows are what the persona window and
+    the storage volume are made of.
+
+    Keyed per (site, client) so one noisy integration cannot starve another
+    tenant's ingestion.
+    """
+
+    def __init__(self, limit: int, window_s: float) -> None:
+        self.limit = limit
+        self.window_s = window_s
+        self._hits: dict[tuple[str, str], list[float]] = {}
+
+    def allow(self, site_id: str, client: str) -> bool:
+        if self.limit <= 0:
+            return True
+        now = time.monotonic()
+        key = (site_id, client)
+        recent = [t for t in self._hits.get(key, ()) if now - t < self.window_s]
+        # Bounded memory: a key with nothing recent is dropped rather than kept
+        # forever, so a rotating source cannot grow this dict without limit.
+        if not recent and key in self._hits:
+            del self._hits[key]
+        if len(recent) >= self.limit:
+            self._hits[key] = recent
+            return False
+        recent.append(now)
+        self._hits[key] = recent
+        return True
+
+
+_ingest_limiter = _IngestLimiter(
+    limit=int(os.environ.get("COGNISWARM_INGEST_RATE_LIMIT", "120")),
+    window_s=float(os.environ.get("COGNISWARM_INGEST_RATE_WINDOW_S", "60")),
+)
+
+
+_ID_SEGMENT = re.compile(
+    r"^(?:"
+    r"\d+"                                          # 8817
+    r"|[0-9a-f]{8,}"                                # hex ids, uuids without dashes
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # uuid
+    r"|[A-Za-z0-9_-]{20,}"                          # long opaque tokens
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def template_path(path: str) -> str:
+    """Replace identifier-shaped path segments with `:id` before storage.
+
+    The SDK sends `location.pathname`, so query strings never arrive — the
+    exposure is the PATH, and it routinely carries exactly the identifiers the
+    architecture promises never to collect: `/invoice/8817`, `/u/8f3a…`,
+    `/reset/<token>`. Storing those raw makes the "no PII by construction"
+    claim false through a channel the zone whitelist does not cover, and a
+    password-reset token in a telemetry table is a live credential.
+
+    Templating keeps everything the product actually uses the path for —
+    grouping sessions by page — while discarding the part that identifies a
+    person or grants access.
+    """
+    parts = path.split("/")
+    return "/".join(":id" if _ID_SEGMENT.match(p) else p for p in parts)
 
 
 def estimate_twin_calls(personas: int, request) -> int:
@@ -844,6 +938,12 @@ def get_job(caller: CallerDep, job_id: str) -> dict:
 
 @app.post("/v1/panel/members")
 def create_panel_member(caller: CallerDep, request: PanelMemberCreate) -> dict:
+    """Provision an invite.
+
+    This is the ONE response that carries the capability URL, because it is the
+    one moment it is needed: the admin has to send it to the member. It is not
+    retrievable afterwards — see the listing below.
+    """
     member = storage.insert_panel_member(request.label)
     member["disclosure_url"] = f"/panel/{member['token']}"
     return member
@@ -851,9 +951,21 @@ def create_panel_member(caller: CallerDep, request: PanelMemberCreate) -> dict:
 
 @app.get("/v1/panel/members")
 def panel_members(caller: CallerDep) -> list[dict]:
-    # tokens are capability URLs — do not leak them wholesale in listings
+    """List members WITHOUT their capability tokens.
+
+    The previous version stripped `token` from the dict and then rebuilt the
+    full capability URL from that same token one expression later, under a
+    comment saying tokens must not leak in listings. So the listing handed out
+    every member's disclosure URL — and that URL is the capability: anyone
+    holding it can consent or revoke on that member's behalf.
+
+    A token is a bearer secret, so it is shown once at creation and never
+    again. `token_hint` is the last four characters, which is enough for an
+    admin to match a row against an invite they already sent and not enough to
+    reconstruct anything.
+    """
     return [
-        {k: v for k, v in m.items() if k != "token"} | {"disclosure_url": f"/panel/{m['token']}"}
+        {k: v for k, v in m.items() if k != "token"} | {"token_hint": m["token"][-4:]}
         for m in storage.list_panel_members()
     ]
 

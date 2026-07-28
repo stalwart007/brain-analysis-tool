@@ -3,7 +3,7 @@
 /**
  * EXPERIMENTS — a descent through the frontal decision system.
  *
- * Same journey grammar as the swarm route: each panel sits in the structure
+ * Same journey grammar as the forecast route: each panel sits in the structure
  * that performs its job, and scrolling flies the camera there.
  *
  *   dlPFC        weighing alternatives against each other
@@ -67,7 +67,7 @@ export default function ExperimentsPage() {
   const seeded =
     personaCount > 0
       ? `${personaCount} persona${personaCount === 1 ? "" : "s"} available to every experiment.`
-      : "Profile at least one session on the Swarm station first — experiments need seeded personas.";
+      : "Profile at least one session on the Forecast station first — experiments need seeded personas.";
 
   return (
     <div className="mx-auto max-w-5xl px-6 pb-24">
