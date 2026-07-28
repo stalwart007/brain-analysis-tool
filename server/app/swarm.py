@@ -125,7 +125,7 @@ async def run_swarm(
     ]
     results = await asyncio.gather(*tasks)
     reactions = [r for r in results if r is not None]
-    return aggregate_reactions(reactions, scenario, cognitive_load)
+    return aggregate_reactions(reactions, scenario, cognitive_load, requested=len(tasks))
 
 
 async def stream_swarm(
@@ -160,7 +160,9 @@ async def stream_swarm(
             "intent": round(r.intent_score, 3),
         }
 
-    aggregate = aggregate_reactions(reactions, scenario, cognitive_load)
+    aggregate = aggregate_reactions(
+        reactions, scenario, cognitive_load, requested=total
+    )
     yield {"type": "done", "result": aggregate.model_dump()}
 
 
@@ -171,12 +173,23 @@ ACTION_VOCABULARY: tuple[str, ...] = ("convert", "continue", "hesitate", "abando
 
 
 def aggregate_reactions(
-    reactions: list[TwinReaction], scenario: str, cognitive_load: str
+    reactions: list[TwinReaction],
+    scenario: str,
+    cognitive_load: str,
+    requested: Optional[int] = None,
 ) -> SwarmAggregate:
     """Pure aggregation over twin reactions — shared by the live fan-out and the
-    Batch API runner, and unit-testable without any LLM call."""
+    Batch API runner, and unit-testable without any LLM call.
+
+    `requested` is how many twin calls were DISPATCHED. Without it the result
+    reports only survivors, so a run where most twins hit a 429 is
+    indistinguishable from a healthy run of the smaller size — every interval
+    below is then computed on a non-random subsample and presented with
+    identical confidence language.
+    """
     if not reactions:
         raise RuntimeError("Swarm run produced no valid reactions (all twins failed).")
+    dispatched = requested if requested is not None else len(reactions)
 
     actions = Counter(r.action for r in reactions)
     dropoffs = Counter(
@@ -239,6 +252,8 @@ def aggregate_reactions(
         run_id="",  # assigned by storage on insert
         scenario_preview=scenario[:200],
         twin_count=len(reactions),
+        twins_requested=dispatched,
+        twins_failed=max(0, dispatched - len(reactions)),
         cognitive_load=cognitive_load,
         mean_engagement=round(sum(engagements) / len(reactions), 3),
         mean_intent=round(sum(intents) / len(reactions), 3),

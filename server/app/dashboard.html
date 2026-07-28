@@ -33,7 +33,7 @@
   <label>Cognitive load
     <select id="load"><option>low</option><option>medium</option><option>high</option></select>
   </label>
-  <button id="run">Run swarm</button>
+  <button id="run">Forecast response</button>
 </div>
 <div id="swarm-result"></div>
 
@@ -86,7 +86,7 @@ $("#run").addEventListener("click", async () => {
   } catch (err) {
     $("#swarm-result").innerHTML = `<p style="color:#c33">Error: ${err.message}</p>`;
   } finally {
-    btn.disabled = false; btn.textContent = "Run swarm";
+    btn.disabled = false; btn.textContent = "Forecast response";
   }
 });
 

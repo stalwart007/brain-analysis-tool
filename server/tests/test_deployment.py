@@ -135,3 +135,34 @@ def test_explicit_db_env_always_wins():
     finally:
         del os.environ["COGNISWARM_DB"]
         importlib.reload(config_module)
+
+
+# ── annotation ordering: caught only by the container ─────────────────────
+
+
+def test_every_schema_resolves_without_forward_references():
+    """Guards a bug that the local suite structurally cannot catch.
+
+    Python 3.14 defers annotation evaluation (PEP 649), so a model that
+    references a class defined LATER in the file imports fine on this machine.
+    Python 3.13 — which is what the container runs, and which pyproject
+    declares support for — evaluates eagerly and raises NameError at import,
+    so the service crashed on startup while every test passed locally.
+
+    Building a TypeAdapter forces every annotation to resolve now, reproducing
+    the eager behaviour regardless of the interpreter running the tests.
+    """
+    import inspect
+
+    from pydantic import BaseModel, TypeAdapter
+
+    from app import schemas
+
+    models = [
+        obj
+        for _name, obj in inspect.getmembers(schemas, inspect.isclass)
+        if issubclass(obj, BaseModel) and obj.__module__ == schemas.__name__
+    ]
+    assert len(models) > 20, "sanity: the schema module should expose many models"
+    for model in models:
+        TypeAdapter(model)  # raises if any annotation cannot be resolved

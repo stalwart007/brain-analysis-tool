@@ -88,7 +88,7 @@ export default function SwarmPanel({
   return (
     <div className="card flex h-full flex-col p-6">
       <div className="mb-4 flex items-baseline justify-between">
-        <h2 className="font-display text-lg font-medium tracking-tight">Run a swarm</h2>
+        <h2 className="font-display text-lg font-medium tracking-tight">Forecast response</h2>
         <span className="text-xs text-muted">
           {personaCount} persona{personaCount === 1 ? "" : "s"} seeded
         </span>
@@ -185,7 +185,7 @@ export default function SwarmPanel({
           onClick={run}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >
-          {busy ? "Simulating…" : "Run swarm"}
+          {busy ? "Forecasting…" : "Forecast response"}
         </motion.button>
       </div>
 
@@ -214,6 +214,19 @@ export default function SwarmPanel({
               <p className="max-w-44 text-xs text-muted">
                 {result.twin_count} twins · load {result.cognitive_load}
               </p>
+              {/* A silent shortfall is the whole bug: every mean and interval
+                  above is computed over the survivors, and a non-random
+                  subsample is not the sample the reader thinks they are
+                  looking at. Say so where the numbers are. */}
+              {!!result.twins_failed && (
+                <p
+                  className="max-w-44 text-xs text-critical"
+                  title="These twins errored or returned unusable output. The statistics above are computed over the survivors only."
+                >
+                  {result.twins_failed} of {result.twins_requested} failed —
+                  figures cover survivors
+                </p>
+              )}
             </div>
 
             <div className="min-h-44">

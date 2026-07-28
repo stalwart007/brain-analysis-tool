@@ -407,6 +407,12 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
   const stage = useRef<HTMLElement | null>(null);
   const group = useRef<THREE.Group>(null);
   const spin = useRef(0);
+  /* The UNWARPED angle. `spin` holds the rotation actually applied, which the
+     interior stations read to carry their look targets through the brain's
+     pose; this is the linear phase that drives it. Kept as an accumulator
+     rather than derived from the clock so that leaving the hero and returning
+     resumes where it stopped instead of snapping to wherever time had got to. */
+  const phase = useRef(0);
 
   useEffect(() => {
     if (lastKey.current === stationKey) return;
@@ -448,10 +454,49 @@ function Cortex({ station, region, stationKey, hovered, children }: CortexProps)
     axonMat.uniforms.uWellAmt.value = wellAmt;
     sparkMat.uniforms.uWellAmt.value = wellAmt;
 
-    // The brain spins in place while the camera holds a designed frame; an
+    // The brain turns in place while the camera holds a designed frame; an
     // orbiting camera slowly dragged the composition out of alignment.
+    //
+    // It SWAYS rather than revolves. A continuous 360° yaw spends about a
+    // third of every two-minute revolution presenting the anterior and
+    // posterior faces, where the hemispheres are symmetric to the viewer, the
+    // silhouette is a wide rounded lobe and the depth cues that make it
+    // legible — frontal pole, temporal lobe, cerebellum, brainstem — all
+    // disappear. Held there for thirty seconds at a time it stops reading as a
+    // brain and starts reading as a flattened blob.
+    //
+    // The designed camera already looks along the lateral axis, so yaw 0 is
+    // the recognisable three-quarter view, and staying within about ±35° of it
+    // keeps the anatomy readable at every instant.
+    //
+    // A FULL revolution, at a non-uniform rate.
+    //
+    // Two things have to hold at once. It must actually go round — a bounded
+    // sway reads as a fidget, not an organ turning. And it must look like a
+    // brain throughout, which a constant revolution does not: yaw ±90° is the
+    // anterior/posterior face, where the hemispheres are symmetric to the
+    // viewer and the frontal pole, temporal lobe and cerebellum are all
+    // edge-on. At a constant rate a third of every turn is spent there.
+    //
+    // So the phase advances linearly and the ANGLE is warped:
+    //
+    //     yaw = φ − k·sin(2φ)      dyaw/dφ = 1 − 2k·cos(2φ)
+    //
+    // which is slowest at φ = 0 and π (the lateral profiles, where it should
+    // linger) and fastest at ±π/2 (the faces, which it should get past).
+    // Strictly increasing while 2k < 1, so it is a real revolution that never
+    // reverses and never parks.
+    //
+    // Measured over a full turn at these constants: 60s per revolution
+    // (against the old 114s), angular rate 0.038–0.172 rad/s, and within 55°
+    // of a lateral profile for 75% of the turn — up from 61% at a constant
+    // rate. `phase` accumulates rather than reading the clock so that
+    // returning from an interior station resumes instead of snapping.
     const s = station;
-    if (s.inside === 0) spin.current += dt * 0.055;
+    if (s.inside === 0) {
+      phase.current += dt * 0.105;
+      spin.current = phase.current - 0.32 * Math.sin(2 * phase.current);
+    }
     if (group.current) group.current.rotation.y = spin.current;
 
     if (s.inside === 0) {

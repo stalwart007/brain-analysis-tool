@@ -58,5 +58,18 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|woff2)$).*)"],
+  /**
+   * `sdk/` is excluded because the collector bundle is fetched by <script> tags
+   * on OTHER PEOPLE'S websites, where there is no session and never will be.
+   * Without this the middleware answered every SDK request with a 307 to
+   * /login — verified — so every integration would have loaded an HTML login
+   * page instead of the collector and silently collected nothing.
+   *
+   * It is safe to exclude: the directory contains only published, immutable,
+   * versioned build artifacts, and the SRI hash printed at release time is
+   * what lets customers detect any substitution.
+   */
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|sdk/|.*\\.(?:svg|png|jpg|woff2)$).*)",
+  ],
 };

@@ -16,6 +16,69 @@ const nextConfig = {
   // is a page that renders as completely unstyled HTML).
   //   BUILD_DIR=.next-verify npx next build
   ...(process.env.BUILD_DIR ? { distDir: process.env.BUILD_DIR } : {}),
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          // This app renders LLM-authored strings — inner_monologue,
+          // likely_mindset, friction_notes — that originate from a model
+          // reading attacker-influenceable input. React escapes them, but a
+          // CSP is the layer that holds when something is rendered unescaped
+          // later. `unsafe-inline`/`unsafe-eval` for scripts are what Next's
+          // dev overlay and R3F shader compilation currently need; tightening
+          // those to a nonce is the obvious next step and needs its own
+          // testing pass, so it is deliberately not being done blind tonight.
+          {
+            key: "Content-Security-Policy",
+            value: [
+              "default-src 'self'",
+              "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: blob:",
+              "font-src 'self' data:",
+              // The browser only ever talks to this origin: the backend is
+              // private and reached server-side through /api/cs.
+              "connect-src 'self'",
+              "worker-src 'self' blob:",
+              "object-src 'none'",
+              "base-uri 'self'",
+              "form-action 'self'",
+              // Clickjacking: this app has one-click destructive controls
+              // (panel revoke erases a member's telemetry permanently).
+              "frame-ancestors 'none'",
+            ].join("; "),
+          },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Frame-Options", value: "DENY" },
+          // Page paths are the PII channel this codebase already templates
+          // server-side; do not hand them to third parties in a Referer.
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+          },
+          // Only meaningful over HTTPS; harmless on localhost, which browsers
+          // exempt. Fly terminates TLS, so this is live in production.
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=31536000; includeSubDomains",
+          },
+        ],
+      },
+      {
+        // The SDK is embedded by third-party sites by design, so it needs the
+        // opposite of the default: cross-origin readable, and immutable
+        // because the URL carries the version (see the release script).
+        source: "/sdk/:version/:file*",
+        headers: [
+          { key: "Access-Control-Allow-Origin", value: "*" },
+          { key: "Cache-Control", value: "public, max-age=31536000, immutable" },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;

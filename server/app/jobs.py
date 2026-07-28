@@ -12,7 +12,7 @@ the storage schema already models the full job lifecycle.
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from . import storage
 from .batch_swarm import execute_batch_swarm
@@ -85,10 +85,10 @@ EXECUTORS: dict[str, Executor] = {
 }
 
 
-def enqueue(kind: str, payload: dict[str, Any]) -> str:
+def enqueue(kind: str, payload: dict[str, Any], site_id: Optional[str] = None) -> str:
     if kind not in EXECUTORS:
         raise ValueError(f"Unknown job kind: {kind}")
-    job_id = storage.insert_job(kind, payload)
+    job_id = storage.insert_job(kind, payload, site_id=site_id)
     _queue.put_nowait(job_id)
     return job_id
 
@@ -104,7 +104,11 @@ async def _process(job_id: str) -> None:
         payload["job_id"] = job_id
         if job["kind"] == "batch_swarm":
             payload["mode"] = "batch"
-        run_id = storage.insert_swarm_run(payload, result, kind=run_kind)
+        # Carried from the job row, not from a request context — the worker
+        # has none. Without it every async run was written unowned.
+        run_id = storage.insert_swarm_run(
+            payload, result, kind=run_kind, site_id=job.get("site_id")
+        )
         storage.update_job(job_id, "done", run_id=run_id)
     except Exception as exc:  # noqa: BLE001 — jobs must never kill the worker
         log.exception("job %s failed", job_id)

@@ -8,11 +8,20 @@ Design stance (deliberate, documented):
   it is not a clinical or individual claim.
 """
 
+import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- ingest
+
+# The zone vocabulary is the whole "whitelist-only" architectural claim, and it
+# was never actually enforced server-side. Lowercase alnum with dashes and
+# underscores admits every zone the SDK ships with (hero, pricing-table, cta,
+# checkout, content) and excludes the two things that made this a hole: an
+# email address or other identifier used as a zone name, and a sentence of
+# prose aimed at the model that reads the metrics block.
+_ZONE_KEY = re.compile(r"[a-z0-9_-]{1,32}")
 
 
 class FeaturePayload(BaseModel):
@@ -27,19 +36,57 @@ class FeaturePayload(BaseModel):
     rage_click_bursts: int = 0
     click_count: int = 0
     backtrack_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    zone_dwell_ms: dict[str, float] = Field(default_factory=dict)
-    zone_click_counts: dict[str, int] = Field(default_factory=dict)
-    # cognitive-modeling series (optional; older SDKs don't send them)
+
+    # Zone names are AUTHOR-SUPPLIED strings that travel a long way: they are
+    # json.dumps'd into the Layer-4 analyst prompt, and the analyst's output is
+    # interpolated verbatim into every twin's *system* message. `/v1/ingest`
+    # needs no API key, so without a key pattern this is an unauthenticated
+    # path from a `data-cs` attribute on any page to instructions inside every
+    # simulation — and a PII channel, since `data-cs="user-alice@corp.com"` was
+    # equally acceptable. The pattern is the trust boundary; `_ZONE_KEY` is
+    # enforced by the validator below.
+    zone_dwell_ms: dict[str, float] = Field(default_factory=dict, max_length=64)
+    zone_click_counts: dict[str, int] = Field(default_factory=dict, max_length=64)
+
+    # cognitive-modeling series (optional; older SDKs don't send them).
+    #
+    # Bounded because this is the only unauthenticated write endpoint in the
+    # product. A 10-second segment at the SDK's own sampling rates produces a
+    # few hundred points; these ceilings are an order of magnitude above any
+    # honest client and stop a single POST from being a memory amplifier.
     event_stream: list[list[float]] = Field(
         default_factory=list,
+        max_length=20_000,
         description="[[t_ms, symbol_id]] symbolic event stream; alphabet matches cognition.EVENT_SYMBOLS",
     )
     velocity_series: list[list[float]] = Field(
-        default_factory=list, description="[[t_ms, velocity]] scroll kinematics"
+        default_factory=list,
+        max_length=20_000,
+        description="[[t_ms, velocity]] scroll kinematics",
     )
     decision_latencies_ms: list[float] = Field(
-        default_factory=list, description="quiet-period → click decision latencies"
+        default_factory=list,
+        max_length=5_000,
+        description="quiet-period → click decision latencies",
     )
+
+    @field_validator("zone_dwell_ms", "zone_click_counts")
+    @classmethod
+    def _reject_unsafe_zone_keys(cls, v: dict) -> dict:
+        """Zone names must look like zone names.
+
+        Rejecting rather than sanitising: a payload with a key that does not
+        match is not a slightly-wrong payload from an honest SDK, it is either
+        a misconfigured integration or an injection attempt, and both deserve
+        a 422 rather than silent partial acceptance.
+        """
+        bad = [k for k in v if not _ZONE_KEY.fullmatch(k)]
+        if bad:
+            raise ValueError(
+                "zone names must match [a-z0-9_-]{1,32} (lowercase); "
+                f"rejected: {bad[:5]!r}"
+            )
+        return v
 
 
 class IngestEnvelope(BaseModel):
@@ -184,7 +231,20 @@ class TwinReaction(BaseModel):
 class SwarmAggregate(BaseModel):
     run_id: str
     scenario_preview: str
+    #: Twins whose reaction was actually USABLE. This is a survivor count, and
+    #: for a long time it was the only count reported — so a run where 180 of
+    #: 200 twins hit a 429 persisted as `twin_count: 20` and was byte-identical
+    #: to a healthy 20-twin run, including in the calibration report. Read it
+    #: together with `twins_requested` and `twins_failed`.
     twin_count: int
+    twins_requested: Optional[int] = Field(
+        default=None,
+        description="Twin calls dispatched. None on runs recorded before this was tracked.",
+    )
+    twins_failed: Optional[int] = Field(
+        default=None,
+        description="Twin calls that errored or returned unusable output.",
+    )
     cognitive_load: str
     mean_engagement: float
     mean_intent: float
@@ -423,12 +483,82 @@ class PriceSensitivityResult(BaseModel):
     )
 
 
+# ---------------------------------------------------------------- content assets
+
+
+class TranscriptCue(BaseModel):
+    t_ms: int = Field(ge=0, description="Cue start, milliseconds from content start.")
+    text: str = Field(min_length=1, max_length=2_000)
+
+
+class VideoFrame(BaseModel):
+    t_ms: int = Field(ge=0, description="Keyframe timestamp, ms from start.")
+    image_b64: str = Field(
+        max_length=8_000_000,
+        description="Base64 keyframe. Extracted client-side — see modality.py.",
+    )
+    media_type: Optional[str] = Field(default="image/jpeg", max_length=64)
+
+
+class ContentAsset(BaseModel):
+    """One piece of digital content, in whatever shape it actually exists.
+
+    There is deliberately NO url field. Fetching a caller-supplied URL
+    server-side is an SSRF primitive: it would let anyone with an API key reach
+    the cloud metadata service, the private backend, or anything else routable
+    from inside the network. The browser can fetch its own bytes.
+    """
+
+    kind: Literal["text", "image", "video", "audio", "page", "document"] = "text"
+    #: Script, copy, transcript, or raw HTML depending on `kind`.
+    text: Optional[str] = Field(default=None, max_length=200_000)
+    content_type: Optional[str] = Field(default=None, max_length=64)
+    brief: Optional[str] = Field(
+        default=None,
+        max_length=1_000,
+        description="Optional context for the analyst, e.g. what the asset is for.",
+    )
+    image_b64: Optional[str] = Field(default=None, max_length=8_000_000)
+    media_type: Optional[str] = Field(default=None, max_length=64)
+    frames: list[VideoFrame] = Field(default_factory=list, max_length=32)
+    transcript_cues: list[TranscriptCue] = Field(default_factory=list, max_length=2_000)
+    pages: list[str] = Field(default_factory=list, max_length=64)
+
+
+class ImageElement(BaseModel):
+    label: str = Field(description="Short name for the element.")
+    description: str = Field(description="What it shows and why the eye lands there.")
+
+
+class ImageHierarchy(BaseModel):
+    elements: list[ImageElement] = Field(
+        description="3-6 attention regions in predicted scan order."
+    )
+
+
+class VideoFrameRead(BaseModel):
+    description: str = Field(description="What is on screen and its emotional register.")
+
+
 # ---------------------------------------------------------------- objection radar
 
 
 class ContentStudyRequest(BaseModel):
-    content: str = Field(min_length=20, description="Script, transcript, storyboard, or copy.")
+    """A neuro-impact study over any digital content.
+
+    `asset` is the general path — text, image, video keyframes, audio
+    transcript, a landing page, or a deck. `content`/`content_type` are the
+    original text-only fields, kept so existing callers and stored runs keep
+    working; when `asset` is absent they are treated as a text asset.
+    """
+
+    content: str = Field(
+        default="",
+        max_length=200_000,
+        description="Script, transcript, storyboard, or copy. Ignored when `asset` is set.",
+    )
     content_type: Literal["video_script", "ad_copy", "article", "storyboard"] = "video_script"
+    asset: Optional[ContentAsset] = None
     session_ids: list[str] = Field(default_factory=list)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"

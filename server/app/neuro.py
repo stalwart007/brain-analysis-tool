@@ -33,9 +33,11 @@ from typing import AsyncIterator, Optional, Sequence
 import openai
 
 from .analytics import bootstrap_ci
+from .modality import UnsupportedAsset, extract_beats
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
 from .oai import Refusal, async_client, parse_completion, response_format_for
 from .schemas import (
+    ContentAsset,
     ContentSegments,
     ContentStudyRequest,
     PersonaSeed,
@@ -390,6 +392,145 @@ def peak_end_memory(
     }
 
 
+def peak_end_per_twin(
+    responses: "list", dims: "tuple[str, str]" = ("arousal", "valence")
+) -> Optional[dict]:
+    """Peak-end computed WITHIN each twin, then aggregated over the results.
+
+    The peak-end rule is a within-subject phenomenon: an individual remembers
+    the moment THEY peaked and the moment it ended for THEM. Running it on the
+    cross-twin mean curve is an ecological fallacy, and not a harmless one —
+    with two audience camps peaking at different beats the mean peaks at a beat
+    NO twin peaked at, and `remembered_affect` is then the valence of a beat
+    nobody had a peak experience of. Jensen also bites: max(mean arousal) is
+    <= mean(max arousal), so encoding_strength was systematically understated.
+
+    The peak-index DISTRIBUTION that falls out of doing this correctly is worth
+    as much as the correction — it is a direct polarisation signal, showing
+    whether the audience has one peak or several.
+    """
+    arousal_dim, valence_dim = dims
+    per: list[dict] = []
+    for r in responses:
+        a = [getattr(x, arousal_dim) for x in r.appraisals]
+        v = [getattr(x, valence_dim) for x in r.appraisals]
+        m = peak_end_memory(a, v)
+        if m:
+            per.append(m)
+    if not per:
+        return None
+
+    n_beats = len(responses[0].appraisals)
+    counts = [0] * n_beats
+    for m in per:
+        counts[m["peak_index"]] += 1
+    modal = max(range(n_beats), key=lambda i: counts[i])
+    remembered = [m["remembered_affect"] for m in per]
+    strength = [m["encoding_strength"] for m in per]
+
+    # Agreement on WHERE the peak was. 1.0 = every twin peaked on the same
+    # beat; near 1/n_beats = no shared peak at all, which is the case the mean
+    # curve silently hid.
+    peak_agreement = counts[modal] / len(per)
+
+    return {
+        "peak_index": modal,
+        "peak_index_distribution": counts,
+        "peak_agreement": round(peak_agreement, 4),
+        "remembered_affect": round(sum(remembered) / len(remembered), 4),
+        "remembered_affect_ci": bootstrap_ci(remembered),
+        "encoding_strength": round(sum(strength) / len(strength), 4),
+        "encoding_strength_ci": bootstrap_ci(strength),
+        "end_valence": round(
+            sum(m["end_valence"] for m in per) / len(per), 4
+        ),
+        "recall_concentration": round(
+            sum(m["recall_concentration"] for m in per) / len(per), 4
+        ),
+        "n_twins": len(per),
+        "model": (
+            "peak-end rule computed per twin and aggregated (Kahneman); the "
+            "peak-index distribution is the polarisation signal"
+        ),
+    }
+
+
+def retention_hazard(responses: "list", threshold: float = 0.25) -> Optional[dict]:
+    """Discrete-time abandonment hazard across beats.
+
+    The commercially load-bearing question for anything with a running order:
+    where do people stop. A twin is treated as having abandoned at the FIRST
+    beat whose attention falls below `threshold`, and as retained thereafter
+    only if it never does — abandonment is absorbing, because someone who has
+    stopped watching does not come back for beat 5 and rate it.
+
+    Reported as a hazard per beat plus the surviving fraction, with the risk
+    set shrinking as twins drop. That is the shape Kaplan-Meier expects, and it
+    is why this is not just `mean(attention) < threshold`: a beat that loses
+    half of a small remaining audience is a different finding from one that
+    loses the same count out of everyone.
+    """
+    if not responses:
+        return None
+    n_beats = len(responses[0].appraisals)
+    if n_beats < 2:
+        return None
+
+    first_drop: list[Optional[int]] = []
+    for r in responses:
+        idx = next(
+            (i for i, a in enumerate(r.appraisals) if a.attention < threshold), None
+        )
+        first_drop.append(idx)
+
+    at_risk = len(responses)
+    survival = 1.0
+    steps = []
+    for i in range(n_beats):
+        dropped = sum(1 for d in first_drop if d == i)
+        if at_risk <= 0:
+            # The curve keeps its full length so a chart spans the whole
+            # content, but the hazard is None rather than 0.0: with an empty
+            # risk set the conditional probability of dropping is UNDEFINED,
+            # not zero, and a run of zeros at the tail would read as "nobody
+            # left here" when it means "nobody was left to leave".
+            steps.append(
+                {
+                    "beat": i,
+                    "entered": 0,
+                    "dropped": 0,
+                    "hazard": None,
+                    "survival": round(survival, 4),
+                }
+            )
+            continue
+        hazard = dropped / at_risk
+        survival *= 1.0 - hazard
+        steps.append(
+            {
+                "beat": i,
+                "entered": at_risk,
+                "dropped": dropped,
+                "hazard": round(hazard, 4),
+                "survival": round(survival, 4),
+            }
+        )
+        at_risk -= dropped
+
+    completed = sum(1 for d in first_drop if d is None)
+    scored = [s for s in steps if s["hazard"] is not None]
+    worst = max(scored, key=lambda s: s["hazard"]) if scored else None
+    return {
+        "threshold": threshold,
+        "steps": steps,
+        "completion_rate": round(completed / len(responses), 4),
+        # Only meaningful where a beat actually lost someone; an argmax over
+        # all-zero hazards would name beat 0 and read as a finding.
+        "worst_beat": worst["beat"] if worst and worst["dropped"] > 0 else None,
+        "model": "discrete-time hazard; abandonment is absorbing",
+    }
+
+
 def emotional_trajectory(
     valence: Sequence[float], arousal: Sequence[float]
 ) -> Optional[dict]:
@@ -506,6 +647,19 @@ async def _content_twin(
     return resp if len(resp.appraisals) == len(segments) else None
 
 
+#: What the segmenting stage is actually doing, per modality — the frontend
+#: shows this live, and "splitting content into narrative beats" would be a lie
+#: for an image.
+_INGEST_DETAIL = {
+    "image": "reading the visual hierarchy — what the eye lands on, in order",
+    "video": "describing keyframes and aligning transcript cues",
+    "audio": "grouping transcript cues into beats",
+    "page": "walking page sections in DOM order",
+    "document": "reading pages in document order",
+    "text": "splitting content into narrative beats",
+}
+
+
 DIMS = [
     "attention", "valence", "arousal", "novelty", "goal_relevance",
     "social_resonance", "threat", "reward_anticipation", "cognitive_effort",
@@ -513,10 +667,28 @@ DIMS = [
 
 
 def aggregate_content_study(
-    responses: list[TwinContentResponse], segments: list[str], load: str
+    responses: list[TwinContentResponse],
+    segments: list[str],
+    load: str,
+    sequence: "Optional[object]" = None,
 ) -> dict:
     """All the analysis layers over the raw appraisal tensor
-    (twins × beats × dimensions). Pure — fully unit-testable."""
+    (twins × beats × dimensions). Pure — fully unit-testable.
+
+    `sequence` is the BeatSequence the beats came from. It carries the AXIS,
+    and the axis decides which statistics are meaningful: peak-end, change
+    points as moments, retention and trajectory all presume an ordered
+    experience, and the regions of a static image are simultaneous. Anything
+    withheld is reported WITH ITS REASON in `withheld`, because an absent
+    number and an inapplicable one look identical in a UI and only one of them
+    is a finding.
+
+    Omitting `sequence` keeps the old behaviour (everything computed), so
+    existing callers and stored runs are unaffected.
+    """
+    def _supports(stat: str) -> bool:
+        return sequence is None or sequence.supports(stat)
+
     n_seg = len(segments)
     # mean curve + CI per dimension per beat
     curves: dict[str, list[float]] = {}
@@ -538,9 +710,21 @@ def aggregate_content_study(
     # likelihood behind each point rests on len(responses) ratings, not one.
     # Without it the BIC penalty is charged at the wrong sample size and the
     # segmenter fires on averaging noise (36.5% of pure-noise curves).
-    cps = change_points(curves["attention"], min_size=1, n_obs=len(responses))
-    memory = peak_end_memory(curves["arousal"], curves["valence"])
-    trajectory = emotional_trajectory(curves["valence"], curves["arousal"])
+    cps = (
+        change_points(curves["attention"], min_size=1, n_obs=len(responses))
+        if _supports("change_points")
+        else None
+    )
+    # Per twin, then aggregated — see peak_end_per_twin. The mean-curve version
+    # is an ecological fallacy that reports the valence of a beat no twin
+    # necessarily peaked on.
+    memory = peak_end_per_twin(responses) if _supports("peak_end") else None
+    trajectory = (
+        emotional_trajectory(curves["valence"], curves["arousal"])
+        if _supports("trajectory")
+        else None
+    )
+    retention = retention_hazard(responses) if _supports("retention") else None
     overall_dims = {d: sum(curves[d]) / n_seg for d in DIMS}
     # Must not be max(recall_probability): that is a softmax over beats, so it
     # falls as ~1/n and the "memory" bar on the brain map tracked how many
@@ -548,14 +732,22 @@ def aggregate_content_study(
     # beats moved it roughly 2×. encoding_strength is peak arousal — the actual
     # mechanism, and invariant to segmentation.
     memorability = (
-        memory["encoding_strength"] if memory else overall_dims["attention"]
+        memory["encoding_strength"] if memory else overall_dims["arousal"]
     )
     systems = functional_systems(overall_dims, memorability)
+    # Per-beat memorability must be on the SAME SCALE as the study-level
+    # number, or the two "memory" bars on the brain map are not comparable —
+    # and they were not. This was `recall_probability[i] * n_seg / 2`, where
+    # recall_probability is a softmax that sums to 1 by construction: on any
+    # flat arousal curve every beat scored EXACTLY 0.500 regardless of how
+    # aroused the audience actually was, for every beat count.
+    #
+    # Study level is peak arousal; per beat is that beat's arousal. Both are
+    # arousal in [0,1], both are invariant to the number of beats, and the
+    # max over beats reproduces the study-level figure up to Jensen — which is
+    # what "comparable" has to mean.
     per_segment_systems = [
-        functional_systems(
-            {d: curves[d][i] for d in DIMS},
-            memory["recall_probability"][i] * n_seg / 2 if memory else curves["attention"][i],
-        )
+        functional_systems({d: curves[d][i] for d in DIMS}, curves["arousal"][i])
         for i in range(n_seg)
     ]
     # Clamp: TwinContentResponse.would_share carries no numeric bounds in the
@@ -588,6 +780,12 @@ def aggregate_content_study(
         "change_points": cps,
         "memory": memory,
         "trajectory": trajectory,
+        "retention": retention,
+        "axis": getattr(sequence, "axis", None) and sequence.axis.value,
+        "beat_source": getattr(sequence, "source", None),
+        "beat_notes": getattr(sequence, "notes", None),
+        "timestamps_ms": getattr(sequence, "timestamps_ms", None),
+        "withheld": (sequence.to_dict()["withheld"] if sequence is not None else {}),
         "systems": systems,
         "per_segment_systems": per_segment_systems,
         "share_intent_mean": round(share_mean, 4),
@@ -605,10 +803,34 @@ def aggregate_content_study(
 async def stream_content_study(
     personas: list[PersonaSeed], request: ContentStudyRequest
 ) -> AsyncIterator[dict]:
-    yield {"type": "stage", "stage": "segmenting", "detail": "splitting content into narrative beats"}
-    segments = await segment_content(request.content, request.content_type)
+    # Any modality, not just pasted text. `asset` is the new path; `content`
+    # remains for existing callers and is treated as a text asset.
+    asset = request.asset or ContentAsset(
+        kind="text", text=request.content, content_type=request.content_type
+    )
+    yield {
+        "type": "stage",
+        "stage": "segmenting",
+        "detail": _INGEST_DETAIL.get(asset.kind, "splitting content into beats"),
+    }
+    try:
+        sequence = await extract_beats(asset)
+    except UnsupportedAsset as exc:
+        # Refusing beats guessing: a study run on beats that do not represent
+        # the content produces confident numbers about something the audience
+        # never saw.
+        yield {"type": "error", "detail": str(exc)}
+        return
+    segments = sequence.beats
     roster = personas * request.twins_per_persona
-    yield {"type": "start", "total": len(roster), "segments": segments}
+    yield {
+        "type": "start",
+        "total": len(roster),
+        "segments": segments,
+        "axis": sequence.axis.value,
+        "beat_source": sequence.source,
+        "beat_notes": sequence.notes,
+    }
 
     semaphore = asyncio.Semaphore(SWARM_CONCURRENCY)
     tasks = [
@@ -634,9 +856,16 @@ async def stream_content_study(
         return
 
     yield {"type": "stage", "stage": "isc", "detail": "inter-subject correlation of attention trajectories"}
-    yield {"type": "stage", "stage": "changepoints", "detail": "BIC-penalised change-point detection"}
-    yield {"type": "stage", "stage": "memory", "detail": "peak-end + serial-position recall model"}
+    if sequence.supports("change_points"):
+        yield {"type": "stage", "stage": "changepoints", "detail": "BIC-penalised change-point detection"}
+    if sequence.supports("peak_end"):
+        yield {"type": "stage", "stage": "memory", "detail": "per-twin peak-end + serial-position recall"}
+    if sequence.supports("retention"):
+        yield {"type": "stage", "stage": "retention", "detail": "discrete-time abandonment hazard"}
     yield {"type": "stage", "stage": "systems", "detail": "projecting onto functional cognitive systems"}
-    result = aggregate_content_study(responses, segments, request.cognitive_load)
-    result["content_preview"] = request.content[:140]
+    result = aggregate_content_study(
+        responses, segments, request.cognitive_load, sequence=sequence
+    )
+    result["content_preview"] = (asset.text or asset.brief or segments[0])[:140]
+    result["modality"] = asset.kind
     yield {"type": "done", "result": result}

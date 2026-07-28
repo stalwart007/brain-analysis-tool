@@ -43,16 +43,13 @@ The dashboard has no such constraint and scales horizontally.
      volume /data     SQLite + WAL
 ```
 
-**The backend must not have a public address.** Two reasons, one of them
-active:
-
-1. The analysis surface exposes run history containing every twin's inner
-   monologue, and every endpoint that spends OpenAI credit.
-2. It currently has an **unauthenticated persona-eviction path** (200 ingests
-   push every profiled session out of the load window, and every study endpoint
-   then 400s) and **no tenant isolation at all** — `site_id` is written and
-   never read. Both are open. Keeping the backend private is what contains them
-   until they are fixed.
+**The backend must not have a public address.** The analysis surface exposes
+run history containing every twin's inner monologue, panel membership, and
+every endpoint that spends OpenAI credit. Tenant isolation and the
+persona-eviction path are now fixed, so this is defence in depth rather than
+the only thing standing between a tenant's data and the internet — but it is
+free, and it means the next hole found in that surface is not remotely
+reachable while it is being fixed.
 
 Telemetry still reaches it: the SDK posts to the dashboard's public
 `/api/ingest`, which forwards only that one path and injects no API key.
@@ -117,10 +114,13 @@ Expect roughly $10/mo: two shared-cpu-1x machines and a 3 GB volume.
 | | |
 |---|---|
 | `OPENAI_API_KEY` | required |
-| `COGNISWARM_API_KEYS` | **required unless** `COGNISWARM_ALLOW_ANONYMOUS=1`. Auth fails closed: with neither, every `/v1/*` returns 503 |
+| `COGNISWARM_API_KEYS` | **required unless** `COGNISWARM_ALLOW_ANONYMOUS=1`. Auth fails closed: with neither, every `/v1/*` returns 503. Two forms — `key:site` scopes a key to one tenant, a bare `key` is unscoped (admin / single-tenant) |
 | `COGNISWARM_ALLOWED_ORIGINS` | customer origins that may POST telemetry, comma separated, scheme included. **Empty means the SDK silently drops everything** — see below |
 | `COGNISWARM_DB` | set to `/data/cogniswarm.db`. Defaults into the repo tree, which in a container is an ephemeral image layer |
 | `COGNISWARM_CONCURRENCY` | max concurrent twin calls, default 8 |
+| `COGNISWARM_MAX_TWINS_PER_RUN` | hard per-request fan-out ceiling, default 2000. A request over it is refused (413) with the computed number |
+| `COGNISWARM_INGEST_RATE_LIMIT` | segments per window per (site, client), default 120 |
+| `COGNISWARM_INGEST_RATE_WINDOW_S` | rate-limit window, default 60 |
 
 ### Dashboard
 
@@ -182,13 +182,19 @@ Origins match exactly: `https://acme.com` does not cover `https://www.acme.com`.
 
 Not blockers for a demo or early customers, but know them:
 
-- **No per-run cost ceiling.** Worst case from one request: 200 personas × 20
-  twins × 8 variants = 32,000 twin calls. Set a hard spend limit in your OpenAI
-  billing settings — that is currently the only backstop.
-- **No tenant isolation.** `site_id` is written and never read; every run mixes
-  personas across all sites.
-- **Unauthenticated persona eviction.** 200 ingests disable every study
-  endpoint until more sessions are profiled.
+- **Rate limiting is in-process and best-effort.** It is a backstop against a
+  script, not a defence against a distributed flood — that belongs at the edge.
+  Because the backend sits behind the dashboard passthrough, the socket peer is
+  the proxy for every request, so `X-Forwarded-For` is what distinguishes
+  callers and it is spoofable. The per-site half of the key still holds.
+- **Still set an OpenAI spend limit.** `COGNISWARM_MAX_TWINS_PER_RUN` bounds a
+  single request; it does not bound many requests.
+- **Anonymous mode is unscoped.** `COGNISWARM_ALLOW_ANONYMOUS=1` has no key to
+  carry a tenant, so it sees everything. Correct for local development and
+  single-tenant servers; never set it on a shared deployment.
+- **Runs written before tenancy have no owner.** They stay visible to an
+  unscoped caller and invisible to a scoped one. Backfill `swarm_runs.site_id`
+  if you need historical runs attributed.
 - **No abort propagation.** Closing a tab mid-run does not cancel the fan-out;
   it bills to completion.
 - **Observability is one log line.** No request IDs, no metrics, and
