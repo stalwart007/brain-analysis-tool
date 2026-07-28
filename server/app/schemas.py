@@ -483,30 +483,6 @@ class PriceSensitivityResult(BaseModel):
     )
 
 
-# ---------------------------------------------------------------- objection radar
-
-
-class ContentStudyRequest(BaseModel):
-    """A neuro-impact study over any digital content.
-
-    `asset` is the general path — text, image, video keyframes, audio
-    transcript, a landing page, or a deck. `content`/`content_type` are the
-    original text-only fields, kept so existing callers and stored runs keep
-    working; when `asset` is absent they are treated as a text asset.
-    """
-
-    content: str = Field(
-        default="",
-        max_length=200_000,
-        description="Script, transcript, storyboard, or copy. Ignored when `asset` is set.",
-    )
-    content_type: Literal["video_script", "ad_copy", "article", "storyboard"] = "video_script"
-    asset: Optional[ContentAsset] = None
-    session_ids: list[str] = Field(default_factory=list)
-    twins_per_persona: int = Field(default=3, ge=1, le=20)
-    cognitive_load: Literal["low", "medium", "high"] = "low"
-
-
 # ---------------------------------------------------------------- content assets
 
 
@@ -562,6 +538,30 @@ class ImageHierarchy(BaseModel):
 
 class VideoFrameRead(BaseModel):
     description: str = Field(description="What is on screen and its emotional register.")
+
+
+# ---------------------------------------------------------------- objection radar
+
+
+class ContentStudyRequest(BaseModel):
+    """A neuro-impact study over any digital content.
+
+    `asset` is the general path — text, image, video keyframes, audio
+    transcript, a landing page, or a deck. `content`/`content_type` are the
+    original text-only fields, kept so existing callers and stored runs keep
+    working; when `asset` is absent they are treated as a text asset.
+    """
+
+    content: str = Field(
+        default="",
+        max_length=200_000,
+        description="Script, transcript, storyboard, or copy. Ignored when `asset` is set.",
+    )
+    content_type: Literal["video_script", "ad_copy", "article", "storyboard"] = "video_script"
+    asset: Optional[ContentAsset] = None
+    session_ids: list[str] = Field(default_factory=list)
+    twins_per_persona: int = Field(default=3, ge=1, le=20)
+    cognitive_load: Literal["low", "medium", "high"] = "low"
 
 
 class ContentSegments(BaseModel):
