@@ -19,5 +19,9 @@ next-env.d.ts
 .idea/
 .DS_Store
 
-# personal working notes, not published
+# Internal working documents — engineering notes, commercial planning and
+# operational runbooks. They stay in docs/ on disk; they are simply not
+# tracked.
 docs/AUDIT-BACKLOG.md
+docs/SCALING-PLAN.md
+docs/DEPLOY.md
