@@ -6,6 +6,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from .config import DB_PATH
@@ -124,6 +125,43 @@ def insert_session(
             (session_id, site_id, page_path, _now(), json.dumps(features), panel_member_id),
         )
     return session_id
+
+
+def backup_to(destination: "str | Path") -> Path:
+    """Consistent snapshot of the database, safe to take while it is in use.
+
+    Use this instead of copying the file. WAL keeps recent transactions in a
+    `-wal` sidecar until a checkpoint, so `cp cogniswarm.db backup.db` produces
+    a file that opens cleanly, contains a plausible-looking database, and is
+    silently missing everything written since the last checkpoint — the worst
+    possible failure mode for a backup, because you only discover it when you
+    restore. The online-backup API walks the live database under a read lock
+    and produces a single fully-checkpointed file.
+    """
+    dest = Path(destination)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(DB_PATH, timeout=30.0)
+    target = sqlite3.connect(dest)
+    try:
+        with target:
+            source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    return dest
+
+
+def ping() -> None:
+    """Cheapest possible proof that the datastore is actually reachable.
+
+    Used by the health check. Deliberately reads from a real table rather than
+    running `SELECT 1`: the failure this exists to catch is a volume that did
+    not mount, where opening a connection succeeds against a fresh empty file
+    on the container's own layer and only a query against the schema reveals
+    that nothing is there.
+    """
+    with _conn() as c:
+        c.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
 
 def get_session(session_id: str) -> Optional[dict[str, Any]]:

@@ -130,14 +130,36 @@ app = FastAPI(title="CogniSwarm", version="0.2.0", lifespan=lifespan)
 # marked "dev only" in a comment but had no way to be anything else, so it
 # shipped as written — and paired with the fail-open auth above it meant any
 # page a developer visited could read the whole telemetry corpus off localhost.
+#
+# This list is what makes the SDK work on a customer's site, and an empty one
+# is why it currently does not. `transport.ts` sends the beacon as a Blob typed
+# application/json, which is not a CORS-safelisted content type, so every
+# cross-origin POST is preceded by a preflight — and with no configured origins
+# that preflight is refused. The failure is completely silent from both ends:
+# `navigator.sendBeacon` returns true on *queueing*, so the SDK reports success,
+# and the request never reaches a route so the server logs nothing. A correctly
+# integrated site drops 100% of its telemetry and nobody finds out.
+#
+# Set COGNISWARM_ALLOWED_ORIGINS to the customer origins that may post
+# telemetry, comma separated, scheme included:
+#   COGNISWARM_ALLOWED_ORIGINS=https://acme.com,https://www.acme.com
+#
+# Origins are matched exactly — scheme, host and port. https://acme.com does
+# not cover https://www.acme.com, and neither covers a staging subdomain.
 _ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("COGNISWARM_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Ingest is the only cross-origin surface: the dashboard reaches the
+    # analysis API server-side through its own proxy and is never subject to
+    # CORS. So the browser only ever needs POST (plus the OPTIONS preflight,
+    # which CORSMiddleware answers itself) and only the one header the beacon
+    # actually sets. Narrowing these means a stolen origin entry cannot be used
+    # to drive the rest of the API from someone's browser.
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 storage.init_db()
@@ -148,6 +170,29 @@ _COLLECTOR_DIST = REPO_ROOT / "packages" / "collector" / "dist"
 
 if _COLLECTOR_DIST.exists():
     app.mount("/static/collector", StaticFiles(directory=_COLLECTOR_DIST), name="collector")
+
+
+# ------------------------------------------------------------------ liveness
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict:
+    """Platform health check. Deliberately outside `require_api_key`.
+
+    An orchestrator probes this before the app is reachable by anything else,
+    so gating it behind auth means the container is killed as unhealthy while
+    working perfectly. It touches the database because a backend that cannot
+    reach its volume is not healthy in any useful sense — that is the failure
+    this needs to catch, since the mount is the part most likely to be wrong.
+
+    Returns no configuration, no version, no paths: it is a public endpoint and
+    the only thing a prober is entitled to know is up or not up.
+    """
+    try:
+        storage.ping()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Datastore unavailable.")
+    return {"status": "ok"}
 
 
 # ------------------------------------------------------------------ ingestion

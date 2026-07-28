@@ -1,0 +1,69 @@
+# Local reproduction of the production topology.
+#
+# The point of this file is not convenience — it is that the one thing most
+# likely to break in production is the network shape, and here it is exercised
+# the same way. The backend has NO published ports: it is reachable only from
+# the dashboard over the internal network, exactly as it should be deployed.
+# If something works locally through `localhost:8000`, that is a hole that will
+# not exist in production and a bug you will find only after deploying.
+#
+#   cp server/.env.example server/.env      # then add your OPENAI_API_KEY
+#   docker compose up --build
+#   open http://localhost:3000
+#
+# Provision a member (the image has no signup flow, by design):
+#   docker compose run --rm --entrypoint sh dashboard -c \
+#     'node /app/scripts/add-user.mjs you@team.com your-password "Your Name"'
+
+services:
+  backend:
+    build:
+      context: ./server
+    # Deliberately no `ports:`. Ingest reaches this through the dashboard's
+    # public /api/ingest passthrough; nothing else should be able to reach it
+    # at all. The analysis surface still has an unauthenticated
+    # persona-eviction path and no tenant isolation — keeping it off any
+    # public interface is what contains both until they are fixed.
+    expose:
+      - "8000"
+    environment:
+      COGNISWARM_DB: /data/cogniswarm.db
+      # Backend auth fails closed: with neither of these set every /v1/*
+      # endpoint returns 503. Inside a private network with a single known
+      # caller, the anonymous hatch is the honest choice; set
+      # COGNISWARM_API_KEYS instead if the network is not trusted.
+      COGNISWARM_ALLOW_ANONYMOUS: "1"
+      # Origins allowed to POST telemetry. Without the site's exact origin
+      # here, the beacon's CORS preflight is refused and every segment is
+      # dropped — silently, because sendBeacon reports success regardless.
+      COGNISWARM_ALLOWED_ORIGINS: "${COGNISWARM_ALLOWED_ORIGINS:-http://localhost:3000}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:?set OPENAI_API_KEY in your shell or server/.env}"
+    volumes:
+      - cogniswarm-data:/data
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      # Host port is overridable so this can run alongside `npm run dev`, which
+      # already holds 3000 on most machines that have this repo checked out.
+      #   DASHBOARD_PORT=3100 docker compose up
+      - "${DASHBOARD_PORT:-3000}:3000"
+    environment:
+      # Service name, not localhost — the backend is a separate container.
+      COGNISWARM_BACKEND: http://backend:8000
+      # Signs session cookies. No default on purpose: a fallback here would be
+      # a constant that anyone reading this file could forge sessions with.
+      AUTH_SECRET: "${AUTH_SECRET:?generate one with: openssl rand -base64 32}"
+      COGNISWARM_USERS_FILE: /secrets/users.json
+    volumes:
+      # Members survive image rebuilds because they live here, not in the image.
+      - ./dashboard/data:/secrets:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  cogniswarm-data:
