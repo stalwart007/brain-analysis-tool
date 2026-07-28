@@ -117,7 +117,7 @@ Expect roughly $10/mo: two shared-cpu-1x machines and a 3 GB volume.
 | | |
 |---|---|
 | `OPENAI_API_KEY` | required |
-| `COGNISWARM_API_KEYS` | **required unless** `COGNISWARM_ALLOW_ANONYMOUS=1`. Auth fails closed: with neither, every `/v1/*` returns 503 |
+| `COGNISWARM_API_KEYS` | **required unless** `COGNISWARM_ALLOW_ANONYMOUS=1`. Auth fails closed: with neither, every `/v1/*` returns 503. Two forms — `key:site` scopes a key to one tenant, a bare `key` is unscoped (admin / single-tenant) |
 | `COGNISWARM_ALLOWED_ORIGINS` | customer origins that may POST telemetry, comma separated, scheme included. **Empty means the SDK silently drops everything** — see below |
 | `COGNISWARM_DB` | set to `/data/cogniswarm.db`. Defaults into the repo tree, which in a container is an ephemeral image layer |
 | `COGNISWARM_CONCURRENCY` | max concurrent twin calls, default 8 |
@@ -185,10 +185,12 @@ Not blockers for a demo or early customers, but know them:
 - **No per-run cost ceiling.** Worst case from one request: 200 personas × 20
   twins × 8 variants = 32,000 twin calls. Set a hard spend limit in your OpenAI
   billing settings — that is currently the only backstop.
-- **No tenant isolation.** `site_id` is written and never read; every run mixes
-  personas across all sites.
-- **Unauthenticated persona eviction.** 200 ingests disable every study
-  endpoint until more sessions are profiled.
+- **Anonymous mode is unscoped.** `COGNISWARM_ALLOW_ANONYMOUS=1` has no key to
+  carry a tenant, so it sees everything. Correct for local development and
+  single-tenant servers; never set it on a shared deployment.
+- **Runs written before tenancy have no owner.** They stay visible to an
+  unscoped caller and invisible to a scoped one. Backfill `swarm_runs.site_id`
+  if you need historical runs attributed.
 - **No abort propagation.** Closing a tab mid-run does not cancel the fan-out;
   it bills to completion.
 - **Observability is one log line.** No request IDs, no metrics, and

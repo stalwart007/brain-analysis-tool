@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
     created_at TEXT NOT NULL,
     -- swarm | compare | walk | price | objection | virality | content | optimize | sequence
     kind TEXT NOT NULL DEFAULT 'swarm',
+    -- Owning tenant. Nullable because rows written before tenancy existed have
+    -- no owner and must stay readable by an unscoped caller; a scoped caller
+    -- never sees them.
+    site_id TEXT,
     request TEXT NOT NULL,
     result TEXT NOT NULL,
     actuals TEXT                          -- ActualsPayload JSON (validation harness)
@@ -38,7 +42,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,                 -- queued | running | done | error
     payload TEXT NOT NULL,
     run_id TEXT,                          -- resulting swarm_runs row when done
-    error TEXT
+    error TEXT,
+    site_id TEXT                          -- owning tenant, carried to the run
 );
 CREATE TABLE IF NOT EXISTS panel_members (
     id TEXT PRIMARY KEY,
@@ -60,6 +65,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_received  ON sessions(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_panel     ON sessions(panel_member_id);
 CREATE INDEX IF NOT EXISTS idx_runs_kind_created  ON swarm_runs(kind, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_created       ON swarm_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_site          ON swarm_runs(site_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_site      ON sessions(site_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_created       ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status        ON jobs(status);
 """
@@ -98,11 +105,16 @@ def init_db() -> None:
             c.execute("ALTER TABLE swarm_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'swarm'")
         if "actuals" not in cols:
             c.execute("ALTER TABLE swarm_runs ADD COLUMN actuals TEXT")
+        if "site_id" not in cols:
+            c.execute("ALTER TABLE swarm_runs ADD COLUMN site_id TEXT")
         session_cols = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
         if "panel_member_id" not in session_cols:
             c.execute("ALTER TABLE sessions ADD COLUMN panel_member_id TEXT")
         if "cognition" not in session_cols:
             c.execute("ALTER TABLE sessions ADD COLUMN cognition TEXT")
+        job_cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
+        if "site_id" not in job_cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN site_id TEXT")
         # after the migrations, so indexes on added columns are creatable
         c.executescript(_INDEXES)
 
@@ -164,21 +176,36 @@ def ping() -> None:
         c.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
 
-def get_session(session_id: str) -> Optional[dict[str, Any]]:
+def get_session(session_id: str, site_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """One session. With `site_id`, a row belonging to another tenant reads as
+    absent rather than forbidden — a 404 rather than a 403 — so the endpoint
+    cannot be used to probe which session ids exist elsewhere."""
+    where = "WHERE id = ? AND site_id = ?" if site_id else "WHERE id = ?"
+    params: tuple = (session_id, site_id) if site_id else (session_id,)
     with _conn() as c:
-        row = c.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        row = c.execute(f"SELECT * FROM sessions {where}", params).fetchone()
     return _hydrate(row) if row else None
 
 
-def list_sessions(limit: int = 200) -> list[dict[str, Any]]:
+def list_sessions(limit: int = 200, site_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """Newest sessions, optionally restricted to one tenant.
+
+    `site_id=None` means UNSCOPED — every tenant. That is correct only for an
+    unscoped API key (single-tenant deployments and admin keys); callers with a
+    site must always pass it. See `Caller` in main.py, which is what decides.
+    """
+    where = "WHERE site_id = ?" if site_id else ""
+    params: tuple = (site_id, limit) if site_id else (limit,)
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM sessions ORDER BY received_at DESC LIMIT ?", (limit,)
+            f"SELECT * FROM sessions {where} ORDER BY received_at DESC LIMIT ?", params
         ).fetchall()
     return [_hydrate(r) for r in rows]
 
 
-def list_profiled_sessions(limit: int = 200) -> list[dict[str, Any]]:
+def list_profiled_sessions(
+    limit: int = 200, site_id: Optional[str] = None
+) -> list[dict[str, Any]]:
     """Sessions that actually carry a persona, filtered IN SQL.
 
     The caller used to take the newest `limit` rows and filter for a persona in
@@ -193,11 +220,16 @@ def list_profiled_sessions(limit: int = 200) -> list[dict[str, Any]]:
     so the same scenario run a day apart silently ran against a different set
     of personas with nothing in the stored result recording which.
     """
+    where = "WHERE persona IS NOT NULL"
+    params: list = []
+    if site_id:
+        where += " AND site_id = ?"
+        params.append(site_id)
+    params.append(limit)
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM sessions WHERE persona IS NOT NULL "
-            "ORDER BY received_at DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM sessions {where} ORDER BY received_at DESC LIMIT ?",
+            tuple(params),
         ).fetchall()
     return [_hydrate(r) for r in rows]
 
@@ -221,41 +253,71 @@ def set_cognition(session_id: str, profile: dict[str, Any]) -> None:
 
 
 def insert_swarm_run(
-    request: dict[str, Any], result: dict[str, Any], kind: str = "swarm"
+    request: dict[str, Any],
+    result: dict[str, Any],
+    kind: str = "swarm",
+    site_id: Optional[str] = None,
 ) -> str:
+    """Persist a run, stamped with the tenant that produced it.
+
+    `site_id=None` records a run made by an unscoped caller, which is the
+    single-tenant and admin case. It is deliberately not defaulted to some
+    placeholder string: a run with no owner must be distinguishable from one
+    owned by a tenant literally called "default", or the predicate below leaks.
+    """
     run_id = uuid.uuid4().hex[:12]
     with _conn() as c:
         c.execute(
-            "INSERT INTO swarm_runs (id, created_at, kind, request, result) VALUES (?,?,?,?,?)",
-            (run_id, _now(), kind, json.dumps(request), json.dumps(result)),
+            "INSERT INTO swarm_runs (id, created_at, kind, site_id, request, result)"
+            " VALUES (?,?,?,?,?,?)",
+            (run_id, _now(), kind, site_id, json.dumps(request), json.dumps(result)),
         )
     return run_id
 
 
-def get_swarm_run(run_id: str) -> Optional[dict[str, Any]]:
+def get_swarm_run(run_id: str, site_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """One run. A scoped caller sees another tenant's run as absent, not
+    forbidden, so run ids cannot be enumerated across tenants."""
+    where = "WHERE id = ? AND site_id = ?" if site_id else "WHERE id = ?"
+    params: tuple = (run_id, site_id) if site_id else (run_id,)
     with _conn() as c:
-        row = c.execute("SELECT * FROM swarm_runs WHERE id = ?", (run_id,)).fetchone()
+        row = c.execute(f"SELECT * FROM swarm_runs {where}", params).fetchone()
     return _hydrate_run(row) if row else None
 
 
-def set_actuals(run_id: str, actuals: dict[str, Any]) -> bool:
+def set_actuals(
+    run_id: str, actuals: dict[str, Any], site_id: Optional[str] = None
+) -> bool:
+    """Record ground truth against a run. Scoped, because otherwise one tenant
+    could write outcomes onto another's runs and corrupt their calibration —
+    a write path, so the isolation matters more here than on the reads."""
+    where = "WHERE id = ? AND site_id = ?" if site_id else "WHERE id = ?"
+    params: tuple = (
+        (json.dumps(actuals), run_id, site_id) if site_id else (json.dumps(actuals), run_id)
+    )
     with _conn() as c:
-        cur = c.execute(
-            "UPDATE swarm_runs SET actuals = ? WHERE id = ?",
-            (json.dumps(actuals), run_id),
-        )
+        cur = c.execute(f"UPDATE swarm_runs SET actuals = ? {where}", params)
         return cur.rowcount > 0
 
 
-def list_swarm_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[str, Any]]:
+def list_swarm_runs(
+    limit: int = 50, kind: Optional[str] = None, site_id: Optional[str] = None
+) -> list[dict[str, Any]]:
     query = "SELECT * FROM swarm_runs"
-    params: tuple[Any, ...] = ()
+    clauses: list[str] = []
+    params: list[Any] = []
     if kind:
-        query += " WHERE kind = ?"
-        params = (kind,)
+        clauses.append("kind = ?")
+        params.append(kind)
+    if site_id:
+        clauses.append("site_id = ?")
+        params.append(site_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
     with _conn() as c:
-        rows = c.execute(query, (*params, limit)).fetchall()
+        rows = c.execute(query, tuple(params)).fetchall()
     return [_hydrate_run(r) for r in rows]
 
 
@@ -270,13 +332,23 @@ def _hydrate_run(row: sqlite3.Row) -> dict[str, Any]:
 # ------------------------------------------------------------------ jobs
 
 
-def insert_job(kind: str, payload: dict[str, Any]) -> str:
+def insert_job(
+    kind: str, payload: dict[str, Any], site_id: Optional[str] = None
+) -> str:
+    """Queue a job, remembering which tenant asked for it.
+
+    The tenant has to be stored rather than inferred later: the worker runs
+    without a request context, so a job submitted by a scoped caller used to
+    produce a run owned by nobody — invisible to the tenant that paid for it
+    and visible to an unscoped one.
+    """
     job_id = uuid.uuid4().hex[:12]
     now = _now()
     with _conn() as c:
         c.execute(
-            "INSERT INTO jobs (id, created_at, updated_at, kind, status, payload) VALUES (?,?,?,?,?,?)",
-            (job_id, now, now, kind, "queued", json.dumps(payload)),
+            "INSERT INTO jobs (id, created_at, updated_at, kind, status, payload, site_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (job_id, now, now, kind, "queued", json.dumps(payload), site_id),
         )
     return job_id
 
@@ -295,16 +367,18 @@ def update_job(
         )
 
 
-def get_job(job_id: str) -> Optional[dict[str, Any]]:
+def get_job(job_id: str, site_id: Optional[str] = None) -> Optional[dict[str, Any]]:
     with _conn() as c:
         row = c.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     return _hydrate_job(row) if row else None
 
 
-def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
+def list_jobs(limit: int = 50, site_id: Optional[str] = None) -> list[dict[str, Any]]:
+    where = "WHERE site_id = ?" if site_id else ""
+    params: tuple = (site_id, limit) if site_id else (limit,)
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ?", params
         ).fetchall()
     return [_hydrate_job(r) for r in rows]
 

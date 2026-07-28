@@ -20,8 +20,9 @@ import asyncio
 import hmac
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import json
 
@@ -79,7 +80,52 @@ from .swarm import (
 from .validation import calibration_report
 
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+@dataclass(frozen=True)
+class Caller:
+    """Who is asking, and what they are allowed to see.
+
+    `site_id is None` means UNSCOPED — every tenant's data. That is the right
+    answer for a single-tenant deployment and for an admin key, and the wrong
+    answer for a customer key, so it is represented explicitly rather than as a
+    magic string: a run owned by nobody must stay distinguishable from a run
+    owned by a tenant that happens to be called "default".
+    """
+
+    site_id: Optional[str] = None
+
+    @property
+    def scoped(self) -> bool:
+        return self.site_id is not None
+
+    def owns(self, site_id: Optional[str]) -> bool:
+        return self.site_id is None or self.site_id == site_id
+
+
+def _key_table() -> dict[str, Optional[str]]:
+    """Parse COGNISWARM_API_KEYS into {key: site_id or None}.
+
+    Two accepted forms, so adding tenancy does not break an existing
+    deployment on the night it ships:
+
+        COGNISWARM_API_KEYS=k1:acme,k2:globex   # scoped to one tenant each
+        COGNISWARM_API_KEYS=k3                  # unscoped (admin/single-tenant)
+
+    A site id cannot contain ':' (it comes from IngestEnvelope.site_id, which
+    the SDK sets), so splitting on the first colon is unambiguous.
+    """
+    table: dict[str, Optional[str]] = {}
+    for entry in os.environ.get("COGNISWARM_API_KEYS", "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, _, site = entry.partition(":")
+        key = key.strip()
+        if key:
+            table[key] = site.strip() or None
+    return table
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> Caller:
     """Headless-API auth.
 
     FAILS CLOSED. Returning early when COGNISWARM_API_KEYS is unset would mean
@@ -94,19 +140,28 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     COGNISWARM_ALLOW_ANONYMOUS=1, so the open state is always something someone
     chose rather than something that happened.
     """
-    keys = {k.strip() for k in os.environ.get("COGNISWARM_API_KEYS", "").split(",") if k.strip()}
+    keys = _key_table()
     if keys:
         # Configured keys always win: the anonymous escape hatch below can never
         # weaken a server that has been given keys.
         #
-        # constant-time compare — `in` on a set of strings short-circuits on the
-        # first differing byte, which leaks key length and prefix under timing.
-        if not (x_api_key and any(hmac.compare_digest(x_api_key, k) for k in keys)):
+        # constant-time compare — `in` on a dict of strings short-circuits on
+        # the first differing byte, which leaks key length and prefix under
+        # timing. Every candidate is compared so the work does not depend on
+        # which key matched either.
+        matched: Optional[str] = None
+        for candidate, site in keys.items():
+            if x_api_key and hmac.compare_digest(x_api_key, candidate):
+                matched = candidate
+        if matched is None:
             raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key.")
-        return
+        return Caller(site_id=keys[matched])
 
     if os.environ.get("COGNISWARM_ALLOW_ANONYMOUS", "").strip().lower() in {"1", "true", "yes"}:
-        return
+        # Anonymous is unscoped by construction — there is no key to carry a
+        # tenant. Correct for local development and single-tenant servers; it
+        # is why the anonymous hatch must never be set on a shared deployment.
+        return Caller(site_id=None)
 
     raise HTTPException(
         status_code=503,
@@ -115,6 +170,15 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
             "or COGNISWARM_ALLOW_ANONYMOUS=1 for local development."
         ),
     )
+
+
+#: Every authenticated endpoint takes this instead of listing the dependency
+#: in `dependencies=[...]`. Taking it as a PARAMETER rather than a side-effect
+#: is the point: the tenant scope has to be visible in the signature, or the
+#: next endpoint someone adds will authenticate correctly and then query every
+#: tenant's data — which is exactly how `site_id` came to be written and never
+#: read. FastAPI caches the dependency per request, so this costs nothing.
+CallerDep = Annotated[Caller, Depends(require_api_key)]
 
 
 @asynccontextmanager
@@ -223,9 +287,9 @@ def ingest(envelope: IngestEnvelope) -> dict:
     return {"status": "accepted", "session_id": session_id}
 
 
-@app.get("/v1/sessions", dependencies=[Depends(require_api_key)])
-def sessions() -> list[dict]:
-    return storage.list_sessions()
+@app.get("/v1/sessions")
+def sessions(caller: CallerDep) -> list[dict]:
+    return storage.list_sessions(site_id=caller.site_id)
 
 
 # ------------------------------------------------------------------ profiling
@@ -264,9 +328,9 @@ def _cognition_inputs(features: FeaturePayload) -> dict:
     }
 
 
-@app.post("/v1/sessions/{session_id}/profile", dependencies=[Depends(require_api_key)])
-def profile(session_id: str) -> dict:
-    session = storage.get_session(session_id)
+@app.post("/v1/sessions/{session_id}/profile")
+def profile(caller: CallerDep, session_id: str) -> dict:
+    session = storage.get_session(session_id, site_id=caller.site_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Unknown session")
 
@@ -287,15 +351,12 @@ def profile(session_id: str) -> dict:
     }
 
 
-@app.post(
-    "/v1/sessions/{session_id}/profile/stream",
-    dependencies=[Depends(require_api_key)],
-)
-async def profile_stream(session_id: str) -> StreamingResponse:
+@app.post("/v1/sessions/{session_id}/profile/stream")
+async def profile_stream(session_id: str, caller: CallerDep) -> StreamingResponse:
     """The full profiling pipeline as SSE — every model's computation is
     streamed as it happens so the frontend can show the real work: EM traces,
     BIC comparisons, fitted parameters, then the LLM synthesis stages."""
-    session = storage.get_session(session_id)
+    session = storage.get_session(session_id, site_id=caller.site_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Unknown session")
     features = FeaturePayload(**session["features"])
@@ -339,15 +400,15 @@ async def profile_stream(session_id: str) -> StreamingResponse:
 # ------------------------------------------------------------------ swarm
 
 
-def _load_personas(session_ids: list[str]) -> list[PersonaSeed]:
+def _load_personas(session_ids: list[str], caller: Caller) -> list[PersonaSeed]:
     candidates = (
-        [storage.get_session(sid) for sid in session_ids]
+        [storage.get_session(sid, site_id=caller.site_id) for sid in session_ids]
         if session_ids
         # Filtered in SQL, not in Python after a LIMIT — see the note on
         # list_profiled_sessions. Taking the newest 200 rows and *then* looking
         # for personas meant 200 unauthenticated ingests disabled every study
         # endpoint in the product.
-        else storage.list_profiled_sessions()
+        else storage.list_profiled_sessions(site_id=caller.site_id)
     )
     personas = [
         PersonaSeed(**s["persona"])
@@ -399,9 +460,9 @@ def _llm_errors(exc: Exception) -> HTTPException:
     raise exc
 
 
-@app.post("/v1/swarm/run", dependencies=[Depends(require_api_key)])
-async def swarm_run(request: SwarmRunRequest) -> dict:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/swarm/run")
+async def swarm_run(caller: CallerDep, request: SwarmRunRequest) -> dict:
+    personas = _load_personas(request.session_ids, caller)
     try:
         aggregate = await run_swarm(
             personas=personas,
@@ -411,22 +472,32 @@ async def swarm_run(request: SwarmRunRequest) -> dict:
         )
     except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
-    run_id = storage.insert_swarm_run(request.model_dump(), aggregate.model_dump())
+    run_id = storage.insert_swarm_run(
+        request.model_dump(), aggregate.model_dump(), site_id=caller.site_id
+    )
     result = aggregate.model_dump()
     result["run_id"] = run_id
     return result
 
 
-def _sse(generator, request_model, kind: str) -> StreamingResponse:
+def _sse(generator, request_model, kind: str, caller: Caller) -> StreamingResponse:
     """Wrap a simulation's async event generator as an SSE response, persisting
-    the run when the terminal 'done' event passes through."""
+    the run when the terminal 'done' event passes through.
+
+    `caller` is required rather than optional: every streaming study persists a
+    run through here, so a default would silently write unowned rows that no
+    scoped tenant can ever read back.
+    """
 
     async def gen():
         try:
             async for evt in generator:
                 if evt.get("type") == "done":
                     run_id = storage.insert_swarm_run(
-                        request_model.model_dump(), evt["result"], kind=kind
+                        request_model.model_dump(),
+                        evt["result"],
+                        kind=kind,
+                        site_id=caller.site_id,
                     )
                     evt["result"]["run_id"] = run_id
                 yield f"data: {json.dumps(evt)}\n\n"
@@ -441,24 +512,25 @@ def _sse(generator, request_model, kind: str) -> StreamingResponse:
     )
 
 
-@app.post("/v1/swarm/stream", dependencies=[Depends(require_api_key)])
-async def swarm_stream(request: SwarmRunRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/swarm/stream")
+async def swarm_stream(caller: CallerDep, request: SwarmRunRequest) -> StreamingResponse:
+    personas = _load_personas(request.session_ids, caller)
     return _sse(
         stream_swarm(
             personas, request.scenario, request.twins_per_persona, request.cognitive_load
         ),
         request,
         "swarm",
+        caller,
     )
 
 
-@app.post("/v1/swarm/compare/stream", dependencies=[Depends(require_api_key)])
-async def compare_stream(request: CompareRequest) -> StreamingResponse:
+@app.post("/v1/swarm/compare/stream")
+async def compare_stream(caller: CallerDep, request: CompareRequest) -> StreamingResponse:
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = _load_personas(request.session_ids)
+    personas = _load_personas(request.session_ids, caller)
     return _sse(
         stream_compare(
             personas,
@@ -469,24 +541,26 @@ async def compare_stream(request: CompareRequest) -> StreamingResponse:
         ),
         request,
         "compare",
+        caller,
     )
 
 
-@app.post("/v1/swarm/walk/stream", dependencies=[Depends(require_api_key)])
-async def walk_stream(request: WalkRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/swarm/walk/stream")
+async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingResponse:
+    personas = _load_personas(request.session_ids, caller)
     return _sse(
         stream_walkthrough(
             personas, request.steps, request.twins_per_persona, request.cognitive_load
         ),
         request,
         "walk",
+        caller,
     )
 
 
-@app.post("/v1/studies/price/stream", dependencies=[Depends(require_api_key)])
-async def price_stream(request: PriceSensitivityRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/studies/price/stream")
+async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> StreamingResponse:
+    personas = _load_personas(request.session_ids, caller)
     return _sse(
         stream_price_sensitivity(
             personas,
@@ -497,63 +571,65 @@ async def price_stream(request: PriceSensitivityRequest) -> StreamingResponse:
         ),
         request,
         "price",
+        caller,
     )
 
 
-@app.post("/v1/studies/objection/stream", dependencies=[Depends(require_api_key)])
-async def objection_stream(request: ObjectionRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/studies/objection/stream")
+async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> StreamingResponse:
+    personas = _load_personas(request.session_ids, caller)
     return _sse(
         stream_objection_scan(
             personas, request.pitch, request.twins_per_persona, request.cognitive_load
         ),
         request,
         "objection",
+        caller,
     )
 
 
-@app.post("/v1/studies/virality/stream", dependencies=[Depends(require_api_key)])
-async def virality_stream(request: ViralityRequest) -> StreamingResponse:
+@app.post("/v1/studies/virality/stream")
+async def virality_stream(caller: CallerDep, request: ViralityRequest) -> StreamingResponse:
     """Virality forecast: Galton-Watson branching process over twin share
     intents — R0, extinction probability, seeded cascade quantile bands."""
-    personas = _load_personas(request.session_ids)
-    return _sse(stream_virality(personas, request), request, "virality")
+    personas = _load_personas(request.session_ids, caller)
+    return _sse(stream_virality(personas, request), request, "virality", caller)
 
 
-@app.post("/v1/studies/content/stream", dependencies=[Depends(require_api_key)])
-async def content_stream(request: ContentStudyRequest) -> StreamingResponse:
+@app.post("/v1/studies/content/stream")
+async def content_stream(caller: CallerDep, request: ContentStudyRequest) -> StreamingResponse:
     """Neuro-impact study: beat-by-beat audience response with ISC,
     change-point, peak-end memory, and functional-system mapping."""
-    personas = _load_personas(request.session_ids)
-    return _sse(stream_content_study(personas, request), request, "content")
+    personas = _load_personas(request.session_ids, caller)
+    return _sse(stream_content_study(personas, request), request, "content", caller)
 
 
-@app.post("/v1/studies/optimize/stream", dependencies=[Depends(require_api_key)])
-async def optimize_stream(request: CopyOptimizerRequest) -> StreamingResponse:
+@app.post("/v1/studies/optimize/stream")
+async def optimize_stream(caller: CallerDep, request: CopyOptimizerRequest) -> StreamingResponse:
     """Copy optimiser: an evolutionary loop that WRITES better copy — twin-scored
     populations, Thompson-allocated budget within each generation, LLM crossover
     and mutation between them, and a win claimed only when the champion's
     credible interval clears the seed's."""
-    personas = _load_personas(request.session_ids)
-    return _sse(stream_copy_optimizer(personas, request), request, "optimize")
+    personas = _load_personas(request.session_ids, caller)
+    return _sse(stream_copy_optimizer(personas, request), request, "optimize", caller)
 
 
-@app.post("/v1/studies/sequence/stream", dependencies=[Depends(require_api_key)])
-async def sequence_stream(request: SequenceRequest) -> StreamingResponse:
+@app.post("/v1/studies/sequence/stream")
+async def sequence_stream(caller: CallerDep, request: SequenceRequest) -> StreamingResponse:
     """Message-sequence optimiser: estimates a position-adjusted precedence
     matrix from a sampled subset of the N! orderings, then solves the linear
     ordering problem heuristically for the ordering that ends with the most
     intent — reporting primacy/recency separately from message strength."""
-    personas = _load_personas(request.session_ids)
-    return _sse(stream_sequence(personas, request), request, "sequence")
+    personas = _load_personas(request.session_ids, caller)
+    return _sse(stream_sequence(personas, request), request, "sequence", caller)
 
 
-@app.post("/v1/swarm/compare", dependencies=[Depends(require_api_key)])
-async def swarm_compare(request: CompareRequest) -> dict:
+@app.post("/v1/swarm/compare")
+async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = _load_personas(request.session_ids)
+    personas = _load_personas(request.session_ids, caller)
     try:
         compared = await run_compare(
             personas=personas,
@@ -563,15 +639,17 @@ async def swarm_compare(request: CompareRequest) -> dict:
         )
     except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
-    run_id = storage.insert_swarm_run(request.model_dump(), compared.model_dump(), kind="compare")
+    run_id = storage.insert_swarm_run(
+        request.model_dump(), compared.model_dump(), kind="compare", site_id=caller.site_id
+    )
     result = compared.model_dump()
     result["run_id"] = run_id
     return result
 
 
-@app.post("/v1/swarm/walk", dependencies=[Depends(require_api_key)])
-async def swarm_walk(request: WalkRequest) -> dict:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/swarm/walk")
+async def swarm_walk(caller: CallerDep, request: WalkRequest) -> dict:
+    personas = _load_personas(request.session_ids, caller)
     try:
         aggregate = await run_walkthrough(
             personas=personas,
@@ -581,23 +659,25 @@ async def swarm_walk(request: WalkRequest) -> dict:
         )
     except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
-    run_id = storage.insert_swarm_run(request.model_dump(), aggregate.model_dump(), kind="walk")
+    run_id = storage.insert_swarm_run(
+        request.model_dump(), aggregate.model_dump(), kind="walk", site_id=caller.site_id
+    )
     result = aggregate.model_dump()
     result["run_id"] = run_id
     return result
 
 
-@app.get("/v1/swarm/runs", dependencies=[Depends(require_api_key)])
-def swarm_runs(kind: Optional[str] = None) -> list[dict]:
-    return storage.list_swarm_runs(kind=kind)
+@app.get("/v1/swarm/runs")
+def swarm_runs(caller: CallerDep, kind: Optional[str] = None) -> list[dict]:
+    return storage.list_swarm_runs(kind=kind, site_id=caller.site_id)
 
 
 # ------------------------------------------------------------------ studies (advanced use cases)
 
 
-@app.post("/v1/studies/price", dependencies=[Depends(require_api_key)])
-async def study_price(request: PriceSensitivityRequest) -> dict:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/studies/price")
+async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> dict:
+    personas = _load_personas(request.session_ids, caller)
     try:
         result = await run_price_sensitivity(
             personas=personas,
@@ -608,15 +688,17 @@ async def study_price(request: PriceSensitivityRequest) -> dict:
         )
     except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
-    run_id = storage.insert_swarm_run(request.model_dump(), result.model_dump(), kind="price")
+    run_id = storage.insert_swarm_run(
+        request.model_dump(), result.model_dump(), kind="price", site_id=caller.site_id
+    )
     out = result.model_dump()
     out["run_id"] = run_id
     return out
 
 
-@app.post("/v1/studies/objection", dependencies=[Depends(require_api_key)])
-async def study_objection(request: ObjectionRequest) -> dict:
-    personas = _load_personas(request.session_ids)
+@app.post("/v1/studies/objection")
+async def study_objection(caller: CallerDep, request: ObjectionRequest) -> dict:
+    personas = _load_personas(request.session_ids, caller)
     try:
         result = await run_objection_scan(
             personas=personas,
@@ -626,7 +708,9 @@ async def study_objection(request: ObjectionRequest) -> dict:
         )
     except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
-    run_id = storage.insert_swarm_run(request.model_dump(), result.model_dump(), kind="objection")
+    run_id = storage.insert_swarm_run(
+        request.model_dump(), result.model_dump(), kind="objection", site_id=caller.site_id
+    )
     out = result.model_dump()
     out["run_id"] = run_id
     return out
@@ -635,25 +719,29 @@ async def study_objection(request: ObjectionRequest) -> dict:
 # ------------------------------------------------------------------ validation
 
 
-@app.post("/v1/runs/{run_id}/actuals", dependencies=[Depends(require_api_key)])
-def record_actuals(run_id: str, payload: ActualsPayload) -> dict:
+@app.post("/v1/runs/{run_id}/actuals")
+def record_actuals(caller: CallerDep, run_id: str, payload: ActualsPayload) -> dict:
     if payload.engagement is None and payload.intent is None:
         raise HTTPException(status_code=400, detail="Provide at least one metric.")
-    if not storage.set_actuals(run_id, payload.model_dump(exclude_none=True)):
+    if not storage.set_actuals(
+        run_id, payload.model_dump(exclude_none=True), site_id=caller.site_id
+    ):
         raise HTTPException(status_code=404, detail="Unknown run")
     return {"status": "recorded", "run_id": run_id}
 
 
-@app.get("/v1/validation/report", dependencies=[Depends(require_api_key)])
-def validation_report() -> CalibrationReport:
-    return calibration_report(storage.list_swarm_runs(limit=500, kind="swarm"))
+@app.get("/v1/validation/report")
+def validation_report(caller: CallerDep) -> CalibrationReport:
+    return calibration_report(
+        storage.list_swarm_runs(limit=500, kind="swarm", site_id=caller.site_id)
+    )
 
 
 # ------------------------------------------------------------------ jobs (Phase 3)
 
 
-@app.post("/v1/jobs", status_code=202, dependencies=[Depends(require_api_key)])
-def create_job(request: JobCreate) -> dict:
+@app.post("/v1/jobs", status_code=202)
+def create_job(request: JobCreate, caller: CallerDep) -> dict:
     # Validate the payload against the target request schema up front, so a bad
     # job fails at submission rather than silently in the worker.
     schema = {
@@ -666,18 +754,18 @@ def create_job(request: JobCreate) -> dict:
         payload = schema(**request.payload).model_dump()
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
-    job_id = jobs.enqueue(request.kind, payload)
+    job_id = jobs.enqueue(request.kind, payload, site_id=caller.site_id)
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/v1/jobs", dependencies=[Depends(require_api_key)])
-def list_jobs() -> list[dict]:
-    return storage.list_jobs()
+@app.get("/v1/jobs")
+def list_jobs(caller: CallerDep) -> list[dict]:
+    return storage.list_jobs(site_id=caller.site_id)
 
 
-@app.get("/v1/jobs/{job_id}", dependencies=[Depends(require_api_key)])
-def get_job(job_id: str) -> dict:
-    job = storage.get_job(job_id)
+@app.get("/v1/jobs/{job_id}")
+def get_job(caller: CallerDep, job_id: str) -> dict:
+    job = storage.get_job(job_id, site_id=caller.site_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job")
     return job
@@ -686,15 +774,15 @@ def get_job(job_id: str) -> dict:
 # ------------------------------------------------------------------ panel (Phase 4)
 
 
-@app.post("/v1/panel/members", dependencies=[Depends(require_api_key)])
-def create_panel_member(request: PanelMemberCreate) -> dict:
+@app.post("/v1/panel/members")
+def create_panel_member(caller: CallerDep, request: PanelMemberCreate) -> dict:
     member = storage.insert_panel_member(request.label)
     member["disclosure_url"] = f"/panel/{member['token']}"
     return member
 
 
-@app.get("/v1/panel/members", dependencies=[Depends(require_api_key)])
-def panel_members() -> list[dict]:
+@app.get("/v1/panel/members")
+def panel_members(caller: CallerDep) -> list[dict]:
     # tokens are capability URLs — do not leak them wholesale in listings
     return [
         {k: v for k, v in m.items() if k != "token"} | {"disclosure_url": f"/panel/{m['token']}"}

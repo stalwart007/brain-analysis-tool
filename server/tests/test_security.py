@@ -188,3 +188,111 @@ def test_price_sensitivity_requires_a_pricing_zone():
         _features(zone_dwell_ms={"pricing-table": 400.0}),
     )
     assert kept.price_sensitivity_signal == "high"
+
+
+# ── tenant isolation ──────────────────────────────────────────────────────
+#
+# `site_id` was written on every session and then never read anywhere in the
+# backend — no WHERE clause, no filter, no scoping predicate. One API key was
+# the entire authorization model, so every UI-driven run silently blended
+# personas from every customer, and GET /v1/sessions returned all of them.
+
+
+def _client_with_keys(monkeypatch, keys: str):
+    import importlib
+
+    import app.main as main_module
+
+    monkeypatch.setenv("COGNISWARM_API_KEYS", keys)
+    monkeypatch.delenv("COGNISWARM_ALLOW_ANONYMOUS", raising=False)
+    return TestClient(importlib.reload(main_module).app)
+
+
+def test_a_scoped_key_sees_only_its_own_sessions(monkeypatch):
+    from app import storage
+
+    acme = storage.insert_session(site_id="acme", page_path="/a", features={"event_count": 3})
+    globex = storage.insert_session(site_id="globex", page_path="/b", features={"event_count": 3})
+
+    c = _client_with_keys(monkeypatch, "ka:acme,kg:globex")
+
+    seen = c.get("/v1/sessions", headers={"X-API-Key": "ka"}).json()
+    ids = {s["id"] for s in seen}
+    assert acme in ids
+    assert globex not in ids, "a tenant could read another tenant's telemetry"
+
+    seen_g = c.get("/v1/sessions", headers={"X-API-Key": "kg"}).json()
+    ids_g = {s["id"] for s in seen_g}
+    assert globex in ids_g and acme not in ids_g
+
+
+def test_another_tenants_session_reads_as_absent_not_forbidden(monkeypatch):
+    """404 rather than 403: a 403 confirms the id exists, which turns the
+    endpoint into an oracle for enumerating other tenants' session ids."""
+    from app import storage
+
+    globex = storage.insert_session(site_id="globex", page_path="/b", features={"event_count": 3})
+    c = _client_with_keys(monkeypatch, "ka:acme,kg:globex")
+
+    r = c.post(f"/v1/sessions/{globex}/profile", headers={"X-API-Key": "ka"})
+    assert r.status_code == 404
+
+
+def test_a_scoped_key_cannot_borrow_another_tenants_personas(monkeypatch):
+    """The path that mattered most: session_ids is caller-supplied and was
+    never checked against anything, so naming another tenant's session id
+    seeded your swarm with their audience."""
+    from app import storage
+
+    victim = storage.insert_session(site_id="globex", page_path="/b", features={"event_count": 3})
+    storage.set_persona(victim, {"persona_id": "p", "label": "victims-audience"})
+
+    c = _client_with_keys(monkeypatch, "ka:acme,kg:globex")
+    r = c.post(
+        "/v1/swarm/run",
+        headers={"X-API-Key": "ka"},
+        json={"scenario": "x", "session_ids": [victim], "twins_per_persona": 1},
+    )
+    # 400 "no profiled personas" — the borrowed session resolves to nothing.
+    assert r.status_code == 400
+
+
+def test_runs_are_stamped_and_filtered_by_tenant(monkeypatch):
+    from app import storage
+
+    a = storage.insert_swarm_run({"scenario": "a"}, {"mean_intent": 0.5}, site_id="acme")
+    g = storage.insert_swarm_run({"scenario": "g"}, {"mean_intent": 0.5}, site_id="globex")
+
+    c = _client_with_keys(monkeypatch, "ka:acme,kg:globex")
+    ids = {r["id"] for r in c.get("/v1/swarm/runs", headers={"X-API-Key": "ka"}).json()}
+    assert a in ids and g not in ids
+
+
+def test_actuals_cannot_be_written_onto_another_tenants_run(monkeypatch):
+    """A write path, so this matters more than the reads: without scoping, one
+    tenant could corrupt another's calibration record."""
+    from app import storage
+
+    victim_run = storage.insert_swarm_run({"scenario": "g"}, {"mean_intent": 0.5}, site_id="globex")
+    c = _client_with_keys(monkeypatch, "ka:acme,kg:globex")
+
+    r = c.post(
+        f"/v1/runs/{victim_run}/actuals",
+        headers={"X-API-Key": "ka"},
+        json={"intent": 0.9},
+    )
+    assert r.status_code == 404
+    assert storage.get_swarm_run(victim_run)["actuals"] is None
+
+
+def test_an_unscoped_key_still_sees_everything(monkeypatch):
+    """Single-tenant deployments and admin keys must keep working — the whole
+    reason the bare-key form is still accepted."""
+    from app import storage
+
+    storage.insert_session(site_id="acme", page_path="/a", features={"event_count": 3})
+    storage.insert_session(site_id="globex", page_path="/b", features={"event_count": 3})
+
+    c = _client_with_keys(monkeypatch, "adminkey")
+    sites = {s["site_id"] for s in c.get("/v1/sessions", headers={"X-API-Key": "adminkey"}).json()}
+    assert {"acme", "globex"} <= sites
