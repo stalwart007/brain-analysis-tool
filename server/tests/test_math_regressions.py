@@ -9,6 +9,7 @@ was well-formed, plausible, and wrong.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 
@@ -283,3 +284,284 @@ def test_recall_concentration_is_scale_free():
     assert spiky["recall_concentration"] > flat["recall_concentration"]
     for m in (flat, spiky):
         assert 0.0 <= m["recall_concentration"] <= 1.0
+
+
+# ── EZ-diffusion: the accuracy must be observed, never manufactured ───────
+
+
+def test_drift_rate_is_antisymmetric_about_chance():
+    """Why a fabricated accuracy was not a safe fallback.
+
+    `v` flips sign about p = 0.5 with identical magnitude. The old
+    `_cognition_inputs` proxy took only the values 1.0 and 0.0 (the subtracted
+    `rage_click_bursts * 3` term always exceeded the click count once any burst
+    existed), so a single triple-click moved the reported drift rate from
+    +0.2787 to -0.2787 on unchanged latencies — while the interpretation
+    string still read "efficient evidence accumulation".
+    """
+    import statistics
+
+    from app.cognition import ez_diffusion
+
+    rng = random.Random(3)
+    lat = [max(0.05, rng.gauss(0.7, 0.18)) for _ in range(24)]
+    m, v, n = statistics.fmean(lat), statistics.pvariance(lat), len(lat)
+
+    hi = ez_diffusion(m, v, 1.0, n, latencies_s=lat)
+    lo = ez_diffusion(m, v, 0.0, n, latencies_s=lat)
+    assert hi is not None and lo is not None
+    assert hi["drift_rate"] == pytest.approx(-lo["drift_rate"])
+    assert abs(hi["drift_rate"]) > 0.1  # the swing is large, not marginal
+
+
+def test_cognition_inputs_never_fabricates_a_completion_ratio():
+    """Browser telemetry carries no success/abandon signal, so there is none.
+
+    Guards the seam rather than the estimator: `ez_diffusion` already refuses
+    without an observed accuracy, and the bug was that its caller supplied one
+    anyway. Any future proxy assembled from click counts must fail here.
+    """
+    from app.main import _cognition_inputs
+    from app.schemas import FeaturePayload
+
+    for clicks, bursts in ((0, 0), (5, 0), (5, 1), (40, 3)):
+        feats = FeaturePayload(
+            segment_start=0.0,
+            segment_end=10_000.0,
+            event_count=max(clicks, 1),
+            click_count=clicks,
+            rage_click_bursts=bursts,
+        )
+        assert _cognition_inputs(feats)["completion_ratio"] is None
+
+
+def test_ddm_refuses_without_completion_signal_and_says_why():
+    """The refusal must be visible in the payload, not a silent omission."""
+    from app.cognition import iter_cognitive_profile
+
+    rng = random.Random(11)
+    stream = [[float(i * 40), i % 7] for i in range(260)]
+    profile = None
+    for frame in iter_cognitive_profile(
+        event_stream=stream,
+        velocity_series=[[float(i * 40), rng.random()] for i in range(120)],
+        decision_latencies_ms=[rng.gauss(700, 180) for _ in range(24)],
+        completion_ratio=None,
+    ):
+        if frame.get("stage") == "complete":
+            profile = frame.get("profile") or profile
+    assert profile is not None
+    assert "ez_diffusion" not in profile["models_run"]
+    assert "ez_diffusion" in profile["models_skipped"]
+    assert "completion signal" in profile["ddm_skipped_reason"]
+
+
+# ── change_points must be symmetric about the middle of the series ────────
+
+
+def test_change_points_detects_a_collapse_at_the_ending():
+    """The loop bound `range(min_size, m - min_size)` excluded k = m - min_size,
+    which is admissible — it leaves a right segment of exactly min_size, the
+    same size the left segment is allowed. Verified before the fix: a collapse
+    in the ending returned [] while the mirror-image collapse in the opening
+    returned [1]. For content analysis that is the worst possible asymmetry,
+    since peak-end theory says the ending is what gets remembered.
+    """
+    from app.neuro import change_points
+
+    ending = change_points([0.8] * 7 + [0.1], min_size=1, n_obs=20)
+    opening = change_points([0.8] + [0.1] * 7, min_size=1, n_obs=20)
+    assert ending, "a collapse in the final beat must be detectable"
+    assert opening, "sanity: the mirror image was already detected"
+    # mirror-image series must yield mirror-image split counts
+    assert len(ending) == len(opening)
+
+
+def test_change_points_is_mirror_symmetric_on_reversed_input():
+    from app.neuro import change_points
+
+    rng = random.Random(5)
+    series = [0.2 + rng.random() * 0.05 for _ in range(6)] + [
+        0.85 + rng.random() * 0.05 for _ in range(6)
+    ]
+    fwd = change_points(series, min_size=2, n_obs=20)
+    rev = change_points(list(reversed(series)), min_size=2, n_obs=20)
+    assert len(fwd) == len(rev) == 1
+    assert fwd[0] + rev[0] == len(series)  # split reflects about the midpoint
+
+
+# ── persona trait shifts: absence of evidence must not move a trait ───────
+
+
+def _signal(**kw):
+    from app.schemas import BehavioralSignal
+
+    base = dict(
+        segment_label="x",
+        evidence="e",
+        likely_mindset="m",
+        confidence=1.0,
+        deliberation="medium",
+        frustration_signal="none",
+        exploration_style="reader",
+        price_sensitivity_signal="unknown",
+    )
+    base.update(kw)
+    return BehavioralSignal(**base)
+
+
+def test_absence_of_rage_clicks_is_not_evidence_of_calm():
+    """`none` was -0.1, so an unremarkable session — the overwhelmingly common
+    case, and the only thing this telemetry can observe — was pushed BELOW the
+    documented baseline as though calm had been measured. Absence of evidence
+    must leave the trait at its prior; only observed frustration may move it.
+    """
+    from app.persona import BASELINE, derive_traits
+
+    n = {
+        lv: derive_traits(_signal(frustration_signal=lv)).neuroticism.score
+        for lv in ("none", "mild", "elevated")
+    }
+    assert n["none"] == pytest.approx(BASELINE, abs=1e-9)
+    assert n["mild"] > BASELINE
+    assert n["elevated"] > n["mild"]
+
+
+def test_neutral_levels_sit_exactly_on_the_baseline():
+    """Each vocabulary's neutral level is its semantic zero, so a session with
+    nothing remarkable in it produces the population prior, not a persona."""
+    from app.persona import BASELINE, derive_traits
+
+    neutral = derive_traits(_signal())
+    for trait in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"):
+        assert getattr(neutral, trait).score == pytest.approx(BASELINE, abs=1e-9), trait
+
+
+def test_trait_shifts_stay_monotone_in_their_evidence():
+    from app.persona import derive_traits
+
+    o = {
+        lv: derive_traits(_signal(exploration_style=lv)).openness.score
+        for lv in ("goal_directed", "reader", "scanner", "wandering")
+    }
+    assert o["goal_directed"] < o["reader"] < o["scanner"] < o["wandering"]
+    c = {
+        lv: derive_traits(_signal(deliberation=lv)).conscientiousness.score
+        for lv in ("low", "medium", "high")
+    }
+    assert c["low"] < c["medium"] < c["high"]
+
+
+# ── virality: the two censoring bounds are different findings ─────────────
+
+
+def test_capped_cascades_are_not_recorded_as_extinct():
+    """`active_by_gen` stayed at its 0 initialiser for every generation after
+    the size cap, so `alive_frac` read 0.000 for exactly the runs that
+    exploded. Verified at R0 = 5.4: the survival curve showed the epidemic
+    going extinct at generation 8, precisely because every run blew past
+    SIZE_CAP there.
+    """
+    sims = simulate_cascades([0.9] * 6, 6, n_sims=200)
+    assert sims["capped_frac"] > 0.5, "fixture must actually hit the cap"
+    for row in sims["generations"]:
+        assert row["alive_frac"] > 0.5, f"generation {row['g']} reads extinct"
+        # active can never exceed cumulative — both are clamped to the bound
+        assert row["active_q50"] <= row["cum_q50"]
+
+
+def test_horizon_censoring_is_not_reported_as_hitting_the_size_cap():
+    """At R0 = 1.2 roughly a third of runs are still alive at generation 20 and
+    *none* reach the 50,000-node cap. Summing the two causes made the verdict
+    print "36.7% of simulated cascades exceeded the 50,000-node simulation
+    bound — growth is unbounded", which was false in both clauses.
+    """
+    sims = simulate_cascades([0.2] * 6, 6, n_sims=400)
+    assert sims["horizon_frac"] > 0.05, "fixture must actually censor at horizon"
+    assert sims["capped_frac"] == 0.0
+    assert sims["censored_frac"] == pytest.approx(
+        sims["capped_frac"] + sims["horizon_frac"], abs=1e-6
+    )
+
+    crit = virality_result([0.2] * 6, 6, "low")["criticality"]
+    assert crit["regime"] == "unresolved"
+    assert "exceeded" not in crit["interpretation"]
+    assert "still spreading" in crit["interpretation"]
+
+
+def test_genuinely_explosive_growth_still_reads_explosive():
+    """The new gate must not blunt the case it exists to report."""
+    crit = virality_result([0.9] * 6, 6, "low")["criticality"]
+    assert crit["regime"] == "explosive"
+    assert crit["capped_frac"] > 0.5
+
+
+# ── batch results survive a malformed line ───────────────────────────────
+
+
+def test_one_malformed_batch_line_does_not_discard_the_whole_batch():
+    """`json.loads` sat OUTSIDE parse_batch_line's guard, so a single truncated
+    line raised JSONDecodeError, propagated to jobs._process's blanket handler,
+    and marked the job `error` — throwing away every completed twin in a batch
+    that had already run up to 24 hours and been billed in full.
+    """
+    from app.batch_swarm import parse_batch_line
+
+    good = json.dumps(
+        {
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "engagement": 0.6,
+                                        "intent_score": 0.5,
+                                        "action": "continue",
+                                        "dropoff_point": None,
+                                        "friction_notes": "the price block is buried",
+                                        "inner_monologue": "curious but not sold",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    for bad in ('{"response": {"status_code": 200,', "", "not json at all", "[]"):
+        assert parse_batch_line(bad) is None  # must not raise
+    assert parse_batch_line(good) is not None
+
+
+# ── schema violations are 502s, not 500s or truncated streams ────────────
+
+
+def test_out_of_schema_model_output_maps_to_a_gateway_error():
+    """pydantic's ValidationError subclasses ValueError, not RuntimeError, so
+    the `except (openai.OpenAIError, RuntimeError)` handlers missed it: a bare
+    500 on the JSON routes, and on SSE a body that truncated after the headers
+    with no terminal frame — indistinguishable from a successful empty run.
+
+    Reachable by construction: `oai._clean` strips minimum/maximum from the
+    wire schema, so the model may legally return confidence: 1.4.
+    """
+    from pydantic import BaseModel, Field, ValidationError
+
+    from app.main import _llm_errors
+
+    class Bounded(BaseModel):
+        confidence: float = Field(ge=0.0, le=1.0)
+
+    try:
+        Bounded(confidence=1.4)
+        raise AssertionError("fixture must raise")
+    except ValidationError as exc:
+        assert isinstance(exc, ValueError)
+        assert not isinstance(exc, RuntimeError)  # this is why it was missed
+        http = _llm_errors(exc)
+        assert http.status_code == 502
+        assert "schema" in str(http.detail).lower()

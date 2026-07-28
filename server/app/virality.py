@@ -152,9 +152,12 @@ def simulate_cascades(
     finals: list[int] = []
     censored: list[bool] = []
 
+    capped_flags: list[bool] = []
+
     for sim in range(n_sims):
         active, total = 1, 1
         was_censored = False
+        capped = False
         active_by_gen[0][sim] = 1
         cum_by_gen[0][sim] = 1
         for g in range(1, MAX_GENERATIONS + 1):
@@ -176,10 +179,27 @@ def simulate_cascades(
                 # complete the generation honestly, record the bound, stop
                 total = SIZE_CAP
                 was_censored = True
+                capped = True
                 active_by_gen[g][sim] = active
                 cum_by_gen[g][sim] = total
+                # A capped run is still ALIVE — we stopped simulating it, it did
+                # not die out. Leaving active_by_gen at its 0 initialiser made
+                # `alive_frac` read 0.000 for exactly the runs that exploded: at
+                # R0 = 5.4 the survival curve showed the epidemic going extinct
+                # at generation 8, precisely because every run blew past
+                # SIZE_CAP there. Carry the live count forward instead.
+                #
+                # Clamped to the same bound as `total`, so the two series stay
+                # coherent: the raw live count at cap time can exceed SIZE_CAP
+                # (138,939 against a 50,000 cumulative in the R0 = 5.4 case),
+                # and an active count above the cumulative is not a thing that
+                # can happen. Both are lower bounds past this point, which is
+                # what `censored_frac` and `capped_frac` are there to say.
+                active = min(active, SIZE_CAP)
+                active_by_gen[g][sim] = active
                 for g2 in range(g + 1, MAX_GENERATIONS + 1):
                     cum_by_gen[g2][sim] = total
+                    active_by_gen[g2][sim] = active
                 break
 
             active_by_gen[g][sim] = active
@@ -203,6 +223,7 @@ def simulate_cascades(
             was_censored = True
         finals.append(total)
         censored.append(was_censored)
+        capped_flags.append(capped)
 
     def q(xs: list[int], frac: float) -> float:
         ys = sorted(xs)
@@ -228,6 +249,19 @@ def simulate_cascades(
         "final_sizes": finals,
         "censored": censored,
         "censored_frac": round(sum(censored) / n_sims, 4) if n_sims else 0.0,
+        # The two bounds are different findings and must not be conflated.
+        # `capped` means the cascade outgrew SIZE_CAP — genuine explosive
+        # growth. `horizon` means it was still alive at MAX_GENERATIONS —
+        # slow burn, which near criticality is the common case. Reporting
+        # their union under a message that names only the cap produced the
+        # sentence "37.6% of simulated cascades exceeded the 50,000-node
+        # simulation bound" at R0 = 1.2, where the true count was ZERO.
+        "capped_frac": round(sum(capped_flags) / n_sims, 4) if n_sims else 0.0,
+        "horizon_frac": (
+            round(sum(1 for c, p in zip(censored, capped_flags) if c and not p) / n_sims, 4)
+            if n_sims
+            else 0.0
+        ),
     }
 
 
@@ -266,15 +300,28 @@ def _size_summary(sims: dict) -> dict:
     finals = sorted(sims["final_sizes"])
     n = len(finals)
     if n == 0:
-        return {"median": None, "p90": None, "max": None, "censored_frac": 0.0}
+        return {
+            "median": None,
+            "p90": None,
+            "max": None,
+            "censored_frac": 0.0,
+            "capped_frac": 0.0,
+            "horizon_frac": 0.0,
+        }
     return {
         "median": finals[n // 2],
         "p90": finals[min(n - 1, int(0.90 * n))],
         "max": finals[-1],
         "censored_frac": sims["censored_frac"],
+        # Split out so consumers stop saying "hit the bound" about runs that
+        # merely had not finished. The old note said "lower bounds at the
+        # simulation cap" for both, which is only true of the capped ones.
+        "capped_frac": sims["capped_frac"],
+        "horizon_frac": sims["horizon_frac"],
         "note": (
-            "quantiles over simulated cascades; censored runs are lower bounds "
-            "at the simulation cap"
+            "quantiles over simulated cascades; capped runs are lower bounds at "
+            f"the {SIZE_CAP:,}-node cap, horizon runs are lower bounds at "
+            f"generation {MAX_GENERATIONS}"
         ),
     }
 
@@ -311,17 +358,43 @@ def virality_result(ps: list[float], k: int, load: str) -> dict:
     ]
     crit = powerlaw_vs_exponential(uncensored)
 
-    if censored_frac >= 0.02:
-        # Explosive growth is not a tail shape to be classified — it is the
-        # headline. Say so instead of reporting a fit to the survivors.
+    capped_frac = sims["capped_frac"]
+    horizon_frac = sims["horizon_frac"]
+
+    # "Explosive" is a claim about outgrowing the SIZE CAP, so gate it on the
+    # cap alone. Gating on the union fired this branch — and printed "exceeded
+    # the 50,000-node simulation bound" — at R0 = 1.2, where 36.7% of runs were
+    # merely still alive at generation 20 (median size 463) and exactly ZERO
+    # had reached the cap. That is a slow burn, not unbounded growth, and it is
+    # the regime this product exists to analyse.
+    if capped_frac >= 0.02:
         crit = {
             "regime": "explosive",
             "censored_frac": censored_frac,
+            "capped_frac": capped_frac,
+            "horizon_frac": horizon_frac,
             "n_uncensored": len(uncensored),
             "interpretation": (
-                f"{censored_frac * 100:.1f}% of simulated cascades exceeded the "
+                f"{capped_frac * 100:.1f}% of simulated cascades exceeded the "
                 f"{SIZE_CAP:,}-node simulation bound — growth is unbounded at this "
                 "fanout, so cascade size is limited by the audience, not by the content"
+            ),
+        }
+    elif horizon_frac >= 0.02:
+        # Still spreading when the simulation stopped: the sizes are lower
+        # bounds, so a tail fit to the survivors would be selection on the
+        # fast-extinguishing runs. Report the censoring instead of a shape.
+        crit = {
+            "regime": "unresolved",
+            "censored_frac": censored_frac,
+            "capped_frac": capped_frac,
+            "horizon_frac": horizon_frac,
+            "n_uncensored": len(uncensored),
+            "interpretation": (
+                f"{horizon_frac * 100:.1f}% of simulated cascades were still spreading "
+                f"at generation {MAX_GENERATIONS}, so their sizes are lower bounds and "
+                "the tail shape cannot be identified from this horizon — near-critical "
+                "spread that neither dies out nor runs away within the simulated window"
             ),
         }
     elif crit:  # re-domain the shared tail-test's interpretation for cascades

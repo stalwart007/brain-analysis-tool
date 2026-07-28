@@ -33,6 +33,37 @@ function workerMain() {
     return mean(a.map((v) => (v - m) * (v - m)));
   };
 
+  /**
+   * Maximal rage-click bursts, as index ranges into `clicks`.
+   *
+   * A burst is a run in which every window of RAGE_CLICKS consecutive clicks
+   * spans less than RAGE_WINDOW_MS. The previous form counted *sliding
+   * windows*, so a single burst of n clicks scored n - RAGE_CLICKS + 1: five
+   * angry clicks reported three bursts. That number is the primary input to
+   * the profiler's frustration signal (and thence to neuroticism), so the
+   * overcount pushed every frustrated session further than the behaviour
+   * warranted. Once a burst ends we skip a full window ahead, so the same
+   * clicks can never seed a second burst.
+   */
+  function rageBursts(clicks: Ev[]): { start: number; end: number }[] {
+    const out: { start: number; end: number }[] = [];
+    const fits = (i: number) =>
+      clicks[i].t - clicks[i - RAGE_CLICKS + 1].t < RAGE_WINDOW_MS;
+    let i = RAGE_CLICKS - 1;
+    while (i < clicks.length) {
+      if (!fits(i)) {
+        i++;
+        continue;
+      }
+      const start = i - RAGE_CLICKS + 1;
+      let end = i;
+      while (end + 1 < clicks.length && fits(end + 1)) end++;
+      out.push({ start, end });
+      i = end + RAGE_CLICKS;
+    }
+    return out;
+  }
+
   function compute(evts: Ev[]) {
     if (evts.length === 0) return null;
 
@@ -71,10 +102,8 @@ function workerMain() {
     }
 
     // rage-click bursts: >= RAGE_CLICKS clicks inside RAGE_WINDOW_MS
-    let rage = 0;
-    for (let i = RAGE_CLICKS - 1; i < clicks.length; i++) {
-      if (clicks[i].t - clicks[i - RAGE_CLICKS + 1].t < RAGE_WINDOW_MS) rage++;
-    }
+    const bursts = rageBursts(clicks);
+    const rage = bursts.length;
 
     // zone attribution
     const dwell: Record<string, number> = {};
@@ -111,11 +140,8 @@ function workerMain() {
         stream.push([e.t, 2]);
       }
     }
-    // mark rage bursts at the burst end
-    for (let i = RAGE_CLICKS - 1; i < clicks.length; i++) {
-      if (clicks[i].t - clicks[i - RAGE_CLICKS + 1].t < RAGE_WINDOW_MS)
-        stream.push([clicks[i].t, 4]);
-    }
+    // mark rage bursts at the burst end — one symbol per burst, not per window
+    for (const b of bursts) stream.push([clicks[b.end].t, 4]);
     stream.sort((a, b) => a[0] - b[0]);
 
     // velocity series for spectral / entropy analysis (irregular sampling ok)

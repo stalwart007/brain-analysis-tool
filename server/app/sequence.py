@@ -114,6 +114,38 @@ _COMMIT_THRESHOLD = 0.5
 # ─────────────────────────────── pure math ───────────────────────────────
 
 
+def assign_orderings(
+    n_personas: int, n_reps: int, n_orderings: int, seed: int = _DESIGN_SEED
+) -> list[int]:
+    """Assign an ordering to each (persona, repetition) slot.
+
+    Slots are enumerated repetition-major — slot `rep * n_personas + p` belongs
+    to persona `p` — so the caller must build its walker list the same way.
+
+    Two properties matter, and the obvious arithmetic schemes get at most one:
+
+    · **Flat coverage.** Every ordering is walked within one of every other,
+      including ordering 0, the submitted baseline that every comparison is
+      measured against. `(p + rep) % L` failed this — it covered a contiguous
+      block and gave the baseline a single walk, so its interval was None.
+
+    · **No persona/ordering aliasing.** `(p + rep * P) % L` confines persona p
+      to the coset p + <P> in Z_L, so personas split into gcd(P, L) groups on
+      disjoint ordering sets — at P = L = 6, persona p walks only ordering p.
+      Every between-ordering number becomes a persona comparison in disguise.
+
+    Round-robin gives the first; shuffling under a fixed seed gives the second.
+    Randomisation is not a stylistic choice here — with R repetitions and
+    L > R orderings no persona *can* reach every ordering, so an unbiased
+    contrast requires the pairing to be random rather than systematic.
+    """
+    if n_orderings <= 0 or n_personas <= 0 or n_reps <= 0:
+        return []
+    assignment = [i % n_orderings for i in range(n_personas * n_reps)]
+    random.Random(seed).shuffle(assignment)
+    return assignment
+
+
 def sample_orderings(n: int, k: int, seed: int = _DESIGN_SEED) -> list[list[int]]:
     """The experimental design: submitted, reversed, then random permutations.
 
@@ -671,16 +703,32 @@ async def stream_sequence(
     # terminal-intent interval was None and its Bayesian arm was a single
     # observation.
     #
-    # Striding by the persona count instead sweeps the full ordering space:
-    # successive repetitions land P apart rather than 1 apart, so every ordering
-    # is reached and the walk counts are flat. The persona/ordering confound the
-    # original comment was worried about is still broken, because persona p and
-    # persona p+1 never share an ordering within a repetition.
-    stride = max(1, len(personas))
+    # Striding by the persona count fixed the coverage hole and introduced a
+    # worse one. `(p_index + rep * P) % L` confines persona p to the coset
+    # p + <P> in Z_L, so the personas split into gcd(P, L) groups walking
+    # DISJOINT ordering sets. gcd(P, L) > 1 for nearly every panel size, and at
+    # P = 6 with L = 6 it degenerates completely — persona p walks only
+    # ordering p, all repetitions. Every between-ordering statistic
+    # (mean_terminal_intent, commit_rate, disengage_rate, the Bayesian arms,
+    # and therefore `recommended_from="walked"`) was then a *persona*
+    # comparison wearing an ordering label. Strictly worse than the triangular
+    # coverage it replaced, because the counts look flat and correct.
+    #
+    # The fix is the standard randomised block design: hand out ordering
+    # indices round-robin so the counts stay flat, then shuffle the assignment
+    # under the fixed design seed so persona and ordering are paired at random
+    # rather than by arithmetic. Randomisation is what makes the contrast
+    # unbiased; no deterministic stride can do it, because with L orderings and
+    # R < L repetitions no persona can reach every ordering.
+    assignment = assign_orderings(
+        len(personas), request.twins_per_persona, len(orderings)
+    )
+    walkers = [
+        persona for _rep in range(request.twins_per_persona) for persona in personas
+    ]
     tasks = [
-        asyncio.create_task(one(persona, (p_index + rep * stride) % len(orderings)))
-        for rep in range(request.twins_per_persona)
-        for p_index, persona in enumerate(personas)
+        asyncio.create_task(one(persona, order_index))
+        for persona, order_index in zip(walkers, assignment)
     ]
 
     walks: list[dict] = []

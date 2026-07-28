@@ -83,8 +83,15 @@ def test_profile_stream_emits_model_stages_then_llm_failure_without_key():
     # and the computed cognition profile was persisted despite the LLM failure
     session = next(s for s in client.get("/v1/sessions").json() if s["id"] == sid)
     assert session["cognition"] is not None
-    assert "ez_diffusion" in session["cognition"]["models_run"]
     assert "state_occupancy" in session["cognition"]["summary"]
+    # EZ-diffusion must SKIP: browser telemetry carries no success/abandon
+    # signal, and this test previously asserted the opposite because
+    # `_cognition_inputs` fabricated an accuracy from click counts. The model
+    # is written to refuse without an observed accuracy; assert it refuses,
+    # visibly, with a reason — see test_ddm_refuses_without_completion_signal.
+    assert "ez_diffusion" not in session["cognition"]["models_run"]
+    assert "ez_diffusion" in session["cognition"]["models_skipped"]
+    assert session["cognition"]["ddm_skipped_reason"]
 
 
 def test_profile_stream_unknown_session_404s():

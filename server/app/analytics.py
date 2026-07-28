@@ -180,6 +180,20 @@ def bootstrap_ci(
     """Percentile bootstrap CI for the mean. Deterministic for a given seed.
 
     Returns None for samples too small to resample meaningfully (n < 2).
+
+    A **constant** sample returns a zero-width interval, e.g. 20 twins all
+    reporting 0.5 gives (0.5, 0.5). That is the literally correct bootstrap
+    answer — every resample of a constant sample has the same mean — but it is
+    not an honest uncertainty statement: the width reflects the 0.1 quantisation
+    of LLM twin scores, not an absence of sampling error. Unanimity is common
+    here, so this is a routine case rather than a corner one.
+
+    It is deliberately NOT collapsed to None. Consumers use interval separation
+    as a decision gate (`optimizer.beat_seed`), and withholding the interval
+    makes two well-separated unanimous arms read as "no evidence of a
+    difference" — trading a display problem for a wrong decision. Callers that
+    render the interval should detect `hi - lo == 0` and label it as no
+    observed variation rather than as a tight interval.
     """
     n = len(values)
     if n < 2:

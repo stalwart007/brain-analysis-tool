@@ -382,19 +382,34 @@ export interface ViralityCriticality {
   vuong_z?: number;
   p_value?: number;
   /**
-   * "levy_like" | "brownian_like" | "indistinguishable" | "explosive".
+   * "levy_like" | "brownian_like" | "indistinguishable" | "explosive" |
+   * "unresolved".
    *
-   * `explosive` has no tail fit at all — when a material share of simulated
-   * cascades exceed the simulation bound, their sizes are lower bounds rather
-   * than observations, so there is nothing honest to fit. `alpha` is absent in
-   * that case; render `interpretation` instead.
+   * Neither `explosive` nor `unresolved` carries a tail fit, because in both
+   * cases a material share of simulated cascades never terminated and their
+   * sizes are lower bounds rather than observations. They differ in *which*
+   * bound was hit, and the distinction is the whole finding:
+   *
+   * · `explosive`  — cascades outgrew the 50,000-node size cap. Unbounded
+   *   growth; size is limited by the audience, not the content.
+   * · `unresolved` — cascades were still spreading at the generation horizon.
+   *   Near-critical slow burn, which is a completely different story and used
+   *   to be reported as `explosive` because the two censoring causes were
+   *   summed. Verified at R₀ = 1.2: 36.7% censored, of which *zero* had
+   *   reached the cap.
+   *
+   * `alpha` is absent for both; render `interpretation` instead.
    */
   regime?: string;
   interpretation?: string;
   n?: number;
   n_total?: number;
-  /** fraction of simulated cascades that hit the size cap */
+  /** fraction censored for any reason — capped_frac + horizon_frac */
   censored_frac?: number;
+  /** fraction that outgrew the size cap (the "unbounded growth" claim) */
+  capped_frac?: number;
+  /** fraction still spreading at the generation horizon */
+  horizon_frac?: number;
   n_uncensored?: number;
 }
 
@@ -404,7 +419,12 @@ export interface SimulatedSize {
   median: number | null;
   p90: number | null;
   max: number | null;
+  /** censored for any reason; do NOT render this as "hit the bound" */
   censored_frac: number;
+  /** outgrew the size cap — this is the one that means "hit the bound" */
+  capped_frac?: number;
+  /** still spreading at the generation horizon */
+  horizon_frac?: number;
   note?: string;
 }
 

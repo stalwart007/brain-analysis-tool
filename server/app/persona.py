@@ -53,7 +53,19 @@ def derive_traits(signal: BehavioralSignal) -> TraitVector:
         signal.deliberation
     ]
     # Neuroticism ~ stress reactivity proxied by frustration expression.
-    frustration_shift = {"none": -0.1, "mild": 0.1, "elevated": _MAX_SHIFT}[
+    #
+    # `none` is the ZERO level, not a negative one. It was -0.1, which made the
+    # absence of rage clicks evidence *for* low neuroticism — but "no rage
+    # clicks" is the overwhelmingly common case and the only thing this
+    # telemetry can observe, so it is absence of evidence, not evidence of
+    # calm. Every unremarkable session was being pushed below the BASELINE this
+    # module documents as the prior traits move away from "only with evidence",
+    # which biased the mean of every downstream study in a fixed direction.
+    #
+    # The other two vocabularies already have a semantic zero at their neutral
+    # level (`medium`, `reader`) and are left alone: each of their levels is a
+    # genuine observation pointing somewhere, whereas `none` is the default.
+    frustration_shift = {"none": 0.0, "mild": 0.1, "elevated": _MAX_SHIFT}[
         signal.frustration_signal
     ]
     # Openness ~ exploratory navigation vs goal-locked behavior.

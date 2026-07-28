@@ -427,3 +427,60 @@ def test_endpoint_streams_sse_and_persists_the_run(monkeypatch):
     assert runs[0]["id"] == run_id
     assert len(runs[0]["result"]["recommended_ordering"]) == 3
     assert runs[0]["request"]["messages"] == MESSAGES
+
+
+# ── design assignment: flat coverage AND no persona/ordering aliasing ─────
+
+
+def _persona_ordering_sets(P: int, R: int, L: int) -> list[set[int]]:
+    """Which orderings each persona reaches, under the real assignment."""
+    from app.sequence import assign_orderings
+
+    assignment = assign_orderings(P, R, L)
+    sets: list[set[int]] = [set() for _ in range(P)]
+    for slot, order_index in enumerate(assignment):
+        sets[slot % P].add(order_index)
+    return sets
+
+
+def test_assignment_covers_every_ordering_flatly():
+    """Including ordering 0 — the submitted baseline every gain is measured
+    against. Under `(p + rep) % L` it was walked exactly once, so its CI was
+    None and its Bayesian arm was a single observation."""
+    from app.sequence import assign_orderings
+
+    for P, R, L in ((6, 4, 6), (6, 3, 6), (5, 3, 6), (8, 2, 6), (3, 4, 6)):
+        counts = [0] * L
+        for order_index in assign_orderings(P, R, L):
+            counts[order_index] += 1
+        assert min(counts) >= 1, f"ordering never walked at P={P} R={R} L={L}"
+        assert max(counts) - min(counts) <= 1, f"unflat counts at P={P} R={R} L={L}"
+
+
+def test_personas_are_not_confined_to_disjoint_ordering_sets():
+    """The regression this replaces.
+
+    `(p_index + rep * len(personas)) % L` put persona p in the coset
+    p + <P> of Z_L. Verified before the fix: at P=6, R=3, L=6 every persona
+    walked exactly ONE ordering and no two personas shared any — so
+    `mean_terminal_intent` per ordering was a per-persona mean, and the
+    recommendation was a persona ranking wearing an ordering label.
+    """
+    for P, R, L in ((6, 3, 6), (6, 4, 6), (4, 3, 6), (8, 2, 6)):
+        sets = _persona_ordering_sets(P, R, L)
+        # no persona is pinned to a single ordering when it walks more than once
+        if R > 1:
+            assert max(len(s) for s in sets) > 1, f"persona pinned at P={P} L={L}"
+        # and the sets genuinely overlap rather than partitioning
+        shared = any(
+            sets[a] & sets[b] for a in range(P) for b in range(a + 1, P)
+        )
+        assert shared, f"personas partition into disjoint ordering sets at P={P} L={L}"
+
+
+def test_assignment_is_deterministic_under_the_design_seed():
+    """Reproducibility is a product claim; the design must not drift per run."""
+    from app.sequence import assign_orderings
+
+    assert assign_orderings(6, 3, 6) == assign_orderings(6, 3, 6)
+    assert assign_orderings(0, 3, 6) == [] and assign_orderings(6, 3, 0) == []

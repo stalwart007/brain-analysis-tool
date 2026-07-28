@@ -12,12 +12,15 @@ Request construction and per-line result parsing are pure functions
 
 import asyncio
 import json
+import logging
 from typing import Any, Literal
 
 from .config import LOAD_TO_TEMPERATURE, TWIN_MODEL
 from .oai import async_client, response_format_for, strict_schema
 from .schemas import PersonaSeed, SwarmAggregate, TwinReaction
 from .swarm import SIMULATION_PREAMBLE, _LOAD_CONDITIONING, aggregate_reactions
+
+log = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 15
 MAX_WAIT_S = 60 * 60  # batches usually finish within the hour
@@ -70,10 +73,23 @@ def build_batch_requests(
     return requests
 
 
-def parse_batch_line(entry: dict[str, Any]) -> TwinReaction | None:
+def parse_batch_line(entry: "dict[str, Any] | str | bytes") -> TwinReaction | None:
     """Parse one line of the batch output JSONL into a TwinReaction; None on any
-    failure (non-200, refusal, malformed JSON)."""
+    failure (non-200, refusal, malformed JSON).
+
+    Accepts the raw line as well as a decoded dict, because the decode is
+    exactly what used to escape this guard: the caller did
+    `parse_batch_line(json.loads(line))`, so a single truncated or non-JSON
+    line raised JSONDecodeError *outside* the try, propagated to the blanket
+    handler in `jobs._process`, and marked the whole job `error` — discarding
+    every successfully-completed twin in a batch that had already run for up to
+    24 hours and been billed in full.
+    """
     try:
+        if isinstance(entry, (str, bytes)):
+            entry = json.loads(entry)
+        if not isinstance(entry, dict):
+            return None
         response = entry.get("response") or {}
         if response.get("status_code") != 200:
             return None
@@ -122,12 +138,23 @@ async def execute_batch_swarm(
     text = content.text
 
     reactions: list[TwinReaction] = []
+    skipped = 0
     for line in text.splitlines():
         if not line.strip():
             continue
-        reaction = parse_batch_line(json.loads(line))
+        reaction = parse_batch_line(line)
         if reaction is not None:
             reactions.append(reaction)
+        else:
+            skipped += 1
+    if skipped:
+        log.warning(
+            "batch %s: %d of %d output lines unparseable, kept %d reactions",
+            batch.id,
+            skipped,
+            skipped + len(reactions),
+            len(reactions),
+        )
 
     return aggregate_reactions(reactions, scenario, cognitive_load)
 

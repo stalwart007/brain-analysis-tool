@@ -302,7 +302,15 @@ def change_points(
         if base <= 1e-12:  # a perfectly flat parent has nothing to split
             return
         best_k, best_cost = None, base
-        for k in range(min_size, m - min_size):
+        # `m - min_size` IS an admissible split — it leaves a right segment of
+        # exactly min_size, the same size the left segment is allowed. The
+        # exclusive bound silently required the right segment to hold at least
+        # min_size + 1, so the last beat could never end a segment: a collapse
+        # in the *ending* returned [] while the identical collapse in the
+        # opening returned [1]. For content analysis that is the worst possible
+        # asymmetry — peak-end says the ending is the part that gets
+        # remembered, and peak_end_memory reads the same curve.
+        for k in range(min_size, m - min_size + 1):
             cost = _rss(seg[:k]) + _rss(seg[k:])
             if cost < best_cost:
                 best_k, best_cost = k, cost

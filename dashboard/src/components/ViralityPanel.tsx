@@ -152,20 +152,49 @@ export default function ViralityPanel({ personaCount }: { personaCount: number }
               sizes are lower bounds and there is nothing honest to fit. It is
               also the most important thing that can happen here, so it gets
               the loud treatment rather than a line of grey mono. */}
-          {result.criticality?.regime === "explosive" ? (
-            <div className="border border-critical/40 bg-critical/[0.07] p-3">
-              <div className="hud-label text-critical">Unbounded growth</div>
-              <p className="mt-1 text-[11px] leading-relaxed text-ink-2">
-                {result.criticality.interpretation}
-              </p>
-              {result.simulated_size?.median != null && (
-                <p className="mt-1.5 font-mono text-[10px] text-muted">
-                  simulated median {result.simulated_size.median.toLocaleString()} ·
-                  p90 {result.simulated_size.p90?.toLocaleString()} ·
-                  {" "}{Math.round((result.simulated_size.censored_frac ?? 0) * 100)}% hit the bound
-                </p>
-              )}
-            </div>
+          {result.criticality?.regime === "explosive" ||
+          result.criticality?.regime === "unresolved" ? (
+            (() => {
+              // Both regimes mean "no honest tail fit", but for opposite
+              // reasons, and saying the wrong one is a material misreport:
+              // explosive = outgrew the size cap, unresolved = still spreading
+              // at the horizon. They used to collapse into one because the
+              // censoring causes were summed.
+              const explosive = result.criticality?.regime === "explosive";
+              const size = result.simulated_size;
+              const bound = explosive ? size?.capped_frac : size?.horizon_frac;
+              return (
+                <div
+                  className={
+                    explosive
+                      ? "border border-critical/40 bg-critical/[0.07] p-3"
+                      : "border border-white/15 bg-white/[0.03] p-3"
+                  }
+                >
+                  <div
+                    className={`hud-label ${explosive ? "text-critical" : "text-ink-2"}`}
+                  >
+                    {explosive ? "Unbounded growth" : "Tail unresolved at this horizon"}
+                  </div>
+                  <p className="mt-1 text-[11px] leading-relaxed text-ink-2">
+                    {result.criticality?.interpretation}
+                  </p>
+                  {size?.median != null && (
+                    <p className="mt-1.5 font-mono text-[10px] text-muted">
+                      simulated median {size.median.toLocaleString()} · p90{" "}
+                      {size.p90?.toLocaleString()}
+                      {bound != null && (
+                        <>
+                          {" · "}
+                          {Math.round(bound * 100)}%{" "}
+                          {explosive ? "hit the size cap" : "still spreading"}
+                        </>
+                      )}
+                    </p>
+                  )}
+                </div>
+              );
+            })()
           ) : (
             result.criticality && (
               <p className="font-mono text-[10px] text-ink-2">

@@ -187,15 +187,35 @@ def sessions() -> list[dict]:
 
 
 def _cognition_inputs(features: FeaturePayload) -> dict:
-    """Map stored telemetry onto the cognition engine's inputs. The completion
-    ratio proxy: clicks that were not part of rage bursts / all clicks."""
-    ok_clicks = max(0, features.click_count - features.rage_click_bursts * 3)
-    completion = ok_clicks / features.click_count if features.click_count else None
+    """Map stored telemetry onto the cognition engine's inputs.
+
+    `completion_ratio` is deliberately **None**.
+
+    The old proxy was `(click_count - rage_click_bursts * 3) / click_count`,
+    which is not an accuracy in any sense the drift-diffusion model recognises,
+    and it was numerically degenerate besides: because the burst counter
+    reported one burst per sliding *window*, the subtracted term exceeded the
+    click count whenever any burst existed at all. The proxy therefore took
+    exactly two values — 1.0 with no rage burst, 0.0 with one — and `v` is
+    antisymmetric about p = 0.5, so a single triple-click flipped the reported
+    drift rate from +0.279 to -0.279 on identical latencies while the
+    interpretation string still read "efficient evidence accumulation".
+
+    `ez_diffusion` was already written to refuse without an observed accuracy
+    (see the note above the `ddm_skip` branch in cognition.py); this caller was
+    manufacturing the very input that refusal exists to demand. Passing None
+    restores it: the session lands in `models_skipped` with a reason attached,
+    which is visible and honest rather than confidently wrong.
+
+    Restoring the DDM needs a real success/abandon signal — a declared goal
+    zone, or a completion event class from the collector — not a rearrangement
+    of click counts.
+    """
     return {
         "event_stream": features.event_stream or None,
         "velocity_series": features.velocity_series or None,
         "decision_latencies_ms": features.decision_latencies_ms or None,
-        "completion_ratio": completion,
+        "completion_ratio": None,
     }
 
 
@@ -210,7 +230,7 @@ def profile(session_id: str) -> dict:
     storage.set_cognition(session_id, cognition)
     try:
         signal = profile_features(features, cognition.get("summary"))
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     persona = seed_persona(signal)
     storage.set_signal(session_id, signal.model_dump())
@@ -260,7 +280,7 @@ async def profile_stream(session_id: str) -> StreamingResponse:
             persona = await asyncio.to_thread(seed_persona, signal)
             storage.set_persona(session_id, persona.model_dump())
             yield f"data: {json.dumps({'type': 'done', 'result': {'signal': signal.model_dump(), 'persona': persona.model_dump(), 'cognition': cognition}})}\n\n"
-        except (openai.OpenAIError, RuntimeError) as exc:
+        except (openai.OpenAIError, RuntimeError, ValueError) as exc:
             detail = _llm_errors(exc).detail
             yield f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
 
@@ -294,6 +314,22 @@ def _load_personas(session_ids: list[str]) -> list[PersonaSeed]:
 
 
 def _llm_errors(exc: Exception) -> HTTPException:
+    # pydantic's ValidationError subclasses ValueError, NOT RuntimeError, so
+    # the handlers here used to miss it entirely: a schema violation surfaced
+    # as a bare 500 on the JSON routes, and on the SSE routes it raised after
+    # the headers were already sent, truncating the body with no terminal
+    # frame — which the client cannot distinguish from a successful empty run.
+    #
+    # It is reachable by construction: `oai._clean` strips `minimum`/`maximum`/
+    # `pattern` from the wire schema (strict mode rejects them), so the model
+    # may legally return `confidence: 1.4`, and `parse_completion` then
+    # re-applies the real Pydantic bounds and raises. Every per-twin handler in
+    # swarm/studies/neuro already caught ValueError; these did not.
+    if isinstance(exc, ValidationError):
+        return HTTPException(
+            status_code=502,
+            detail=f"Model returned values outside the response schema: {exc}",
+        )
     # AuthenticationError ⊂ APIError ⊂ OpenAIError — check most specific first.
     if isinstance(exc, openai.AuthenticationError):
         return HTTPException(
@@ -309,6 +345,8 @@ def _llm_errors(exc: Exception) -> HTTPException:
         )
     if isinstance(exc, RuntimeError):
         return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=502, detail=f"Invalid model output: {exc}")
     raise exc
 
 
@@ -322,7 +360,7 @@ async def swarm_run(request: SwarmRunRequest) -> dict:
             twins_per_persona=request.twins_per_persona,
             cognitive_load=request.cognitive_load,
         )
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     run_id = storage.insert_swarm_run(request.model_dump(), aggregate.model_dump())
     result = aggregate.model_dump()
@@ -343,7 +381,7 @@ def _sse(generator, request_model, kind: str) -> StreamingResponse:
                     )
                     evt["result"]["run_id"] = run_id
                 yield f"data: {json.dumps(evt)}\n\n"
-        except (openai.OpenAIError, RuntimeError) as exc:
+        except (openai.OpenAIError, RuntimeError, ValueError) as exc:
             detail = _llm_errors(exc).detail
             yield f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
 
@@ -474,7 +512,7 @@ async def swarm_compare(request: CompareRequest) -> dict:
             twins_per_persona=request.twins_per_persona,
             cognitive_load=request.cognitive_load,
         )
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     run_id = storage.insert_swarm_run(request.model_dump(), compared.model_dump(), kind="compare")
     result = compared.model_dump()
@@ -492,7 +530,7 @@ async def swarm_walk(request: WalkRequest) -> dict:
             twins_per_persona=request.twins_per_persona,
             cognitive_load=request.cognitive_load,
         )
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     run_id = storage.insert_swarm_run(request.model_dump(), aggregate.model_dump(), kind="walk")
     result = aggregate.model_dump()
@@ -519,7 +557,7 @@ async def study_price(request: PriceSensitivityRequest) -> dict:
             twins_per_persona=request.twins_per_persona,
             cognitive_load=request.cognitive_load,
         )
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     run_id = storage.insert_swarm_run(request.model_dump(), result.model_dump(), kind="price")
     out = result.model_dump()
@@ -537,7 +575,7 @@ async def study_objection(request: ObjectionRequest) -> dict:
             twins_per_persona=request.twins_per_persona,
             cognitive_load=request.cognitive_load,
         )
-    except (openai.OpenAIError, RuntimeError) as exc:
+    except (openai.OpenAIError, RuntimeError, ValueError) as exc:
         raise _llm_errors(exc) from exc
     run_id = storage.insert_swarm_run(request.model_dump(), result.model_dump(), kind="objection")
     out = result.model_dump()
