@@ -110,14 +110,34 @@ export default function DashboardPage() {
           Nothing but the organ and its vitals. No card, no panel — the whole
           viewport is the brain. */}
       <Station spec={SURFACE} full>
-        <div className="tag mb-3 text-muted">{SURFACE.kicker}</div>
-        <h1 className="display reg text-[clamp(3rem,11vw,8rem)] text-bone">Swarm</h1>
-        <p className="mt-3 max-w-xl text-sm text-ink-2">
-          Telemetry → cognitive models → personas → simulated reactions.
-        </p>
+        {/* The masthead is held to the left half from `lg` up.
+            The cortex canvas is fixed to the VIEWPORT, not to this centred
+            column, and its camera is art-directed to sit right of centre — so
+            an unconstrained wordmark grows straight into the organ and the two
+            read as one smeared object. Reserving the right half gives the
+            brain clean space to occupy instead of fighting the type for it.
+            Below `lg` the canvas is largely behind the fold, so the text takes
+            the full column as before. */}
+        <div className="lg:max-w-[54%]">
+          <div className="tag mb-3 text-muted">{SURFACE.kicker}</div>
+          {/* Capped so the wordmark cannot outgrow the column it now lives in:
+              at the old 11vw/8rem it overran the reserved half on any wide
+              display and collided with the tissue. */}
+          <h1 className="display reg text-[clamp(2.75rem,7vw,6.5rem)] text-bone">
+            Swarm
+          </h1>
+          {/* Held to the wordmark's own right edge rather than the column's.
+              The organ's silhouette breathes as it rotates, so its leftmost
+              extent moves ~40px between frames; matching the lede to the type
+              keeps the whole masthead clear of the widest rotation and gives
+              the block one straight right edge instead of a ragged one. */}
+          <p className="mt-3 max-w-sm text-sm text-ink-2">
+            Telemetry → cognitive models → personas → simulated reactions.
+          </p>
+        </div>
 
         {/* electrode readings pinned to the tissue, not tiles stacked on it */}
-        <div className="mt-12 flex flex-wrap gap-x-10 gap-y-6">
+        <div className="mt-12 flex flex-wrap gap-x-10 gap-y-6 lg:max-w-[54%]">
           <Electrode label="Segments" value={<Counted value={sessions.length} />} />
           <Electrode label="Personas" value={<Counted value={profiled} />} />
           <Electrode label="Runs" value={<Counted value={runs.length} />} />
