@@ -7,6 +7,7 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --minify --format=iife --global-name=CogniSwarm --outfile=dist/cogniswarm.min.js",
     "build:dev": "esbuild src/index.ts --bundle --format=iife --global-name=CogniSwarm --outfile=dist/cogniswarm.js",
+    "release": "npm run build && node scripts/release.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

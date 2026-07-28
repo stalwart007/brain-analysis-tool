@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.next-verify/
+npm-debug.log*
+*.tsbuildinfo
+# users.json holds bcrypt hashes and is mounted at runtime, not baked in —
+# see COGNISWARM_USERS_FILE in the Dockerfile.
+data/
+.env
+.env.*
+!.env.example

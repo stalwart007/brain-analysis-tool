@@ -19,7 +19,10 @@ if (password.length < 8) {
   process.exit(1);
 }
 
-const usersPath = path.join(process.cwd(), "data", "users.json");
+// Must resolve identically to USERS_PATH in src/lib/auth.ts, or you provision
+// accounts into a file the app never reads.
+const usersPath =
+  process.env.COGNISWARM_USERS_FILE ?? path.join(process.cwd(), "data", "users.json");
 await fs.mkdir(path.dirname(usersPath), { recursive: true });
 
 let users = [];

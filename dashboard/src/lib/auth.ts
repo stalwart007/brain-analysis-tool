@@ -26,7 +26,17 @@ function secret(): Uint8Array {
   return new TextEncoder().encode(raw);
 }
 
-const USERS_PATH = path.join(process.cwd(), "data", "users.json");
+/**
+ * Where the member list lives.
+ *
+ * Overridable because in a container this file is STATE, not config: it is
+ * written by `npm run add-user`, so an image with it baked in loses every
+ * account on the next rebuild — and the symptom is "my password stopped
+ * working", which reads as an auth bug rather than a deployment one. Point
+ * COGNISWARM_USERS_FILE at a mounted secret or volume in production.
+ */
+export const USERS_PATH =
+  process.env.COGNISWARM_USERS_FILE ?? path.join(process.cwd(), "data", "users.json");
 
 interface UserRecord {
   email: string;
@@ -39,9 +49,24 @@ export async function findUser(email: string): Promise<UserRecord | null> {
   try {
     raw = await fs.readFile(USERS_PATH, "utf8");
   } catch {
-    return null; // no users provisioned yet
+    // Distinguish "nobody provisioned yet" from "the mount is missing" in the
+    // server log. Both must still return null to the caller — leaking which
+    // one it is would tell an attacker whether the deployment is misconfigured
+    // — but an operator staring at a login that rejects every correct password
+    // needs this line to exist.
+    console.error(
+      `[auth] no readable user file at ${USERS_PATH} — ` +
+        "provision with `npm run add-user`, or set COGNISWARM_USERS_FILE to a mounted file"
+    );
+    return null;
   }
-  const users: UserRecord[] = JSON.parse(raw);
+  let users: UserRecord[];
+  try {
+    users = JSON.parse(raw);
+  } catch {
+    console.error(`[auth] user file at ${USERS_PATH} is not valid JSON`);
+    return null;
+  }
   return users.find((u) => u.email.toLowerCase() === email.toLowerCase()) ?? null;
 }
 
