@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Acme Cloud — CogniSwarm demo site</title>
+<style>
+  :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+  body { margin: 0; line-height: 1.55; background: #0a0a09; color: #fff; }
+  section { padding: 5rem 10vw; }
+  .hero { min-height: 62vh; display: flex; flex-direction: column; justify-content: center;
+          background: radial-gradient(700px 420px at 25% 30%, rgba(57,135,229,0.18), transparent 65%); }
+  .hero h1 { font-size: 2.8rem; margin: 0 0 0.5rem; letter-spacing: -0.02em; }
+  .hero p, .filler p { max-width: 58ch; color: #c3c2b7; }
+  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; padding-top: 1rem; }
+  .tile { background: #161615; border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 22px; }
+  .tile h3 { margin: 0 0 6px; font-size: 1rem; }
+  .tile p { margin: 0; font-size: 0.9rem; color: #898781; }
+  .cta button { font-size: 1.05rem; padding: 13px 30px; border-radius: 12px; border: none;
+                background: #3987e5; color: white; cursor: pointer; }
+  .cta button:hover { filter: brightness(1.1); }
+  #consent { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(22,22,21,0.95);
+             backdrop-filter: blur(10px); border-top: 1px solid rgba(255,255,255,0.08);
+             color: #eee; padding: 14px 5vw; display: flex; gap: 12px; align-items: center;
+             justify-content: space-between; }
+  #consent button { padding: 8px 18px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
+                    background: transparent; color: #fff; cursor: pointer; }
+  #consent #accept { background: #3987e5; border: none; }
+  #status { position: fixed; top: 10px; right: 12px; font-size: 0.72rem; color: #898781; }
+</style>
+</head>
+<body>
+
+<div id="status">collector: off</div>
+
+<section class="hero" data-cs="hero">
+  <h1>Acme Cloud</h1>
+  <p>Deploy anything in seconds. Scroll around, hover, click — this page exists to feed the collector.</p>
+</section>
+
+<section class="filler" data-cs="content">
+  <h2>How it works</h2>
+  <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer nec odio. Praesent libero. Sed cursus ante dapibus diam. Sed nisi. Nulla quis sem at nibh elementum imperdiet.</p>
+  <p>Duis sagittis ipsum. Praesent mauris. Fusce nec tellus sed augue semper porta. Mauris massa. Vestibulum lacinia arcu eget nulla. Class aptent taciti sociosqu ad litora torquent.</p>
+  <p>Curabitur sodales ligula in libero. Sed dignissim lacinia nunc. Curabitur tortor. Pellentesque nibh. Aenean quam. In scelerisque sem at dolor. Maecenas mattis.</p>
+</section>
+
+<section data-cs="features">
+  <h2>What you get</h2>
+  <div class="features">
+    <div class="tile"><h3>Instant deploys</h3><p>Push to main, live in seconds. Zero-config pipelines.</p></div>
+    <div class="tile"><h3>Global edge</h3><p>34 regions, automatic failover, sub-50ms everywhere.</p></div>
+    <div class="tile"><h3>Observability</h3><p>Traces, logs, and metrics wired in from the first request.</p></div>
+    <div class="tile"><h3>Previews</h3><p>Every branch gets its own URL. Share before you ship.</p></div>
+  </div>
+</section>
+
+<section class="cta" data-cs="cta">
+  <h2>Ready?</h2>
+  <button onclick="alert('This button intentionally does nothing — rage-click it!')">Start free trial</button>
+</section>
+
+<div id="consent">
+  <span>This demo uses behavioral analytics (CogniSwarm) to study interaction patterns. Allow?</span>
+  <span>
+    <button id="accept">Accept</button>
+    <button id="decline">Decline</button>
+  </span>
+</div>
+
+<script src="/static/collector/cogniswarm.min.js"></script>
+<script>
+  let consented = false;
+  let handle = null;
+  const status = document.getElementById("status");
+
+  document.getElementById("accept").addEventListener("click", () => {
+    consented = true;
+    document.getElementById("consent").remove();
+    handle = CogniSwarm.init({
+      siteId: "demo-site",
+      endpoint: "/v1/ingest",
+      consent: () => consented,
+      zones: ["hero", "content", "features", "cta"],
+      flushIntervalMs: 10000,
+    });
+    status.textContent = handle ? "collector: on" : "collector: blocked (DNT/GPC?)";
+  });
+
+  document.getElementById("decline").addEventListener("click", () => {
+    document.getElementById("consent").remove();
+    status.textContent = "collector: declined";
+  });
+</script>
+</body>
+</html>

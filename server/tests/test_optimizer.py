@@ -1,0 +1,369 @@
+"""Copy optimizer: the pure aggregation, and the evolutionary loop's orchestration.
+
+Everything here runs with zero network calls — `optimizer_result` is pure, and
+the streaming test monkeypatches the twin scorer and the breeder, so what is
+under test is the search itself: Thompson allocation, lineage bookkeeping, and
+the refusal to claim an improvement the intervals don't support.
+"""
+
+import asyncio
+import itertools
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import optimizer, storage
+from app.main import app
+from app.optimizer import optimizer_result, stream_copy_optimizer
+from app.persona import seed_persona
+from app.schemas import BehavioralSignal, CopyMutant, CopyOptimizerRequest, TwinCopyScore
+
+client = TestClient(app)
+
+
+def collect(gen):
+    async def run():
+        return [e async for e in gen]
+
+    return asyncio.run(run())
+
+
+def _persona(label="p"):
+    return seed_persona(
+        BehavioralSignal(
+            deliberation="medium",
+            frustration_signal="none",
+            exploration_style="scanner",
+            price_sensitivity_signal="unknown",
+            friction_hotspot=None,
+            evidence="t",
+            likely_mindset=label,
+            confidence=0.5,
+        )
+    )
+
+
+def _score(intent: float, acts: bool | None = None) -> TwinCopyScore:
+    return TwinCopyScore(
+        intent=intent,
+        would_act=(intent > 0.5) if acts is None else acts,
+        strongest_phrase="the opening line",
+        reaction="…",
+    )
+
+
+def _variant(vid, generation, text, parents=(), operation="mutation"):
+    return {
+        "id": vid,
+        "generation": generation,
+        "text": text,
+        "parents": list(parents),
+        "operation": operation,
+        "rationale": "r",
+    }
+
+
+SEED = _variant("g0v0", 0, "the copy we have today", operation="seed")
+
+
+def _result(lineage, scores, **kw):
+    return optimizer_result(lineage, scores, "g0v0", "brief", "low", kw.pop("gens", 2), **kw)
+
+
+# ─────────────────────────── pure aggregation ────────────────────────────
+
+
+def test_ranks_population_and_records_lineage():
+    lineage = [
+        SEED,
+        _variant("g0v1", 0, "mutant of the seed", parents=["g0v0"]),
+        _variant("g1v0", 1, "child of both", parents=["g0v0", "g0v1"], operation="crossover"),
+    ]
+    scores = {
+        "g0v0": [_score(0.2) for _ in range(10)],
+        "g0v1": [_score(0.5, acts=False) for _ in range(10)],
+        "g1v0": [_score(0.9) for _ in range(10)],
+    }
+    out = _result(lineage, scores)
+
+    assert out["twin_count"] == 30
+    assert out["best_variant_id"] == "g1v0"
+    assert [v["id"] for v in out["population"]] == ["g1v0", "g0v1", "g0v0"]
+    assert out["generations"][0]["best_fitness"] == 0.5  # best of gen 0
+    assert out["generations"][1]["best_fitness"] == 0.9
+    assert out["generations"][0]["evaluations"] == 20
+    # every arm gets a posterior, and the lineage is a directed edge list
+    assert all(v["posterior"] is not None for v in out["population"])
+    assert {"parent": "g0v0", "child": "g0v1", "operation": "mutation"} in out["lineage_edges"]
+    assert sum(1 for e in out["lineage_edges"] if e["child"] == "g1v0") == 2
+
+
+def test_claims_a_win_only_when_both_intervals_clear_the_seed():
+    lineage = [SEED, _variant("g0v1", 0, "much better copy", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(0.05, acts=False) for _ in range(20)],
+        "g0v1": [_score(0.95, acts=True) for _ in range(20)],
+    }
+    out = _result(lineage, scores)
+
+    assert out["beat_seed"] is True
+    assert out["convergence"] == "improved"
+    assert out["posterior_intervals_separated"] is True
+    assert out["intent_intervals_separated"] is True
+    assert out["intent_lift_vs_seed"] == pytest.approx(0.9, abs=1e-6)
+
+
+def test_refuses_to_claim_a_win_when_intervals_overlap():
+    """The winner's curse: the leader of a noisy search is upward-biased, so a
+    +0.1 mean lift on overlapping intervals is not an improvement."""
+    lineage = [SEED, _variant("g0v1", 0, "marginally different copy", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(i) for i in (0.4, 0.6, 0.5, 0.45, 0.55, 0.5)],
+        "g0v1": [_score(i) for i in (0.5, 0.7, 0.6, 0.55, 0.65, 0.6)],
+    }
+    out = _result(lineage, scores)
+
+    assert out["best_variant_id"] == "g0v1"  # it does rank first
+    assert out["beat_seed"] is False  # …but the win is not supported
+    assert out["convergence"] == "not_supported"
+    assert "did NOT beat" in out["verdict"]
+    assert out["intent_lift_vs_seed"] > 0
+
+
+def test_identical_variants_never_produce_a_claimed_improvement():
+    """Two arms with byte-identical copy and identical scores: whichever wins
+    the tiebreak, no improvement may be claimed."""
+    lineage = [SEED, _variant("g0v1", 0, SEED["text"], parents=["g0v0"])]
+    rows = [_score(0.5, acts=False) for _ in range(8)]
+    out = _result(lineage, {"g0v0": list(rows), "g0v1": list(rows)})
+
+    assert out["beat_seed"] is False
+    assert out["convergence"] in {"seed_wins", "not_supported"}
+    assert out["population"][0]["mean_intent"] == out["population"][1]["mean_intent"]
+
+
+def test_single_evaluation_cannot_win_because_it_has_no_interval():
+    """One reading is not a measurement: bootstrap_ci returns None below n=2,
+    and a missing interval must block the claim rather than default to 'clear'."""
+    lineage = [SEED, _variant("g0v1", 0, "lucky one-shot", parents=["g0v0"])]
+    scores = {"g0v0": [_score(0.1) for _ in range(10)], "g0v1": [_score(1.0)]}
+    out = _result(lineage, scores)
+
+    assert out["best_variant_id"] == "g0v1"
+    assert out["population"][0]["intent_ci"] is None
+    assert out["intent_intervals_separated"] is False
+    assert out["beat_seed"] is False
+
+
+def test_unevaluated_variants_are_reported_not_ranked():
+    """Thompson can starve an arm to zero trials; that must not divide by zero
+    and must not rank an unmeasured variant above a measured one."""
+    lineage = [SEED, _variant("g0v1", 0, "never scored", parents=["g0v0"])]
+    out = _result(lineage, {"g0v0": [_score(0.3) for _ in range(4)], "g0v1": []})
+
+    assert out["unevaluated"] == ["g0v1"]
+    assert [v["id"] for v in out["population"]] == ["g0v0"]
+    assert out["convergence"] == "seed_wins"
+    assert out["twin_count"] == 4
+
+
+def test_seed_only_population_is_honest_about_finding_nothing():
+    out = _result([SEED], {"g0v0": [_score(0.4) for _ in range(5)]})
+    assert out["best_variant_id"] == "g0v0"
+    assert out["convergence"] == "seed_wins"
+    assert out["beat_seed"] is False
+
+
+def test_seed_that_never_scored_leaves_no_baseline():
+    lineage = [SEED, _variant("g0v1", 0, "scored child", parents=["g0v0"])]
+    out = _result(lineage, {"g0v0": [], "g0v1": [_score(0.8) for _ in range(6)]})
+    assert out["convergence"] == "no_baseline"
+    assert out["beat_seed"] is False
+    assert "no baseline" in out["verdict"]
+
+
+def test_all_twins_failing_raises():
+    with pytest.raises(RuntimeError):
+        _result([SEED], {"g0v0": []})
+
+
+# ───────────────────────────── orchestration ─────────────────────────────
+
+
+def _fake_breeder():
+    counter = itertools.count()
+
+    async def fake_breed(brief, parents, n_children, generation):
+        # child 0 of every generation carries the marker the fake twin rewards,
+        # so there is always a clear leader for Thompson to find
+        return [
+            CopyMutant(
+                text=("BEST " if i == 0 else "meh ") + f"variant {next(counter)}",
+                parent_ids=[parents[0]["id"]],
+                operation="mutation",
+                rationale="changed the hook",
+            )
+            for i in range(n_children)
+        ]
+
+    return fake_breed
+
+
+def test_stream_runs_generations_and_concentrates_budget_on_the_leader(monkeypatch):
+    async def fake_score(persona, text, load, semaphore):
+        good = text.startswith("BEST")
+        return _score(0.9 if good else 0.2, acts=good)
+
+    monkeypatch.setattr(optimizer, "_score_twin", fake_score)
+    monkeypatch.setattr(optimizer, "_breed", _fake_breeder())
+
+    request = CopyOptimizerRequest(
+        brief="sell the thing",
+        seed_variant="the copy we have today",
+        population_size=3,
+        generations=2,
+        twins_per_persona=3,
+        min_evals_per_variant=2,
+    )
+    events = collect(stream_copy_optimizer([_persona() for _ in range(4)], request))
+
+    kinds = [e["type"] for e in events]
+    assert kinds[0] == "start"
+    assert kinds[-1] == "done"
+    assert kinds.count("generation") == 2
+    assert kinds.count("mutation") == 5  # seed + 2 at gen 0, then 3 bred for gen 1
+    # budget is len(personas) × twins_per_persona per generation
+    assert kinds.count("agent") == 4 * 3 * 2
+    assert kinds.count("variant_scored") == 6  # 3 variants × 2 generations
+    assert any(e["type"] == "wave" and e["policy"] == "thompson" for e in events)
+
+    gen0_agents = [e for e in events if e["type"] == "agent" and e["generation"] == 0]
+    by_variant: dict[str, int] = {}
+    for e in gen0_agents:
+        by_variant[e["variant"]] = by_variant.get(e["variant"], 0) + 1
+    leader = max(by_variant, key=lambda v: by_variant[v])
+    # Thompson must send the surplus (12 budget − 6 floor) to the winning arm
+    assert by_variant[leader] > 12 // 3
+
+    result = events[-1]["result"]
+    assert result["beat_seed"] is True
+    assert result["best_text"].startswith("BEST")
+    assert result["population"][0]["mean_intent"] == 0.9
+    assert result["failed_evaluations"] == 0
+
+
+def test_stream_survives_a_dead_breeder_and_failing_twins(monkeypatch):
+    """No mutants and half the twins failing must still produce a run, scored
+    on whatever survived — the codebase degrades to a smaller sample."""
+    calls = itertools.count()
+
+    async def flaky_score(persona, text, load, semaphore):
+        return None if next(calls) % 2 else _score(0.4)
+
+    async def dead_breed(brief, parents, n_children, generation):
+        return []
+
+    monkeypatch.setattr(optimizer, "_score_twin", flaky_score)
+    monkeypatch.setattr(optimizer, "_breed", dead_breed)
+
+    request = CopyOptimizerRequest(
+        brief="b", seed_variant="s", population_size=2, generations=2, twins_per_persona=2
+    )
+    events = collect(stream_copy_optimizer([_persona(), _persona()], request))
+
+    kinds = [e["type"] for e in events]
+    assert "agent_failed" in kinds
+    assert any(e["type"] == "mutation" and e.get("status") == "failed" for e in events)
+    result = events[-1]["result"]
+    assert result["failed_evaluations"] > 0
+    assert result["twin_count"] > 0
+    assert result["convergence"] == "seed_wins"  # nothing else was ever born
+
+
+def test_stream_raises_when_every_twin_fails(monkeypatch):
+    async def always_fail(persona, text, load, semaphore):
+        return None
+
+    async def dead_breed(brief, parents, n_children, generation):
+        return []
+
+    monkeypatch.setattr(optimizer, "_score_twin", always_fail)
+    monkeypatch.setattr(optimizer, "_breed", dead_breed)
+    request = CopyOptimizerRequest(brief="b", seed_variant="s", generations=1, twins_per_persona=1)
+    with pytest.raises(RuntimeError):
+        collect(stream_copy_optimizer([_persona()], request))
+
+
+def test_adopt_downgrades_a_crossover_that_lost_a_parent():
+    child = CopyMutant(
+        text="x", parent_ids=["g0v0", "hallucinated"], operation="crossover", rationale="r"
+    )
+    record = optimizer._adopt(child, 1, 0, {"g0v0"}, "g0v0")
+    assert record["parents"] == ["g0v0"]
+    assert record["operation"] == "mutation"  # one parent is not a crossover
+    assert record["id"] == "g1v0"
+
+
+def test_endpoint_registered_and_key_guarded(monkeypatch):
+    assert "/v1/studies/optimize/stream" in {r.path for r in app.routes}
+    monkeypatch.setenv("COGNISWARM_API_KEYS", "key-alpha")
+    res = client.post(
+        "/v1/studies/optimize/stream",
+        json={"brief": "b", "seed_variant": "s"},
+    )
+    assert res.status_code == 401
+
+
+def _session_with_persona() -> str:
+    """A profiled session, without going through the LLM profiler."""
+    res = client.post(
+        "/v1/ingest",
+        json={
+            "site_id": "opt",
+            "consent": True,
+            "sdk_version": "0.2.0",
+            "page_path": "/",
+            "features": {"segment_start": 0, "segment_end": 1, "event_count": 1},
+        },
+    )
+    session_id = res.json()["session_id"]
+    storage.set_persona(session_id, _persona().model_dump())
+    return session_id
+
+
+def test_endpoint_streams_sse_and_persists_the_run(monkeypatch):
+    """End to end through _sse: every frame must survive json.dumps and the
+    terminal frame must be persisted under the new `optimize` kind."""
+    monkeypatch.delenv("COGNISWARM_API_KEYS", raising=False)
+
+    async def fake_score(persona, text, load, semaphore):
+        return _score(0.8 if text.startswith("BEST") else 0.2)
+
+    monkeypatch.setattr(optimizer, "_score_twin", fake_score)
+    monkeypatch.setattr(optimizer, "_breed", _fake_breeder())
+
+    session_id = _session_with_persona()
+    with client.stream(
+        "POST",
+        "/v1/studies/optimize/stream",
+        json={
+            "brief": "sell it",
+            "seed_variant": "the copy we have today",
+            "session_ids": [session_id],
+            "population_size": 2,
+            "generations": 1,
+            "twins_per_persona": 4,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        frames = [json.loads(line[5:]) for line in resp.iter_lines() if line.startswith("data:")]
+
+    done = frames[-1]
+    assert done["type"] == "done"
+    run_id = done["result"]["run_id"]
+    assert run_id
+    runs = storage.list_swarm_runs(kind="optimize")
+    assert runs[0]["id"] == run_id
+    assert runs[0]["result"]["best_text"].startswith("BEST")
+    assert runs[0]["request"]["seed_variant"] == "the copy we have today"

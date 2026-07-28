@@ -1,0 +1,34 @@
+{
+  "name": "@cogniswarm/dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "add-user": "node scripts/add-user.mjs"
+  },
+  "dependencies": {
+    "@react-three/fiber": "^9.0.0",
+    "bcryptjs": "^3.0.0",
+    "framer-motion": "^12.0.0",
+    "hls.js": "^1.5.0",
+    "jose": "^5.9.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0",
+    "three": "^0.172.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.185.1",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}

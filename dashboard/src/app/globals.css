@@ -1,0 +1,1597 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════
+   COGNISWARM — "LIVING TISSUE INSTRUMENT"
+
+   The 3D cortex is the product's spine, so nothing in this stylesheet is
+   allowed to bury it. Panels filter the tissue rather than covering it.
+
+   Three layers, and every rule below belongs to one:
+
+     1. TISSUE   the 3D cortex + a living gradient field. Always behind,
+                 always visible. Never occluded, only filtered through.
+     2. MEMBRANE the panels. Not blocks — semi-permeable windows. Blurred,
+                 tinted by whichever brain region you are standing in, with
+                 edges that conduct signal (myelin) and corners that branch
+                 (dendrites). You see the tissue *through* them.
+     3. INSTRUMENT  type, ticks, numerals, rules. Stays razor sharp, mono,
+                 uppercase, zero-radius. The contrast between a precise
+                 instrument and the living thing under it is the whole idea.
+
+   Rules of the system:
+   A. COLOR IS DATA — saturated hues appear in charts and measurements.
+      Chrome is bone/void PLUS a whisper of the current region's hue, so
+      walking through the brain changes the room's colour temperature.
+   B. ONE CLOCK. Every pulse in the UI is driven from a single shared
+      physiological signal (--eeg / --pulse / --theta, published by
+      VitalsClock). Independent animations read as noise; one clock reads
+      as a living organism.
+   C. ZERO RADIUS on instrument surfaces. Curvature belongs to tissue.
+   D. Motion is structural, never decorative — every animation encodes
+      either depth, signal propagation, or measurement uncertainty.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* the two chrome tones */
+  --color-bone: #dfd9d9;
+  --color-void: #0a0b0d;
+
+  /* the field is deeper than before so tissue glow has somewhere to sit */
+  --color-page: #0b0c0e;
+  --color-surface: #141518;
+  --color-surface-2: #1b1d21;
+  --color-ink: #dfd9d9;
+  --color-ink-2: #a8a3a3;
+  --color-muted: #6f6c6c;
+  --color-grid: #2e2e2f;
+  --color-hairline: rgba(223, 217, 217, 0.16);
+
+  /* data-only palette — never used for chrome */
+  --color-accent: #3987e5;
+  --color-accent-2: #d95926;
+  --color-good: #16d016;
+  --color-critical: #f0605f;
+  --color-neon: #4fb6ff;
+  --color-neon-2: #a78bfa;
+
+  /* layout.tsx loads Space Grotesk via next/font into --font-space-grotesk.
+     It has to be named first here, or the webfont is downloaded on every page
+     load and never actually rendered. */
+  --font-display: var(--font-space-grotesk), "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-body: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  --radius-card: 0;
+}
+
+/* ── typed custom properties ───────────────────────────────────────────
+   @property makes these interpolable, which is what lets a gradient angle
+   or a glow radius animate at all. Without the type declaration the browser
+   treats them as strings and snaps between keyframes. */
+
+@property --myelin-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@property --synapse-r {
+  syntax: "<length>";
+  initial-value: 0px;
+  inherits: false;
+}
+@property --field-shift {
+  syntax: "<percentage>";
+  initial-value: 0%;
+  inherits: false;
+}
+
+/* ── the region channel ────────────────────────────────────────────────
+   Shell writes --region-rgb on <html> from the active sector. Everything
+   downstream tints from this single variable, so navigating to a different
+   lobe re-tints the entire interface in one assignment. */
+
+:root {
+  --region-rgb: 125 184 255; /* prefrontal, the default station */
+  --region: rgb(var(--region-rgb));
+
+  /* the physiological clock (VitalsClock writes these every frame) */
+  --eeg: 0; /* −1 ‥ 1  band-limited cortical trace */
+  --pulse: 0; /* 0 ‥ 1  slow cardiac envelope       */
+  --theta: 0; /* −1 ‥ 1  4–8 Hz theta rhythm         */
+
+  /* depth: 0 outside the skull, 1 intracortical. Set by Shell. */
+  --depth: 0;
+
+  /* derived, so components never recompute the same expression */
+  --membrane-tint: rgb(var(--region-rgb) / 0.05);
+  --membrane-edge: rgb(var(--region-rgb) / 0.22);
+  --membrane-glow: rgb(var(--region-rgb) / 0.38);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-page);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: var(--color-bone);
+  color: var(--color-void);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LAYER 1 — TISSUE
+   The field the whole instrument floats in. Two fixed layers behind the
+   WebGL canvas: a slow perfusion glow tinted by the active region, and a
+   fine engineering grid, kept because it reads as calibration rather than
+   decoration.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  z-index: -2;
+  pointer-events: none;
+  /* three offset radial pools drifting at different rates — this is what
+     stops the background reading as a flat fill behind the point cloud */
+  background:
+    radial-gradient(38% 44% at 22% 26%, rgb(var(--region-rgb) / 0.13), transparent 70%),
+    radial-gradient(46% 38% at 78% 32%, rgb(var(--region-rgb) / 0.09), transparent 72%),
+    radial-gradient(52% 50% at 50% 88%, rgb(var(--region-rgb) / 0.07), transparent 74%);
+  filter: blur(38px);
+  animation: perfusion 34s ease-in-out infinite alternate;
+  transition: background 1.6s ease;
+}
+
+@keyframes perfusion {
+  0% {
+    transform: translate3d(-2.2%, -1.4%, 0) scale(1.04);
+  }
+  50% {
+    transform: translate3d(1.8%, 2.2%, 0) scale(1.09);
+  }
+  100% {
+    transform: translate3d(2.6%, -1%, 0) scale(1.02);
+  }
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(223, 217, 217, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(223, 217, 217, 0.028) 1px, transparent 1px);
+  background-size: 40px 40px;
+  /* the grid recedes as you descend into tissue — a depth cue you feel
+     rather than read */
+  opacity: calc(1 - var(--depth) * 0.65);
+  transition: opacity 1.1s ease;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LAYER 2 — MEMBRANE
+   `.card` is the workhorse: every panel in the app uses it. It is now a
+   semi-permeable window rather than an opaque block, so the cortex reads
+   through every surface instead of being buried by it.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.card {
+  position: relative;
+  isolation: isolate;
+  /* Translucency is the whole fix for "the brain is covered by opaque
+     functionality". 0.62–0.78 alpha keeps small type legible over a moving
+     point cloud while still letting structure through. */
+  background:
+    radial-gradient(130% 90% at 50% 0%, var(--membrane-tint), transparent 62%),
+    linear-gradient(180deg, rgb(20 21 24 / 0.72) 0%, rgb(11 12 14 / 0.84) 100%);
+  /* `brightness` is the important term, and it is what a plain translucent
+     panel cannot do. The tractogram is ADDITIVELY blended, so it is luminous
+     rather than merely present — small body text at 0.72 alpha still loses the
+     contrast fight against a bright streamline crossing behind it. Raising the
+     panel's own alpha would fix legibility by destroying the thing that makes
+     this interface work: seeing the anatomy through the membrane.
+     Dimming the backdrop instead keeps the structure fully visible and simply
+     denies it the luminance to compete with type.
+
+     0.42 → 0.58 now that the reading well handles the worst of it upstream:
+     the sprites that used to blow out behind a panel no longer exist, so the
+     membrane can go back to being semi-permeable rather than near-opaque. */
+  backdrop-filter: blur(16px) saturate(1.15) brightness(0.58);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15) brightness(0.58);
+  border: 1px solid var(--color-hairline);
+  transition:
+    border-color 0.24s ease,
+    box-shadow 0.32s ease,
+    transform 0.32s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+/* corner registration ticks — machined marks that BRANCH on approach, so a
+   hovered panel grows the beginnings of a dendritic arbor */
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  --bc: rgba(223, 217, 217, 0.42);
+  --bw: 1px;
+  --bl: 9px;
+  background-image:
+    linear-gradient(var(--bc), var(--bc)), linear-gradient(var(--bc), var(--bc)),
+    linear-gradient(var(--bc), var(--bc)), linear-gradient(var(--bc), var(--bc)),
+    linear-gradient(var(--bc), var(--bc)), linear-gradient(var(--bc), var(--bc)),
+    linear-gradient(var(--bc), var(--bc)), linear-gradient(var(--bc), var(--bc));
+  background-repeat: no-repeat;
+  background-size:
+    var(--bl) var(--bw), var(--bw) var(--bl),
+    var(--bl) var(--bw), var(--bw) var(--bl),
+    var(--bl) var(--bw), var(--bw) var(--bl),
+    var(--bl) var(--bw), var(--bw) var(--bl);
+  background-position:
+    left -1px top -1px, left -1px top -1px,
+    right -1px top -1px, right -1px top -1px,
+    left -1px bottom -1px, left -1px bottom -1px,
+    right -1px bottom -1px, right -1px bottom -1px;
+  transition:
+    background-size 0.4s cubic-bezier(0.2, 0.85, 0.25, 1),
+    opacity 0.24s;
+}
+
+.card:hover::before {
+  --bc: rgb(var(--region-rgb) / 0.72);
+  --bl: 22px;
+}
+
+/* the myelin edge: a signal conducting around the panel border.
+   Drawn as a masked conic gradient so it is one composited layer, not four
+   animated pseudo-borders. */
+.card::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: 0;
+  padding: 1px;
+  pointer-events: none;
+  background: conic-gradient(
+    from var(--myelin-angle),
+    transparent 0 62%,
+    rgb(var(--region-rgb) / 0.55) 74%,
+    rgb(var(--region-rgb) / 0.95) 78%,
+    rgb(var(--region-rgb) / 0.55) 82%,
+    transparent 94% 100%
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.36s ease;
+}
+
+.card:hover,
+.card:focus-within {
+  border-color: rgb(var(--region-rgb) / 0.34);
+  box-shadow:
+    0 0 0 1px rgb(var(--region-rgb) / 0.06),
+    0 18px 60px -28px rgb(var(--region-rgb) / 0.45);
+}
+
+.card:hover::after,
+.card:focus-within::after,
+.card[data-live="1"]::after {
+  opacity: 1;
+  animation: myelin-conduct 3.4s linear infinite;
+}
+
+/* a panel that is actively computing conducts continuously and faster —
+   the border tells you the backend is streaming without a spinner */
+.card[data-live="1"]::after {
+  animation-duration: 1.15s;
+}
+
+@keyframes myelin-conduct {
+  to {
+    --myelin-angle: 360deg;
+  }
+}
+
+.card > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* inverted membrane — bone on void, for emphasis blocks. Opaque by design:
+   this is the one surface allowed to occlude, because it IS the signal. */
+.card-invert {
+  background: var(--color-bone);
+  color: var(--color-void);
+  border: 1px solid var(--color-bone);
+  backdrop-filter: none;
+}
+.card-invert .hud-label,
+.card-invert .text-muted {
+  color: rgba(10, 11, 13, 0.62);
+}
+
+/* a membrane you have physically passed through — used by the swarm
+   journey when a station is behind you */
+.card[data-behind="1"] {
+  opacity: 0.34;
+  filter: saturate(0.4) blur(0.6px);
+  transform: scale(0.988);
+}
+
+/* ── instrument surfaces that must stay opaque ─────────────────────────
+   Sticky table headers have to occlude the rows scrolling under them; a
+   translucent one smears. This is the deliberate exception to membrane. */
+.opaque-chrome,
+thead.sticky {
+  background: color-mix(in oklab, var(--color-surface) 94%, black) !important;
+  backdrop-filter: blur(8px);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LAYER 3 — INSTRUMENT (type, ticks, numerals)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* nothing rounds… */
+[class*="rounded"] {
+  border-radius: 0 !important;
+}
+/* …except indicators, which must stay circular to read as status */
+.pulse-dot,
+.vesicle,
+[class*="rounded-full"][class*="h-1"],
+[class*="rounded-full"][class*="h-2"],
+[class*="rounded-full"][class*="h-3"] {
+  border-radius: 9999px !important;
+}
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -0.035em;
+  line-height: 0.92;
+}
+
+/* superscript trademark tick, as on the reference wordmark */
+.reg::after {
+  content: "®";
+  font-size: 0.28em;
+  vertical-align: super;
+  margin-left: 0.22em;
+  letter-spacing: 0;
+  opacity: 0.75;
+}
+
+/* retained as an API; now carries the region hue as a gradient wash so the
+   masthead of each sector is literally coloured by its lobe */
+.grad-text {
+  background: linear-gradient(
+    92deg,
+    var(--color-bone) 0%,
+    var(--color-bone) 40%,
+    color-mix(in oklab, var(--region) 62%, var(--color-bone)) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ── prose ────────────────────────────────────────────────────────────
+   Sans, as it was. The serif read as a magazine rather than an instrument and
+   fought the mono/grotesk pairing the system was already built on.
+
+   Kept as named classes rather than reverting to inline utilities, because
+   ledes and rationales now share one definition instead of being respecified
+   in nine panels — which is how they drifted apart in the first place.
+
+   The only change from the original is a small intensity bump: slightly more
+   size and contrast, since this type sits over living tissue rather than a
+   flat panel. `text-wrap: pretty` kills orphans. */
+.lede {
+  font-family: var(--font-body);
+  font-size: 0.945rem;
+  line-height: 1.6;
+  color: rgb(223 217 217 / 0.82);
+  text-wrap: pretty;
+  max-width: 68ch;
+}
+
+/* the honest note under a station header — why this lives in this structure.
+   Mono, as before: it is a system annotation, not authored prose. */
+.rationale {
+  font-family: var(--font-mono);
+  font-size: 0.655rem;
+  line-height: 1.65;
+  letter-spacing: 0.012em;
+  color: rgb(168 163 163 / 0.62);
+  text-wrap: pretty;
+  max-width: 92ch;
+}
+
+/* a verdict is a claim the system is making, so it carries a little weight */
+.verdict {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.hud-label {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 0.62rem;
+  color: var(--color-muted);
+}
+
+/* bracketed navigation/label token: renders as [LABEL] */
+.tag {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.68rem;
+}
+.tag::before {
+  content: "[";
+  opacity: 0.5;
+  margin-right: 0.15em;
+}
+.tag::after {
+  content: "]";
+  opacity: 0.5;
+  margin-left: 0.15em;
+}
+
+.panel-index {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  line-height: 1;
+  color: rgba(223, 217, 217, 0.22);
+  font-variant-numeric: tabular-nums;
+}
+
+.marquee {
+  outline: 1px dashed rgba(223, 217, 217, 0.3);
+  outline-offset: 3px;
+}
+
+.card h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -0.01em;
+  font-size: 1.05rem;
+}
+
+/* ── primary action: a synapse ─────────────────────────────────────────
+   bone-on-void, and on press it releases a vesicle ring rather than just
+   dimming. The ring is a single animated box-shadow, so no extra element. */
+button.bg-accent,
+a.bg-accent {
+  position: relative;
+  background: var(--color-bone) !important;
+  color: var(--color-void) !important;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  overflow: hidden;
+  transition:
+    background 0.2s,
+    box-shadow 0.3s;
+}
+button.bg-accent:hover:not(:disabled),
+a.bg-accent:hover {
+  background: #fff !important;
+  box-shadow: 0 0 26px -6px rgb(var(--region-rgb) / 0.7);
+}
+button.bg-accent:active:not(:disabled)::after,
+a.bg-accent:active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, rgb(var(--region-rgb) / 0.5), transparent 60%);
+  animation: vesicle-release 0.5s ease-out;
+}
+@keyframes vesicle-release {
+  from {
+    opacity: 0.9;
+    transform: scale(0.2);
+  }
+  to {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   INPUT CRAFT
+
+   Text entry was the least-designed surface in the app: a flat box with a
+   default focus ring. Under a probe cursor and a living background, a control
+   that does not respond to attention reads as inert. These respond twice —
+   on hover (available) and on focus (engaged) — and the focus state grows a
+   region-tinted bar along the leading edge rather than an outline, so it
+   belongs to the same vocabulary as the station marks and probe veins.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.card textarea,
+.card input[type="text"],
+.card input[type="number"],
+.card input[type="email"],
+.card input[type="password"],
+.card select {
+  position: relative;
+  background: rgb(0 0 0 / 0.28);
+  border: 1px solid var(--color-hairline);
+  color: var(--color-ink);
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease,
+    box-shadow 0.25s ease;
+  outline: none;
+}
+
+.card textarea:hover,
+.card input:hover:not(:focus),
+.card select:hover {
+  border-color: rgb(223 217 217 / 0.3);
+  background: rgb(0 0 0 / 0.36);
+}
+
+.card textarea:focus,
+.card input:focus,
+.card select:focus {
+  border-color: rgb(var(--region-rgb) / 0.55);
+  background: rgb(0 0 0 / 0.44);
+  /* the leading-edge bar: an inset shadow, so no extra element and no layout
+     shift when it appears */
+  box-shadow:
+    inset 2px 0 0 0 rgb(var(--region-rgb)),
+    0 0 0 1px rgb(var(--region-rgb) / 0.14),
+    0 8px 32px -20px rgb(var(--region-rgb) / 0.7);
+}
+
+.card textarea::placeholder,
+.card input::placeholder {
+  color: rgb(111 108 108 / 0.85);
+}
+
+/* number inputs carry data, so they get the data face */
+.card input[type="number"] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* secondary actions — the dashed "use sample" affordances and + variant.
+   They read as suggestions, so they stay quiet until approached. */
+.card button[class*="border-dashed"] {
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease,
+    background 0.2s ease;
+}
+.card button[class*="border-dashed"]:hover {
+  border-color: rgb(var(--region-rgb) / 0.5);
+  color: var(--color-ink);
+  background: rgb(var(--region-rgb) / 0.06);
+}
+
+/* keyboard users get a visible ring everywhere the probe cursor would have
+   been the only affordance */
+:focus-visible {
+  outline: 1px solid rgb(var(--region-rgb) / 0.8);
+  outline-offset: 2px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   NEURAL MOTION PRIMITIVES
+   Reusable pieces of behaviour. Each encodes something real: a spike train
+   is a rate, a raster is a population, a growth-cone is progress.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* status dot, breathing on the shared clock rather than its own timer */
+.neon-dot {
+  box-shadow: 0 0 calc(6px + var(--pulse) * 8px) rgb(var(--region-rgb) / 0.55);
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.82);
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.8s steps(2, end) infinite;
+}
+
+/* live equalizer bars — squared off, bone */
+.eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.eq > i {
+  width: 2px;
+  background: var(--color-ink-2);
+  animation: eq 1.1s steps(3, end) infinite;
+}
+.eq > i:nth-child(2) {
+  animation-delay: 0.22s;
+}
+.eq > i:nth-child(3) {
+  animation-delay: 0.44s;
+}
+.eq > i:nth-child(4) {
+  animation-delay: 0.66s;
+}
+.eq > i:nth-child(5) {
+  animation-delay: 0.15s;
+}
+@keyframes eq {
+  0%,
+  100% {
+    height: 3px;
+  }
+  50% {
+    height: 12px;
+  }
+}
+
+/* SPIKE TRAIN — the app's loader. Not a spinner: a raster of action
+   potentials whose density encodes how much work is outstanding. */
+.spike-train {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  height: 14px;
+}
+.spike-train > i {
+  width: 1.5px;
+  height: 2px;
+  background: var(--region);
+  opacity: 0.35;
+  animation: spike 1.4s ease-in-out infinite;
+}
+.spike-train > i:nth-child(3n) {
+  animation-duration: 0.9s;
+}
+.spike-train > i:nth-child(4n) {
+  animation-duration: 1.9s;
+}
+.spike-train > i:nth-child(1) { animation-delay: 0s; }
+.spike-train > i:nth-child(2) { animation-delay: 0.11s; }
+.spike-train > i:nth-child(3) { animation-delay: 0.27s; }
+.spike-train > i:nth-child(4) { animation-delay: 0.06s; }
+.spike-train > i:nth-child(5) { animation-delay: 0.42s; }
+.spike-train > i:nth-child(6) { animation-delay: 0.19s; }
+.spike-train > i:nth-child(7) { animation-delay: 0.55s; }
+.spike-train > i:nth-child(8) { animation-delay: 0.33s; }
+.spike-train > i:nth-child(9) { animation-delay: 0.62s; }
+.spike-train > i:nth-child(10) { animation-delay: 0.14s; }
+.spike-train > i:nth-child(11) { animation-delay: 0.48s; }
+.spike-train > i:nth-child(12) { animation-delay: 0.24s; }
+@keyframes spike {
+  0%,
+  88%,
+  100% {
+    height: 2px;
+    opacity: 0.3;
+  }
+  92% {
+    height: 14px;
+    opacity: 1;
+  }
+  96% {
+    height: 4px;
+    opacity: 0.5;
+  }
+}
+
+/* AXON CONDUIT — a hairline that carries a travelling action potential.
+   Used to connect a control to the result it produced. */
+.axon {
+  position: relative;
+  height: 1px;
+  background: var(--color-hairline);
+  overflow: hidden;
+}
+.axon::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 28%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(var(--region-rgb) / 0.9),
+    transparent
+  );
+  animation: axon-travel 2.1s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+@keyframes axon-travel {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(460%);
+  }
+}
+
+/* GROWTH CONE — determinate progress that reads as an axon finding a
+   target rather than a bar filling up. */
+.growth-cone {
+  position: relative;
+  height: 2px;
+  background: rgb(223 217 217 / 0.08);
+}
+.growth-cone > i {
+  display: block;
+  height: 100%;
+  width: var(--grown, 0%);
+  background: linear-gradient(90deg, rgb(var(--region-rgb) / 0.25), var(--region));
+  transition: width 0.5s cubic-bezier(0.2, 0.85, 0.25, 1);
+}
+.growth-cone > i::after {
+  content: "";
+  position: absolute;
+  top: -2px;
+  left: var(--grown, 0%);
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  background: var(--region);
+  box-shadow: 0 0 10px 2px rgb(var(--region-rgb) / 0.65);
+  transition: left 0.5s cubic-bezier(0.2, 0.85, 0.25, 1);
+}
+
+/* SYNAPTIC CLEFT divider — a rule that is broken by a gap, like the 20 nm
+   gap it is named for, with vesicles crossing it */
+.cleft {
+  position: relative;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    var(--color-hairline) 0 46%,
+    transparent 46% 54%,
+    var(--color-hairline) 54% 100%
+  );
+}
+.cleft::after {
+  content: "";
+  position: absolute;
+  top: -1.5px;
+  left: 46%;
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgb(var(--region-rgb) / 0.9);
+  animation: cross-cleft 2.6s ease-in-out infinite;
+}
+@keyframes cross-cleft {
+  0%,
+  100% {
+    transform: translateX(0) scale(0.6);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  80% {
+    opacity: 1;
+  }
+  90%,
+  100% {
+    transform: translateX(2.2rem) scale(0.6);
+    opacity: 0;
+  }
+}
+
+/* NEURON CHIP — small inline token that reads as a labelled cell body */
+.soma {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.15em 0.55em;
+  border: 1px solid rgb(var(--region-rgb) / 0.32);
+  background: rgb(var(--region-rgb) / 0.07);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-ink-2);
+}
+.soma::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: var(--region);
+  box-shadow: 0 0 8px rgb(var(--region-rgb) / 0.8);
+  opacity: calc(0.55 + var(--pulse) * 0.45);
+}
+
+/* recessive scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-grid) transparent;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  scrollbar-width: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   THE CORTEX NAVIGATOR — spatial chrome.
+   Stages the 3D brain, tints the page by depth, and choreographs the
+   moment of passing through the cortical surface.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.cortex-stage {
+  transition: opacity 0.9s ease;
+  opacity: 1;
+  /* --travel is driven per-frame from the camera flight (0 at rest, 1 at the
+     midpoint of a journey): the field blurs and pushes toward the viewer as
+     you rush through tissue, then settles on arrival. */
+  --travel: 0;
+  filter: blur(calc(var(--travel) * 3.5px));
+  transform: scale(calc(1 + var(--travel) * 0.06));
+  will-change: filter, transform;
+}
+
+/* Edge fade painted as an overlay rather than a CSS mask: mask-image on a
+   WebGL canvas is unreliable across engines and silently hid the cortex.
+   Far weaker than before — the point is to see the tissue, not hide it. */
+.cortex-stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    108% 100% at 72% 34%,
+    transparent 46%,
+    rgb(11 12 14 / 0.28) 74%,
+    rgb(11 12 14 / 0.82) 100%
+  );
+}
+
+/* Inside the tissue the field is closer — but no longer globally dimmed. The
+   shader's reading well now decides *where* it is quiet, which is strictly
+   better than deciding *how much* it is quiet everywhere: the rim stays
+   luminous and only the reading column steps back. */
+.cortex-stage[data-inside="1"] {
+  opacity: 0.92;
+}
+
+/* Enclosure vignette, only while intracortical. Inverted from the usual
+   reading of a vignette: it darkens the OUTER frame, which is where the well
+   deliberately leaves the anatomy brightest, so the two compose into a band of
+   structure rather than a blaze at the edge of the screen. */
+.cortex-stage[data-inside="1"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    115% 85% at 50% 45%,
+    transparent 38%,
+    rgb(6 7 9 / 0.58) 92%
+  );
+  animation: vignette-close 1.1s cubic-bezier(0.2, 0.85, 0.3, 1) both;
+}
+@keyframes vignette-close {
+  from {
+    opacity: 0;
+    transform: scale(1.12);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* the membrane breach: one burst per route change, layered over content */
+.tissue-flash {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background:
+    radial-gradient(closest-side at 50% 48%, rgb(var(--region-rgb) / 0.22), transparent 70%),
+    repeating-linear-gradient(0deg, rgba(223, 217, 217, 0.05) 0 1px, transparent 1px 4px);
+  animation: breach 0.72s cubic-bezier(0.16, 0.9, 0.24, 1) both;
+}
+@keyframes breach {
+  0% {
+    opacity: 0;
+    transform: scale(1.5);
+    filter: blur(6px);
+  }
+  22% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+    filter: blur(0);
+  }
+}
+
+/* arriving content resolves out of depth-of-field, as if focus is regained */
+.cortex-content {
+  animation: arrive 0.6s cubic-bezier(0.21, 0.9, 0.27, 1) both;
+}
+@keyframes arrive {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.995);
+    filter: blur(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+/* ── the rail ─────────────────────────────────────────────────────────── */
+
+.cortex-pip {
+  width: 9px;
+  height: 9px;
+  border-radius: 9999px;
+  background: var(--color-bone);
+  box-shadow: 0 0 0 0 rgba(223, 217, 217, 0.55);
+  animation: pip 2.6s cubic-bezier(0.2, 0.8, 0.3, 1) infinite;
+  flex: none;
+}
+@keyframes pip {
+  0% {
+    box-shadow: 0 0 0 0 rgba(223, 217, 217, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 11px rgba(223, 217, 217, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(223, 217, 217, 0);
+  }
+}
+
+/* each probe site grows a coloured vein in its region's hue on approach */
+.probe {
+  min-width: 8.5rem;
+}
+.probe-vein {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.42s cubic-bezier(0.2, 0.85, 0.25, 1);
+}
+.probe:hover .probe-vein,
+.probe[aria-current="page"] .probe-vein {
+  transform: scaleX(1);
+}
+/* a faint scan sweeps a probe on hover — the site being interrogated */
+.probe::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    transparent 40%,
+    rgba(223, 217, 217, 0.09) 50%,
+    transparent 60%
+  );
+  background-size: 260% 100%;
+  background-position: 130% 0;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.probe:hover::after {
+  opacity: 1;
+  animation: probe-scan 0.75s ease-out;
+}
+@keyframes probe-scan {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -30% 0;
+  }
+}
+
+/* depth meter: the marker travels from surface to interior */
+.depth-track {
+  position: relative;
+  flex: 1;
+  height: 1px;
+  background: var(--color-hairline);
+  min-width: 3rem;
+}
+.depth-track > i {
+  position: absolute;
+  top: -2px;
+  height: 5px;
+  width: 5px;
+  background: var(--color-bone);
+  transition: left 1.05s cubic-bezier(0.2, 0.85, 0.25, 1);
+  left: 4%;
+}
+.depth-track[data-inside="1"] > i {
+  left: calc(100% - 5px);
+}
+.depth-track[data-inside="1"]::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 0 0;
+  background: linear-gradient(90deg, transparent, rgb(var(--region-rgb) / 0.55));
+  animation: depth-fill 1.05s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+@keyframes depth-fill {
+  from {
+    transform: scaleX(0);
+    transform-origin: left;
+  }
+  to {
+    transform: scaleX(1);
+    transform-origin: left;
+  }
+}
+
+/* ── responsive behaviour ─────────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .probe {
+    min-width: 6.6rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+  .cortex-stage {
+    opacity: 0.78;
+  }
+  .cortex-stage[data-inside="1"] {
+    opacity: 0.5;
+  }
+  /* blur is the most expensive thing on the page; drop it on small screens
+     where the GPU is usually the weakest and the panels are full-bleed */
+  .card {
+    backdrop-filter: blur(9px);
+    -webkit-backdrop-filter: blur(9px);
+  }
+}
+@media (max-width: 640px) {
+  /* the anatomy label is the first thing to go; codes carry the meaning */
+  .probe > span:first-of-type {
+    display: none;
+  }
+  .probe {
+    min-width: 5.4rem;
+  }
+  .depth-strip {
+    display: none;
+  }
+}
+
+/* Entrance reveal — pure CSS so it can never trap content invisible
+   (rAF-driven mount animations park at opacity 0 in hidden/background tabs).
+   `both` fill + time-based timeline completes regardless of visibility. */
+@keyframes reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.reveal {
+  animation: reveal-in 0.45s cubic-bezier(0.21, 0.9, 0.27, 1) both;
+  animation-delay: var(--reveal-delay, 0ms);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   HISTOLOGY — the immersive layer.
+
+   Arriving somewhere should *look* like arriving somewhere. Each of these
+   fields is the real architectural signature of the structure you are
+   standing in, drawn in CSS and parked between the point cloud (z-0) and the
+   content (z-10) — so it reads as matter suspended between you and the far
+   wall of the tissue, not as wallpaper behind everything.
+
+     columns  neocortex — vertical minicolumns, the repeating unit of cortex
+     folia    cerebellum — the tightest parallel folding in the brain
+     laminae  neocortex — horizontal cortical layers, swept by a sensory raster
+     grid     entorhinal/hippocampal — the hexagonal lattice of grid cells
+
+   All four are one element with a background-image, so switching stations
+   costs a crossfade and nothing else.
+
+   THE MASK IS THE IMPORTANT PART. The obvious shape —
+   `radial-gradient(… #000 <inner>, transparent <outer>)` — is opaque in the
+   middle, which puts the field at full strength directly behind the reading
+   column and fades it out toward the empty margins: exactly inverted from what
+   this layout needs.
+
+   So the shared mask below is feathered the other way: nothing through the
+   middle, full strength around the rim, easing off again at the extreme corner
+   so it never terminates on a hard edge. This is the CSS twin of the shader's
+   reading well, so the 3D layer and the histology layer agree about where the
+   page is quiet.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.tissue-field {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 1.4s ease;
+  will-change: opacity;
+
+  --tissue-mask: radial-gradient(
+    78% 68% at 50% 45%,
+    transparent 6%,
+    rgba(0, 0, 0, 0.28) 42%,
+    rgba(0, 0, 0, 0.92) 78%,
+    rgba(0, 0, 0, 0.5) 100%
+  );
+  -webkit-mask-image: var(--tissue-mask);
+  mask-image: var(--tissue-mask);
+}
+.tissue-field[data-on="1"] {
+  opacity: 1;
+}
+
+/* ── neocortical minicolumns ───────────────────────────────────────────
+   Vertical bundles, denser toward the horizon, with a slow drift across —
+   the sense of moving laterally through columnar tissue. */
+.tissue-field[data-field="columns"] {
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0 22px,
+    rgb(var(--region-rgb) / 0.05) 22px 23px,
+    transparent 23px 45px,
+    rgb(var(--region-rgb) / 0.08) 45px 46px
+  );
+  animation: column-drift 26s linear infinite;
+}
+@keyframes column-drift {
+  to {
+    background-position: 90px 0;
+  }
+}
+
+/* ── cerebellar folia ──────────────────────────────────────────────────
+   The cerebellum packs ~80% of the brain's neurons into tightly stacked
+   parallel leaves. Hence: very tight spacing, slight shear, and a second
+   coarser stack behind it for depth. */
+.tissue-field[data-field="folia"] {
+  background-image:
+    repeating-linear-gradient(
+      98deg,
+      transparent 0 5px,
+      rgb(var(--region-rgb) / 0.07) 5px 6px
+    ),
+    repeating-linear-gradient(
+      94deg,
+      transparent 0 17px,
+      rgb(var(--region-rgb) / 0.045) 17px 19px
+    );
+  animation: folia-breathe 19s ease-in-out infinite alternate;
+}
+@keyframes folia-breathe {
+  from {
+    background-size: 100% 100%, 100% 100%;
+    transform: translateY(0);
+  }
+  to {
+    background-size: 104% 104%, 97% 97%;
+    transform: translateY(-1.4%);
+  }
+}
+
+/* ── cortical laminae + sensory raster ────────────────────────────────
+   Cortex is six horizontal layers. Parietal cortex integrates sensory
+   streams, so a bright raster sweeps down through the laminae — the arrival
+   of afferent traffic. */
+.tissue-field[data-field="laminae"] {
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 26px,
+      rgb(var(--region-rgb) / 0.055) 26px 27px
+    ),
+    linear-gradient(
+      0deg,
+      transparent 0%,
+      rgb(var(--region-rgb) / 0.16) 46%,
+      transparent 52%
+    );
+  background-size:
+    100% 100%,
+    100% 220%;
+  background-repeat: repeat, no-repeat;
+  animation: raster-sweep 7.5s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+@keyframes raster-sweep {
+  from {
+    background-position:
+      0 0,
+      0 -120%;
+  }
+  to {
+    background-position:
+      0 0,
+      0 120%;
+  }
+}
+
+/* ── grid modules ─────────────────────────────────────────────────────
+   The hippocampal formation, drawn by what this tissue COMPUTES rather than
+   by its shape. Drawing the anatomy directly (concentric rings, or the rolled
+   spiral of the cornu ammonis) is busy and says nothing.
+
+   Grid cells in the entorhinal cortex fire in a hexagonal lattice as you move
+   through space: the brain's coordinate system, and the 2014 Nobel. The detail
+   worth drawing is that grid cells are organised into discrete MODULES, and
+   the spacing of successive modules scales geometrically by a near-constant
+   ratio of about 1.42 (Stensola et al., Nature 2012). The brain tiles space at
+   several resolutions at once, which is what lets a handful of cells encode
+   position unambiguously over a large area.
+
+   So: three lattices at 1 : 1.42 : 2.02, drifting in different directions at
+   different rates. What you see is the slow moiré between them — the image of
+   a multi-scale coordinate system sliding underneath you. Three faint modules
+   read as more alive than one lattice without being any busier.
+
+   Each lattice is two offset dot layers: a single one is square, and a copy
+   shifted half a period in both axes is what makes it hexagonal. The 1:√3
+   ratio between tile width and height is what makes the triangles equilateral;
+   get it wrong and it reads as a stretched checkerboard. */
+.tissue-field[data-field="grid"] {
+  /* module 1 — the tightest scale */
+  --m1a: 78px;
+  --m1b: 135.1px; /* 78 × √3 — equilateral, not a guess */
+  /* module 2 — ×1.42 */
+  --m2a: 110.8px;
+  --m2b: 191.9px;
+  /* module 3 — ×1.42 again */
+  --m3a: 157.3px;
+  --m3b: 272.5px;
+
+  background-image:
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.34) 1.4px, transparent 1.9px),
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.34) 1.4px, transparent 1.9px),
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.2) 1.7px, transparent 2.3px),
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.2) 1.7px, transparent 2.3px),
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.13) 2.1px, transparent 2.8px),
+    radial-gradient(circle at center, rgb(var(--region-rgb) / 0.13) 2.1px, transparent 2.8px);
+  background-size:
+    var(--m1a) var(--m1b), var(--m1a) var(--m1b),
+    var(--m2a) var(--m2b), var(--m2a) var(--m2b),
+    var(--m3a) var(--m3b), var(--m3a) var(--m3b);
+  /* every second layer carries the half-period offset that hexagonalises its
+     module */
+  background-position:
+    0 0, calc(var(--m1a) / 2) calc(var(--m1b) / 2),
+    0 0, calc(var(--m2a) / 2) calc(var(--m2b) / 2),
+    0 0, calc(var(--m3a) / 2) calc(var(--m3b) / 2);
+  animation: grid-modules 108s linear infinite;
+}
+
+/* Each module translates by exactly ONE of its own periods, so all three loop
+   seamlessly despite having different spacings and different directions — the
+   map slides, it never jumps back. The opposed directions are what makes the
+   moiré between modules move rather than merely exist. */
+@keyframes grid-modules {
+  to {
+    background-position:
+      var(--m1a) var(--m1b),
+      calc(var(--m1a) * 1.5) calc(var(--m1b) * 1.5),
+      calc(var(--m2a) * -1) var(--m2b),
+      calc(var(--m2a) * -0.5) calc(var(--m2b) * 1.5),
+      var(--m3a) calc(var(--m3b) * -1),
+      calc(var(--m3a) * 1.5) calc(var(--m3b) * -0.5);
+  }
+}
+
+/* ── the reading channel ──────────────────────────────────────────────
+   Station headers, mastheads and lede copy carry NO panel — by design, they
+   sit directly on the tissue. That is exactly where legibility broke: at an
+   interior station the cortex is close and blazing, and a 14px lede has
+   nothing between it and a luminous streamline.
+
+   Solving that here alone would take a heavy full-viewport wash, and a wash
+   dims the anatomy you want to see just as hard as the anatomy that is in the
+   way — legible, but uniformly murky.
+
+   So the real work happens in the shaders (the reading well, lib/sprites):
+   every 3D layer quiets itself toward the centre of the frame and stays
+   luminous at the rim, redistributing brightness rather than removing it. This
+   rule keeps one small job — the CSS histology field at z-1 is not
+   shader-controlled, so it still needs a little help through the middle. */
+.reading-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(7 8 10 / 0.3) 18%,
+    rgb(7 8 10 / 0.52) 40%,
+    rgb(7 8 10 / 0.52) 60%,
+    rgb(7 8 10 / 0.3) 82%,
+    transparent 100%
+  );
+  opacity: calc(0.08 + var(--depth, 0) * 0.26);
+  transition: opacity 1.1s ease;
+}
+
+/* Card-less headings get a local lift as well — the channel handles the
+   column, this handles the specific block. Feathered on all sides so it never
+   reads as a rectangle. */
+.station-mark::after {
+  content: "";
+  position: absolute;
+  inset: -1.2rem -2.5rem -1rem -1.5rem;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    68% 120% at 30% 50%,
+    rgb(7 8 10 / calc(0.62 * (0.3 + var(--depth, 0) * 0.7))),
+    transparent 72%
+  );
+}
+
+/* ── station arrival marker ───────────────────────────────────────────
+   A hairline that grows out of the left margin as you arrive, then holds.
+   It is how a station announces itself without a heading shouting. */
+.station-mark {
+  position: relative;
+  /* own stacking context, so the ::after lift below can sit at z-index -1
+     behind this header's text without escaping to paint behind an ancestor */
+  isolation: isolate;
+  padding-left: 1.15rem;
+}
+.station-mark::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.15em;
+  bottom: 0.15em;
+  width: 2px;
+  background: linear-gradient(
+    180deg,
+    var(--region),
+    rgb(var(--region-rgb) / 0.15)
+  );
+  transform: scaleY(0);
+  transform-origin: top;
+  transition: transform 0.7s cubic-bezier(0.2, 0.85, 0.25, 1);
+}
+.station-mark[data-here="1"]::before {
+  transform: scaleY(1);
+}
+
+/* the descent cue on the surface station */
+.descend-cue {
+  animation: descend 2.4s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+@keyframes descend {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  50% {
+    transform: translateY(7px);
+    opacity: 1;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CRAFT — probe cursor, scroll shear, kinetic type.
+   Behaviour lives in components/Craft.tsx; this is only their appearance.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── the probe ────────────────────────────────────────────────────────
+   Hiding the native cursor is a real cost: if the replacement ever fails to
+   render, the interface becomes unusable. So it is hidden ONLY on fine
+   pointers, only when motion is allowed, and only once .probe-layer is
+   actually in the DOM — hence the :has() guard rather than a blanket rule. */
+@media (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  body:has(.probe-layer) {
+    cursor: none;
+  }
+  body:has(.probe-layer) a,
+  body:has(.probe-layer) button,
+  body:has(.probe-layer) [role="button"],
+  body:has(.probe-layer) summary {
+    cursor: none;
+  }
+  /* text entry keeps its caret — a probe over a textarea hides where you type */
+  body:has(.probe-layer) input,
+  body:has(.probe-layer) textarea,
+  body:has(.probe-layer) select {
+    cursor: auto;
+  }
+}
+
+.probe-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+}
+
+.probe-dot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: var(--color-bone);
+  will-change: transform;
+}
+
+.probe-ring {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  border-radius: 9999px;
+  border: 1px solid rgb(var(--region-rgb) / 0.75);
+  box-shadow:
+    0 0 12px rgb(var(--region-rgb) / 0.28),
+    inset 0 0 8px rgb(var(--region-rgb) / 0.16);
+  will-change: transform;
+}
+
+/* the recorded trace — a decaying membrane potential dragged behind */
+.probe-trace {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.probe-trace polyline {
+  fill: none;
+  stroke: rgb(var(--region-rgb) / 0.42);
+  stroke-width: 1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ── scroll shear ─────────────────────────────────────────────────────
+   --scroll-warp is −1‥1 (signed scroll velocity). skewY alone reads as a
+   glitch; pairing a small skew with a matching vertical scale is what makes
+   it read as inertia in a physical sheet. */
+.warp {
+  transform: skewY(calc(var(--scroll-warp, 0) * 0.85deg))
+    scaleY(calc(1 + var(--scroll-warp, 0) * 0.012));
+  transform-origin: center top;
+  will-change: transform;
+}
+
+/* ── kinetic type ─────────────────────────────────────────────────────
+   Characters arrive out of depth and settle. `both` fill + a time-based
+   timeline means it completes even in a background tab, so text can never be
+   trapped invisible — the same failure the .reveal rule exists to avoid. */
+.kinetic {
+  display: inline-block;
+}
+.kinetic-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+.kinetic-space {
+  display: inline-block;
+  width: 0.28em;
+}
+.kinetic-char {
+  display: inline-block;
+  animation: kinetic-in 0.72s cubic-bezier(0.16, 0.9, 0.24, 1) both;
+  animation-delay: var(--kd, 0ms);
+  transform-origin: 50% 100%;
+}
+@keyframes kinetic-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.42em) rotateX(-72deg) scale(0.94);
+    filter: blur(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warp {
+    transform: none;
+  }
+  .kinetic-char {
+    animation: none;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ACCESSIBILITY
+   Motion is the point of this interface, but never at the cost of access.
+   Everything above degrades to a static, fully legible instrument.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  .tissue-flash,
+  .cortex-stage[data-inside="1"]::after,
+  .depth-track[data-inside="1"]::before,
+  .card::after,
+  .axon::after,
+  .cleft::after,
+  .descend-cue,
+  .tissue-field,
+  body::before {
+    animation: none !important;
+  }
+  /* the histology fields stay — they are structure, not motion — but they
+     hold still and sit back so they can never compete with text */
+  .tissue-field[data-on="1"] {
+    opacity: 0.5;
+  }
+  .cortex-content {
+    animation: none;
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+  /* Collapse *travel* — looping, sweeping, parallaxing motion — but keep
+     transitions alive at a short duration rather than zeroing them. Zeroing
+     transitions as well silently removes hover/focus feedback from the entire
+     app for reduced-motion users. Reduce, don't amputate. */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.12s !important;
+    scroll-behavior: auto !important;
+  }
+}

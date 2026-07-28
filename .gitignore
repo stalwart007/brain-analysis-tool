@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.next/
+.venv/
+__pycache__/
+*.pyc
+cogniswarm.db
+dashboard/data/users.json
+.env*
+# …but the template carries no secrets and is what the quickstart tells you to
+# copy, so it has to survive the rule above.
+!*.env.example
+!.env.example
+next-env.d.ts
+*.tsbuildinfo
+
+# editor / local tooling
+.vscode/
+.idea/
+.DS_Store
+
+# personal working notes, not published
+docs/AUDIT-BACKLOG.md

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CogniSwarm — Dev Dashboard</title>
+<style>
+  :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+  body { margin: 2rem auto; max-width: 1080px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #8884; vertical-align: top; }
+  button { cursor: pointer; padding: 4px 10px; border-radius: 6px; border: 1px solid #8886; background: transparent; }
+  button:hover { background: #8882; }
+  textarea { width: 100%; min-height: 90px; font: inherit; padding: 8px; box-sizing: border-box; }
+  select, input[type=number] { font: inherit; padding: 4px; }
+  pre { background: #8881; padding: 10px; border-radius: 8px; overflow-x: auto; font-size: 0.8rem; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; border: 1px solid #8886; font-size: 0.75rem; }
+  .muted { opacity: 0.65; }
+</style>
+</head>
+<body>
+<h1>CogniSwarm <span class="muted">— dev dashboard</span></h1>
+<p class="muted">Interact with the <a href="/demo">demo site</a> to generate telemetry, profile a session, then run a swarm.</p>
+
+<h2>Session segments</h2>
+<div id="sessions">loading…</div>
+
+<h2>Run a swarm</h2>
+<p class="muted">Scenario is domain-agnostic: paste an ad variant, a timestamped video transcript, or a described UI flow.</p>
+<textarea id="scenario" placeholder="e.g. Landing page: hero says 'Ship AI agents in minutes'. Pricing table has 3 tiers ($0 / $49 / Contact us). CTA button reads 'Start building'."></textarea>
+<div style="margin: 8px 0; display: flex; gap: 12px; align-items: center;">
+  <label>Twins/persona <input id="twins" type="number" value="3" min="1" max="50" style="width: 4rem"></label>
+  <label>Cognitive load
+    <select id="load"><option>low</option><option>medium</option><option>high</option></select>
+  </label>
+  <button id="run">Run swarm</button>
+</div>
+<div id="swarm-result"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+
+async function loadSessions() {
+  const rows = await (await fetch("/v1/sessions")).json();
+  if (!rows.length) { $("#sessions").innerHTML = "<p class='muted'>No sessions yet — visit <a href='/demo'>/demo</a>, accept consent, and interact for ~10s.</p>"; return; }
+  $("#sessions").innerHTML = `<table><tr><th>id</th><th>page</th><th>events</th><th>rage</th><th>hesit.</th><th>segment / persona</th><th></th></tr>` +
+    rows.map(r => `<tr>
+      <td><code>${r.id}</code></td>
+      <td>${r.page_path}</td>
+      <td>${r.features.event_count}</td>
+      <td>${r.features.rage_click_bursts}</td>
+      <td>${r.features.micro_hesitation_count}</td>
+      <td>${r.persona ? `<span class="pill">${r.persona.label}</span><br><span class="muted">conf ${r.signal.confidence}</span>` : "<span class='muted'>unprofiled</span>"}</td>
+      <td>${r.persona ? "" : `<button onclick="profileSession('${r.id}')">Profile</button>`}</td>
+    </tr>`).join("") + "</table>";
+}
+
+async function profileSession(id) {
+  const btn = event.target; btn.disabled = true; btn.textContent = "profiling…";
+  const res = await fetch(`/v1/sessions/${id}/profile`, { method: "POST" });
+  if (!res.ok) { btn.textContent = "failed"; console.error(await res.text()); return; }
+  loadSessions();
+}
+
+$("#run").addEventListener("click", async () => {
+  const btn = $("#run"); btn.disabled = true; btn.textContent = "running…";
+  $("#swarm-result").innerHTML = "";
+  try {
+    const res = await fetch("/v1/swarm/run", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scenario: $("#scenario").value,
+        twins_per_persona: parseInt($("#twins").value, 10),
+        cognitive_load: $("#load").value,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    $("#swarm-result").innerHTML = `
+      <p><span class="pill">run ${data.run_id}</span> ${data.twin_count} twins · load: ${data.cognitive_load}</p>
+      <p><b>Mean engagement:</b> ${data.mean_engagement} · <b>Mean intent:</b> ${data.mean_intent}</p>
+      <p><b>Actions:</b> ${Object.entries(data.action_distribution).map(([k,v]) => `${k}: ${v}`).join(" · ")}</p>
+      ${data.top_dropoff_points.length ? `<p><b>Top drop-off points:</b></p><ul>${data.top_dropoff_points.map(d => `<li>${d}</li>`).join("")}</ul>` : ""}
+      <p><b>Top frictions:</b></p><ul>${data.top_frictions.map(f => `<li>${f}</li>`).join("")}</ul>
+      <details><summary>Raw reactions (${data.reactions.length})</summary><pre>${JSON.stringify(data.reactions, null, 2)}</pre></details>`;
+  } catch (err) {
+    $("#swarm-result").innerHTML = `<p style="color:#c33">Error: ${err.message}</p>`;
+  } finally {
+    btn.disabled = false; btn.textContent = "Run swarm";
+  }
+});
+
+loadSessions();
+setInterval(loadSessions, 15000);
+</script>
+</body>
+</html>
