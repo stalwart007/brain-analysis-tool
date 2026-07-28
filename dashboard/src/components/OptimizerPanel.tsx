@@ -165,6 +165,7 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
   const [result, setResult] = useState<OptimizerResult | null>(null);
   const [gen, setGen] = useState(0);
   const [scored, setScored] = useState(0);
+  const [total, setTotal] = useState<number | null>(null);
   const [mutations, setMutations] = useState<string[]>([]);
 
   async function run() {
@@ -191,7 +192,8 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
           // `Number(undefined ?? 0)` every time, so the counter in the running
           // label was pinned at 0 for the whole run. It is 0-based on the wire;
           // display it 1-based.
-          if (evt.type === "generation") setGen(Number(evt.index ?? 0) + 1);
+          if (evt.type === "start") setTotal(Number(evt.total ?? 0) || null);
+          else if (evt.type === "generation") setGen(Number(evt.index ?? 0) + 1);
           else if (evt.type === "variant_scored") setScored((n) => n + 1);
           else if (evt.type === "mutation")
             setMutations((m) => [
@@ -216,7 +218,14 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
     }
   }
 
-  const cost = pop * gens * personaCount * twins;
+  // The evaluation budget is `personas × twins_per_persona` PER GENERATION,
+  // split across the whole population within that generation (optimizer.py
+  // decrements a single `remaining` across variants) — so the population size
+  // is not a multiplier. Including it made the only cost readout in the product
+  // 4× high at the default pop=4 and 8× at pop=8, which pushes users to shrink
+  // the population out of unwarranted fear. The server emits this exact number
+  // as `start.total`; `total` below replaces the estimate once it arrives.
+  const cost = total ?? gens * personaCount * twins;
 
   return (
     <div className="card p-6" data-live={busy ? "1" : "0"}>

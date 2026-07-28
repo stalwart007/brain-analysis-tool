@@ -31,17 +31,25 @@ cd packages/collector && npm install && npm run build
 cd ../../server && python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Credentials (or copy server/.env.example to server/.env)
-export OPENAI_API_KEY=sk-...
+# 3. Credentials — copy the template, then paste your key into .env
+cp .env.example .env
 
 # 4. Run the API (port 8000)
-uvicorn app.main:app --reload
+./run.sh
 
 # 5. Dashboard (separate shell)
 cd ../dashboard && npm install
+cp .env.example .env.local                                    # AUTH_SECRET etc.
 npm run add-user -- you@team.com your-password "Your Name"   # provision access
 npm run dev                                                   # port 3000
 ```
+
+**Python 3.12+ is required** (`random.binomialvariate`). The analysis surface
+**fails closed**: with neither `COGNISWARM_API_KEYS` nor
+`COGNISWARM_ALLOW_ANONYMOUS` set, every `/v1/*` endpoint returns 503 rather
+than silently publishing run history and credit-spending endpoints. The
+`.env.example` templates set the local-development escape hatch explicitly —
+which is why step 3 copies them rather than exporting one variable by hand.
 
 Then:
 
@@ -121,11 +129,15 @@ Backend: **OpenAI** (structured outputs / strict `json_schema`). Set
 | `POST /v1/panel/members` · `GET /v1/panel/members` | Provision panel invites; list members (tokens never listed) |
 | `GET /panel/{token}` · `POST /v1/panel/{token}/{consent,revoke}` | Member disclosure page; consent; revoke + erase |
 
-**Headless access:** set `COGNISWARM_API_KEYS=key1,key2` on the server to
-require `X-API-Key` on the analysis surface (ingest and the member-facing panel
-consent/revoke routes stay public — consent is their gate). Give the dashboard
-its key via `COGNISWARM_API_KEY`; the key is injected server-side by the
-session-gated forwarder, never exposed to the browser.
+**Headless access:** the analysis surface **fails closed**. Set
+`COGNISWARM_API_KEYS=key1,key2` on the server to require `X-API-Key`, or
+`COGNISWARM_ALLOW_ANONYMOUS=1` to opt out explicitly for local development;
+with neither, every `/v1/*` endpoint returns **503**. Configured keys always
+win, so the anonymous escape hatch can never weaken a server that has keys.
+Ingest and the member-facing panel consent/revoke routes stay public — consent
+is their gate. Give the dashboard its key via `COGNISWARM_API_KEY`; the key is
+injected server-side by the session-gated forwarder, never exposed to the
+browser.
 
 ## Scale & durability (Phase 3)
 

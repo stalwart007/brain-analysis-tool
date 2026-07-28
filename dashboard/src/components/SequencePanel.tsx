@@ -114,6 +114,7 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
   const [result, setResult] = useState<SequenceResult | null>(null);
   const [walked, setWalked] = useState(0);
   const [designed, setDesigned] = useState(0);
+  const [totalWalks, setTotalWalks] = useState<number | null>(null);
 
   const messages = text.split("\n").map((s) => s.trim()).filter(Boolean);
 
@@ -142,7 +143,8 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
           // progress means here. `agent_failed` counts too: a twin that failed
           // is a walk that finished, and excluding it would leave the counter
           // permanently short of the total.
-          if (evt.type === "ordering") setDesigned((n) => n + 1);
+          if (evt.type === "start") setTotalWalks(Number(evt.total ?? 0) || null);
+          else if (evt.type === "ordering") setDesigned((n) => n + 1);
           else if (evt.type === "agent" || evt.type === "agent_failed")
             setWalked((n) => n + 1);
           else if (evt.type === "done") setResult(evt.result as unknown as SequenceResult);
@@ -174,10 +176,17 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
       <SimStage
         show={busy || !!result}
         busy={busy}
+        // `walked` counts WALKS (personas × twins) and `designed` counts
+        // ORDERINGS, so pairing them counted to 12 against a denominator of 6
+        // at the defaults. sequence.py's `start` frame already carries both
+        // numbers; use `total` for the walk denominator and report the two
+        // quantities separately rather than pretending they are one ratio.
         runningLabel={
-          designed
-            ? `${walked} of ${designed} orderings walked`
-            : "designing orderings"
+          totalWalks
+            ? `${walked} of ${totalWalks} walks · ${designed} orderings`
+            : designed
+              ? `${walked} walks · ${designed} orderings`
+              : "designing orderings"
         }
         doneLabel="ordering solved"
         height={230}

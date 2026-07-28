@@ -30,6 +30,7 @@ import {
   Station,
 } from "@/lib/cortex";
 import { buildTracts } from "@/lib/tracts";
+import { useCanvasLiveness } from "./vizHooks";
 import {
   makeFadedLineMaterial,
   makeSpriteMaterial,
@@ -539,8 +540,22 @@ export default function CortexNavigator({
   stationKey,
   hovered,
 }: CortexProps) {
+  const holder = useRef<HTMLDivElement>(null);
+  /* This was the one animated surface in the product that ignored
+     prefers-reduced-motion. Everything else honours it — vitals.ts parks the
+     clock, useAgentCanvas draws a single static frame, SwarmNetwork already
+     uses this very hook, globals.css collapses CSS motion — while the largest
+     and most prominent motion in the app, full-viewport and present behind
+     every route, ran at full rate permanently: the brain spin, the
+     vertex-shader breathing, camera drift, ~680 travelling tract packets and
+     the axon sparks. It was the only one a reduced-motion user could not
+     escape. `demand` still renders on prop changes, so the cortex stays fully
+     drawn — it simply stops animating. The hook also covers off-screen and
+     hidden-tab, which this canvas never checked either. */
+  const live = useCanvasLiveness(holder);
   return (
     <div
+      ref={holder}
       aria-hidden
       /* z-0, not negative: a negative z-index would place the canvas behind
          the opaque body background and render it invisible */
@@ -548,6 +563,7 @@ export default function CortexNavigator({
       data-inside={station.inside}
     >
       <Canvas
+        frameloop={live ? "always" : "demand"}
         camera={{ position: [0, 0.3, 3.5], fov: 55, near: 0.01, far: 40 }}
         dpr={[1, 1.75]}
         gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}

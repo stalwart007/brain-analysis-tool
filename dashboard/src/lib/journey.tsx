@@ -45,8 +45,6 @@ export interface Waypoint {
 interface JourneyState {
   /** the waypoint currently driving the camera, or null → use the route default */
   active: Waypoint | null;
-  /** 0‥1 progress through the whole descent, for the depth gauge */
-  progress: number;
 }
 
 interface JourneyApi extends JourneyState {
@@ -60,14 +58,13 @@ export function useJourney(): JourneyApi {
   if (!ctx) {
     // Pages outside a provider (every route except the descent) simply get a
     // null waypoint, and the shell falls back to the route's own station.
-    return { active: null, progress: 0, register: () => () => {} };
+    return { active: null, register: () => () => {} };
   }
   return ctx;
 }
 
 export function JourneyProvider({ children }: { children: ReactNode }) {
   const [active, setActive] = useState<Waypoint | null>(null);
-  const [progress, setProgress] = useState(0);
   const entries = useRef(new Map<HTMLElement, Waypoint>());
   const raf = useRef(0);
 
@@ -98,9 +95,21 @@ export function JourneyProvider({ children }: { children: ReactNode }) {
 
     setActive((prev) => (prev?.id === best?.id ? prev : best));
 
+    /* Scroll progress is published as a CSS variable rather than React state,
+       the same way vitals.ts publishes --eeg.
+
+       It used to be `setProgress(...)` on every rAF tick, and `progress` was
+       part of the memoized context value — so the context identity changed
+       every frame during any scroll, re-rendering Shell and therefore
+       CortexNavigator, TissueField, CortexRail and the entire page subtree,
+       plus every StationHeader through useStationActive. Nothing anywhere in
+       the app ever read `progress`. A whole-tree re-render at 60fps, for a
+       value with no consumers. A CSS variable costs one style write and never
+       touches the React tree, so it stays available to styling if wanted. */
     const doc = document.documentElement;
     const scrollable = doc.scrollHeight - window.innerHeight;
-    setProgress(scrollable > 0 ? Math.min(1, Math.max(0, window.scrollY / scrollable)) : 0);
+    const p = scrollable > 0 ? Math.min(1, Math.max(0, window.scrollY / scrollable)) : 0;
+    doc.style.setProperty("--journey-progress", p.toFixed(4));
   }, []);
 
   const schedule = useCallback(() => {
@@ -143,8 +152,8 @@ export function JourneyProvider({ children }: { children: ReactNode }) {
   }, [schedule, recompute]);
 
   const api = useMemo<JourneyApi>(
-    () => ({ active, progress, register }),
-    [active, progress, register]
+    () => ({ active, register }),
+    [active, register]
   );
 
   return <Ctx.Provider value={api}>{children}</Ctx.Provider>;

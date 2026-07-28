@@ -12,22 +12,42 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  /**
+   * `?from=` is attacker-controllable — middleware puts the requested path
+   * there on every redirect to login, so a crafted link reaches it verbatim.
+   * `//evil.com` and `https://evil.com` are both accepted by router.replace as
+   * off-origin navigations, which turns the sign-in page into an open redirect
+   * (and a convincing one, since the user really did just authenticate).
+   * Only a single-slash-prefixed path is a same-origin destination.
+   */
+  function safeFrom(raw: string | null): string {
+    if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/";
+    return raw;
+  }
+
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    if (res.ok) {
-      router.replace(params.get("from") ?? "/");
-      return;
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      if (res.ok) {
+        router.replace(safeFrom(params.get("from")));
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      setError(body?.detail ?? "Sign-in failed");
+      setBusy(false);
+    } catch {
+      // Without this the button sat on "Signing in…" forever on any network
+      // failure, because setBusy(false) was only on the bad-response path.
+      setError("Couldn't reach the server — check your connection and retry.");
+      setBusy(false);
     }
-    const body = await res.json().catch(() => null);
-    setError(body?.detail ?? "Sign-in failed");
-    setBusy(false);
   }
 
   return (

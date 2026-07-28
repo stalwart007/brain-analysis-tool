@@ -45,6 +45,13 @@ export async function streamRun(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // A stream is only successful if it SAYS so. Without this the loop exits on
+  // a clean close and `streamRun` resolves normally, so a backend that died
+  // mid-run — killed process, proxy read timeout, or an exception raised after
+  // the headers were already sent — left every panel with result === null AND
+  // error === null. `finally { setBusy(false) }` then closed the stage on a
+  // run the user had just watched 40 agents land in, with nothing said.
+  let terminal = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -55,12 +62,28 @@ export async function streamRun(
       buffer = buffer.slice(idx + 2);
       const line = frame.split("\n").find((l) => l.startsWith("data:"));
       if (!line) continue;
+      let evt: StreamEvent;
       try {
-        onEvent(JSON.parse(line.slice(5).trim()) as StreamEvent);
+        evt = JSON.parse(line.slice(5).trim()) as StreamEvent;
       } catch {
-        /* ignore malformed frame */
+        continue; /* genuinely malformed wire frame */
       }
+      // Dispatch OUTSIDE the parse guard. It used to sit inside, so any throw
+      // in a panel's own handler was swallowed as "malformed frame" — e.g.
+      // CognitionPipeline's `ll_trace[0].toFixed(1)` on an empty array, which
+      // left the HMM stage pill stuck on "running" forever with a clean
+      // console and no way to tell the difference from a slow model.
+      if (evt.type === "done" || evt.type === "error") terminal = true;
+      onEvent(evt);
     }
+  }
+  if (!terminal) {
+    onEvent({
+      type: "error",
+      detail:
+        "The stream ended before the run completed — the backend may have " +
+        "restarted or timed out. Any partial results below are incomplete.",
+    });
   }
 }
 

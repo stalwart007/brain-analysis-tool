@@ -1,5 +1,7 @@
 /** Typed client for the FastAPI backend (proxied under /api/cs). */
 
+import { reportBackendResult } from "./health";
+
 export interface FeaturePayload {
   event_count: number;
   micro_hesitation_count: number;
@@ -468,14 +470,26 @@ export interface ViralityRequestBody {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api/cs${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`/api/cs${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...init?.headers },
+    });
+  } catch (e) {
+    // The proxy itself is unreachable (dev server down, network gone). Report
+    // it before rethrowing so the chrome can show a degraded state rather than
+    // letting every caller's .catch() render this as "no data".
+    reportBackendResult(null, e instanceof Error ? e.message : "Network error");
+    throw e;
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new Error(body?.detail ?? `${res.status} ${res.statusText}`);
+    const detail = body?.detail ?? `${res.status} ${res.statusText}`;
+    reportBackendResult(res.status, detail);
+    throw new Error(detail);
   }
+  reportBackendResult(res.status);
   return res.json();
 }
 

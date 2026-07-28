@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import CortexRail from "./CortexRail";
 import CortexNavigator from "./CortexNavigator";
 import TissueField from "./TissueField";
+import BackendPulse, { BackendBanner } from "./BackendPulse";
 import { Probe, ScrollWarp } from "./Craft";
 import { REGION_RGB, RegionId, sectorFor } from "@/lib/cortex";
 import { subscribeVitals, Vitals } from "@/lib/vitals";
@@ -147,10 +148,7 @@ function ShellInner({ children }: { children: ReactNode }) {
 
       {/* vitals, pinned bottom-right so they never collide with the rail */}
       <div className="pointer-events-none fixed bottom-0 right-0 z-20 flex items-center gap-4 border-l border-t border-hairline bg-page/85 px-4 py-1.5 backdrop-blur-md">
-        <span className="flex items-center gap-1.5">
-          <span className="neon-dot pulse-dot inline-block h-1.5 w-1.5 rounded-full bg-bone" />
-          <span className="hud-label text-ink-2">online</span>
-        </span>
+        <BackendPulse />
         <EEGStrip />
         <Clock />
       </div>
@@ -162,6 +160,7 @@ function ShellInner({ children }: { children: ReactNode }) {
           content sheet carries the inertia */}
       <ScrollWarp />
       <Probe />
+      <BackendBanner />
 
       <main key={pathname} className="cortex-content warp relative z-10">
         <span className="tissue-flash" aria-hidden />
