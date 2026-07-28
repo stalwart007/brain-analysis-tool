@@ -296,3 +296,85 @@ def test_an_unscoped_key_still_sees_everything(monkeypatch):
     c = _client_with_keys(monkeypatch, "adminkey")
     sites = {s["site_id"] for s in c.get("/v1/sessions", headers={"X-API-Key": "adminkey"}).json()}
     assert {"acme", "globex"} <= sites
+
+
+# ── per-run cost ceiling ──────────────────────────────────────────────────
+
+
+def test_fan_out_estimate_counts_the_real_multipliers():
+    """The per-field caps (twins <= 20, variants <= 8) look like they bound the
+    cost and do not: the persona count is the multiplier and it comes from the
+    load window, not the request. 200 x 20 x 8 = 32,000 twin calls from one
+    button press was reachable."""
+    from app.main import estimate_twin_calls
+    from app.schemas import CompareRequest, SwarmRunRequest
+
+    swarm = SwarmRunRequest(scenario="x", twins_per_persona=20)
+    assert estimate_twin_calls(200, swarm) == 4_000
+
+    compare = CompareRequest(
+        variants=[{"name": chr(65 + i), "scenario": "v"} for i in range(8)],
+        twins_per_persona=20,
+    )
+    assert estimate_twin_calls(200, compare) == 32_000
+
+
+def test_an_oversized_run_is_refused_not_truncated(monkeypatch):
+    """Refusal, not truncation. Quietly running a smaller swarm would produce a
+    result whose twin_count nobody reads — the same class of error as reporting
+    survivor counts as if they were the requested sample."""
+    from app import storage
+    from app.persona import seed_persona
+
+    persona = seed_persona(_signal()).model_dump()
+    for _ in range(30):
+        sid = storage.insert_session(site_id="acme", page_path="/", features={"event_count": 3})
+        storage.set_persona(sid, persona)
+
+    # Build the client AFTER reloading, rather than using the module-level one.
+    # The tenancy tests above reload app.main to re-read the key table, which
+    # leaves a module-level TestClient bound to a stale app object — so this
+    # passed alone and failed in-suite purely on test order.
+    import importlib
+
+    import app.main as main_module
+
+    monkeypatch.setenv("COGNISWARM_ALLOW_ANONYMOUS", "1")
+    monkeypatch.delenv("COGNISWARM_API_KEYS", raising=False)
+    reloaded = importlib.reload(main_module)
+    monkeypatch.setattr(reloaded, "MAX_TWINS_PER_RUN", 100)
+
+    r = TestClient(reloaded.app).post(
+        "/v1/swarm/run",
+        json={"scenario": "x", "twins_per_persona": 20},
+    )
+    assert r.status_code == 413
+    assert "ceiling" in r.json()["detail"]
+    # the refusal states the actual number, so the caller can act on it
+    assert "twin calls" in r.json()["detail"]
+
+
+def test_one_unreadable_persona_does_not_disable_every_study():
+    """Found by accident: a partial persona row written by another test made
+    `_load_personas` raise ValidationError out of a bare comprehension, which
+    took down every swarm, compare, walk and study endpoint — for every tenant,
+    not just the session with the bad row.
+
+    `persona` is a versionless JSON blob, so this is reachable in production
+    the first time a required field is added to PersonaSeed: every historical
+    row becomes unreadable at once. One bad row must cost one persona.
+    """
+    from app import storage
+    from app.main import Caller, _load_personas
+    from app.persona import seed_persona
+
+    good = seed_persona(_signal()).model_dump()
+    ok_id = storage.insert_session(site_id="resil", page_path="/", features={"event_count": 3})
+    storage.set_persona(ok_id, good)
+
+    bad_id = storage.insert_session(site_id="resil", page_path="/", features={"event_count": 3})
+    storage.set_persona(bad_id, {"persona_id": "truncated", "label": "written by an older schema"})
+
+    personas = _load_personas([], Caller(site_id="resil"))
+    assert len(personas) == 1
+    assert personas[0].persona_id == good["persona_id"]

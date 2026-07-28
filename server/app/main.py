@@ -18,6 +18,7 @@ Dev pages: GET / (legacy mini-dashboard), GET /demo (instrumented demo site)
 
 import asyncio
 import hmac
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import jobs, storage
-from .config import REPO_ROOT
+from .config import MAX_TWINS_PER_RUN, REPO_ROOT
 from .persona import seed_persona
 from .cognition import full_cognitive_profile, iter_cognitive_profile
 from .profiler import profile_features
@@ -78,6 +79,8 @@ from .swarm import (
     stream_walkthrough,
 )
 from .validation import calibration_report
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -400,6 +403,40 @@ async def profile_stream(session_id: str, caller: CallerDep) -> StreamingRespons
 # ------------------------------------------------------------------ swarm
 
 
+def estimate_twin_calls(personas: int, request) -> int:
+    """Twin calls one request will dispatch, before it dispatches any.
+
+    The multiplier is whatever the study fans out over — variants for a
+    compare, prices for a price curve, steps for a walk, generations for the
+    optimizer. Read off the request rather than hardcoded per endpoint so a new
+    study cannot quietly skip the ceiling by not being listed here.
+    """
+    calls = personas * getattr(request, "twins_per_persona", 1)
+    for attr in ("variants", "prices", "steps", "messages"):
+        fan = getattr(request, attr, None)
+        if fan:
+            calls *= len(fan)
+    # The optimizer's budget is per generation (population is NOT a multiplier —
+    # the budget is split across it within a generation).
+    calls *= getattr(request, "generations", 1)
+    return calls
+
+
+def _enforce_budget(personas: list[PersonaSeed], request) -> None:
+    calls = estimate_twin_calls(len(personas), request)
+    if calls > MAX_TWINS_PER_RUN:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"This request would dispatch {calls:,} twin calls, over the "
+                f"{MAX_TWINS_PER_RUN:,} per-run ceiling. Reduce twins_per_persona, "
+                f"narrow the comparison, or select fewer sessions "
+                f"({len(personas)} personas are currently in scope). "
+                "Raise COGNISWARM_MAX_TWINS_PER_RUN to change the ceiling."
+            ),
+        )
+
+
 def _load_personas(session_ids: list[str], caller: Caller) -> list[PersonaSeed]:
     candidates = (
         [storage.get_session(sid, site_id=caller.site_id) for sid in session_ids]
@@ -410,15 +447,32 @@ def _load_personas(session_ids: list[str], caller: Caller) -> list[PersonaSeed]:
         # endpoint in the product.
         else storage.list_profiled_sessions(site_id=caller.site_id)
     )
-    personas = [
-        PersonaSeed(**s["persona"])
-        for s in candidates
-        if s is not None and s.get("persona")
-    ]
+    # Hydrated per row, not as a bare comprehension. `persona` is a versionless
+    # JSON blob, so ONE row written by an older schema — or by any code path
+    # that stored a partial persona — raised ValidationError out of the whole
+    # comprehension and took down every swarm, compare, walk and study endpoint
+    # at once, for every tenant. A single bad row must cost one persona, not
+    # the entire product.
+    personas: list[PersonaSeed] = []
+    skipped = 0
+    for s in candidates:
+        if s is None or not s.get("persona"):
+            continue
+        try:
+            personas.append(PersonaSeed(**s["persona"]))
+        except ValidationError:
+            skipped += 1
+            log.warning("session %s has an unreadable persona blob; skipping", s.get("id"))
+    if skipped:
+        log.warning("%d of %d personas were unreadable", skipped, skipped + len(personas))
     if not personas:
         raise HTTPException(
             status_code=400,
-            detail="No profiled personas available. Profile at least one session first.",
+            detail=(
+                "No profiled personas available. Profile at least one session first."
+                if not skipped
+                else f"No readable personas: {skipped} stored persona(s) failed validation."
+            ),
         )
     return personas
 
@@ -463,6 +517,7 @@ def _llm_errors(exc: Exception) -> HTTPException:
 @app.post("/v1/swarm/run")
 async def swarm_run(caller: CallerDep, request: SwarmRunRequest) -> dict:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     try:
         aggregate = await run_swarm(
             personas=personas,
@@ -515,6 +570,7 @@ def _sse(generator, request_model, kind: str, caller: Caller) -> StreamingRespon
 @app.post("/v1/swarm/stream")
 async def swarm_stream(caller: CallerDep, request: SwarmRunRequest) -> StreamingResponse:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(
         stream_swarm(
             personas, request.scenario, request.twins_per_persona, request.cognitive_load
@@ -531,6 +587,7 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(
         stream_compare(
             personas,
@@ -548,6 +605,7 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
 @app.post("/v1/swarm/walk/stream")
 async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingResponse:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(
         stream_walkthrough(
             personas, request.steps, request.twins_per_persona, request.cognitive_load
@@ -561,6 +619,7 @@ async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingRespo
 @app.post("/v1/studies/price/stream")
 async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> StreamingResponse:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(
         stream_price_sensitivity(
             personas,
@@ -578,6 +637,7 @@ async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> S
 @app.post("/v1/studies/objection/stream")
 async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> StreamingResponse:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(
         stream_objection_scan(
             personas, request.pitch, request.twins_per_persona, request.cognitive_load
@@ -593,6 +653,7 @@ async def virality_stream(caller: CallerDep, request: ViralityRequest) -> Stream
     """Virality forecast: Galton-Watson branching process over twin share
     intents — R0, extinction probability, seeded cascade quantile bands."""
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(stream_virality(personas, request), request, "virality", caller)
 
 
@@ -601,6 +662,7 @@ async def content_stream(caller: CallerDep, request: ContentStudyRequest) -> Str
     """Neuro-impact study: beat-by-beat audience response with ISC,
     change-point, peak-end memory, and functional-system mapping."""
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(stream_content_study(personas, request), request, "content", caller)
 
 
@@ -611,6 +673,7 @@ async def optimize_stream(caller: CallerDep, request: CopyOptimizerRequest) -> S
     and mutation between them, and a win claimed only when the champion's
     credible interval clears the seed's."""
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(stream_copy_optimizer(personas, request), request, "optimize", caller)
 
 
@@ -621,6 +684,7 @@ async def sequence_stream(caller: CallerDep, request: SequenceRequest) -> Stream
     ordering problem heuristically for the ordering that ends with the most
     intent — reporting primacy/recency separately from message strength."""
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     return _sse(stream_sequence(personas, request), request, "sequence", caller)
 
 
@@ -630,6 +694,7 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     try:
         compared = await run_compare(
             personas=personas,
@@ -650,6 +715,7 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
 @app.post("/v1/swarm/walk")
 async def swarm_walk(caller: CallerDep, request: WalkRequest) -> dict:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     try:
         aggregate = await run_walkthrough(
             personas=personas,
@@ -678,6 +744,7 @@ def swarm_runs(caller: CallerDep, kind: Optional[str] = None) -> list[dict]:
 @app.post("/v1/studies/price")
 async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> dict:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     try:
         result = await run_price_sensitivity(
             personas=personas,
@@ -699,6 +766,7 @@ async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> di
 @app.post("/v1/studies/objection")
 async def study_objection(caller: CallerDep, request: ObjectionRequest) -> dict:
     personas = _load_personas(request.session_ids, caller)
+    _enforce_budget(personas, request)
     try:
         result = await run_objection_scan(
             personas=personas,
