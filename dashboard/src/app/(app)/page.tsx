@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * THE FORECAST PAGE — a descent through the cortex.
+ * THE SWARM PAGE — a descent through the cortex.
  *
  * Not a grid of panels but a journey: four stations, each sited in the
  * structure that actually performs that job, with scrolling flying the camera
@@ -15,7 +15,7 @@
  *   SURFACE     whole cortex   the intact organ, before you go in
  *   PARIETAL    telemetry      where streams of sensory events become a
  *                              coherent picture of what someone did
- *   PREFRONTAL  the forecast   simulating other minds is what dorsolateral
+ *   PREFRONTAL  the swarm      simulating other minds is what dorsolateral
  *                              PFC is for
  *   CEREBELLUM  calibration    the structure that learns from repetition by
  *                              minimising prediction error — which is exactly
@@ -111,7 +111,7 @@ export default function DashboardPage() {
           viewport is the brain. */}
       <Station spec={SURFACE} full>
         <div className="tag mb-3 text-muted">{SURFACE.kicker}</div>
-        <h1 className="display reg text-[clamp(3rem,11vw,8rem)] text-bone">Forecast</h1>
+        <h1 className="display reg text-[clamp(3rem,11vw,8rem)] text-bone">Swarm</h1>
         <p className="mt-3 max-w-xl text-sm text-ink-2">
           Telemetry → cognitive models → personas → simulated reactions.
         </p>

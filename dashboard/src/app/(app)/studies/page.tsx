@@ -68,7 +68,7 @@ export default function StudiesPage() {
   const seeded =
     personaCount > 0
       ? `Running against ${personaCount} profiled persona${personaCount === 1 ? "" : "s"}.`
-      : "Profile at least one session on the Forecast station first.";
+      : "Profile at least one session on the Swarm station first.";
 
   return (
     <div className="mx-auto max-w-5xl px-6 pb-24">

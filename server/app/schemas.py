@@ -487,11 +487,81 @@ class PriceSensitivityResult(BaseModel):
 
 
 class ContentStudyRequest(BaseModel):
-    content: str = Field(min_length=20, description="Script, transcript, storyboard, or copy.")
+    """A neuro-impact study over any digital content.
+
+    `asset` is the general path — text, image, video keyframes, audio
+    transcript, a landing page, or a deck. `content`/`content_type` are the
+    original text-only fields, kept so existing callers and stored runs keep
+    working; when `asset` is absent they are treated as a text asset.
+    """
+
+    content: str = Field(
+        default="",
+        max_length=200_000,
+        description="Script, transcript, storyboard, or copy. Ignored when `asset` is set.",
+    )
     content_type: Literal["video_script", "ad_copy", "article", "storyboard"] = "video_script"
+    asset: Optional[ContentAsset] = None
     session_ids: list[str] = Field(default_factory=list)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
+
+
+# ---------------------------------------------------------------- content assets
+
+
+class TranscriptCue(BaseModel):
+    t_ms: int = Field(ge=0, description="Cue start, milliseconds from content start.")
+    text: str = Field(min_length=1, max_length=2_000)
+
+
+class VideoFrame(BaseModel):
+    t_ms: int = Field(ge=0, description="Keyframe timestamp, ms from start.")
+    image_b64: str = Field(
+        max_length=8_000_000,
+        description="Base64 keyframe. Extracted client-side — see modality.py.",
+    )
+    media_type: Optional[str] = Field(default="image/jpeg", max_length=64)
+
+
+class ContentAsset(BaseModel):
+    """One piece of digital content, in whatever shape it actually exists.
+
+    There is deliberately NO url field. Fetching a caller-supplied URL
+    server-side is an SSRF primitive: it would let anyone with an API key reach
+    the cloud metadata service, the private backend, or anything else routable
+    from inside the network. The browser can fetch its own bytes.
+    """
+
+    kind: Literal["text", "image", "video", "audio", "page", "document"] = "text"
+    #: Script, copy, transcript, or raw HTML depending on `kind`.
+    text: Optional[str] = Field(default=None, max_length=200_000)
+    content_type: Optional[str] = Field(default=None, max_length=64)
+    brief: Optional[str] = Field(
+        default=None,
+        max_length=1_000,
+        description="Optional context for the analyst, e.g. what the asset is for.",
+    )
+    image_b64: Optional[str] = Field(default=None, max_length=8_000_000)
+    media_type: Optional[str] = Field(default=None, max_length=64)
+    frames: list[VideoFrame] = Field(default_factory=list, max_length=32)
+    transcript_cues: list[TranscriptCue] = Field(default_factory=list, max_length=2_000)
+    pages: list[str] = Field(default_factory=list, max_length=64)
+
+
+class ImageElement(BaseModel):
+    label: str = Field(description="Short name for the element.")
+    description: str = Field(description="What it shows and why the eye lands there.")
+
+
+class ImageHierarchy(BaseModel):
+    elements: list[ImageElement] = Field(
+        description="3-6 attention regions in predicted scan order."
+    )
+
+
+class VideoFrameRead(BaseModel):
+    description: str = Field(description="What is on screen and its emotional register.")
 
 
 class ContentSegments(BaseModel):

@@ -15,15 +15,46 @@ import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
 import BrainMap, { SystemScores } from "./BrainMap";
+import { AssetInput, assetReady, KINDS, type AssetKind, type ContentAsset } from "./AssetInput";
+
+interface RetentionStep {
+  beat: number;
+  entered: number;
+  dropped: number;
+  /** null once the risk set is empty — UNDEFINED, not zero. */
+  hazard: number | null;
+  survival: number;
+}
 
 interface ContentResult {
   segments: string[];
+  /** temporal | sequential | spatial — decides which statistics below exist. */
+  axis?: string | null;
+  beat_source?: string | null;
+  beat_notes?: string | null;
+  modality?: string;
+  /** statistic -> why it was not computed for this modality. */
+  withheld?: Record<string, string>;
+  retention?: {
+    threshold: number;
+    steps: RetentionStep[];
+    completion_rate: number;
+    worst_beat: number | null;
+  } | null;
   twin_count: number;
   curves: Record<string, number[]>;
   curve_cis: Record<string, ([number, number] | null)[]>;
   isc: { overall: number; grip: string; leave_one_out: (number | null)[]; method: string } | null;
-  change_points: number[];
-  memory: { remembered_affect: number; peak_index: number; recall_probability: number[]; model: string } | null;
+  change_points: number[] | null;
+  memory: {
+    remembered_affect: number;
+    peak_index: number;
+    peak_index_distribution: number[];
+    peak_agreement: number;
+    encoding_strength: number;
+    n_twins: number;
+    model: string;
+  } | null;
   trajectory: { dynamism: number; net_valence_shift: number; quadrant_occupancy: Record<string, number>; model: string } | null;
   systems: SystemScores;
   per_segment_systems: SystemScores[];
@@ -41,7 +72,8 @@ Scene 5 (0:34): Morning. The founder is asleep. Atlas's status: "11 hours of bus
 Scene 6 (0:40): Logo. "Atlas — get your week back." Free 14-day trial.`;
 
 export default function ContentImpactPanel({ personaCount }: { personaCount: number }) {
-  const [content, setContent] = useState("");
+  const [kind, setKind] = useState<AssetKind>("text");
+  const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");
   const [busy, setBusy] = useState(false);
@@ -58,7 +90,11 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
     try {
       await streamRun(
         "/studies/content/stream",
-        { content, content_type: "video_script", twins_per_persona: twins, cognitive_load: load },
+        {
+          asset: { ...asset, kind },
+          twins_per_persona: twins,
+          cognitive_load: load,
+        },
         (evt) => {
           if (evt.type === "stage") setStage(String(evt.detail));
           else if (evt.type === "start") {
@@ -83,25 +119,55 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
         <span className="text-xs text-muted">what the content does to an audience, beat by beat</span>
       </div>
       <p className="lede mb-4">
-        Paste a video script, storyboard, or copy. The swarm experiences it in
-        order; you get attention synchrony, drop-off beats, what memory keeps,
-        the emotional arc, and a functional brain atlas.
+        Any digital content — a script, a static ad, a video, a podcast, a
+        landing page, a deck. The swarm experiences it beat by beat; you get
+        attention synchrony, drop-off, what memory keeps, the emotional arc,
+        and a functional brain atlas. Statistics that the format cannot support
+        are withheld with their reason rather than computed anyway.
       </p>
 
-      <textarea
-        value={content}
-        onChange={(e) => setContent(e.target.value)}
-        rows={6}
-        placeholder={SAMPLE}
-        className="w-full resize-y rounded-xl border border-hairline bg-surface-2 p-3.5 font-mono text-xs leading-relaxed outline-none placeholder:text-muted focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
-      />
+      {/* Modality picker. Each kind reaches the study through a different
+          adapter and lands on a different AXIS, which is what decides whether
+          peak-end, change points and retention are meaningful at all. */}
+      <div
+        role="radiogroup"
+        aria-label="Content type"
+        className="mb-3 flex flex-wrap gap-1.5"
+      >
+        {KINDS.map((k) => (
+          <button
+            key={k.id}
+            role="radio"
+            aria-checked={kind === k.id}
+            title={k.hint}
+            disabled={busy}
+            onClick={() => {
+              setKind(k.id);
+              setAsset({ kind: k.id });
+              setResult(null);
+            }}
+            className={`rounded-lg border px-3 py-1.5 text-xs transition ${
+              kind === k.id
+                ? "border-accent/60 bg-accent/[0.10] text-ink"
+                : "border-hairline text-muted hover:border-accent/40 hover:text-ink-2"
+            }`}
+          >
+            {k.label}
+          </button>
+        ))}
+      </div>
+
+      <AssetInput kind={kind} asset={asset} onChange={setAsset} disabled={busy} />
+
       <div className="mt-3 flex flex-wrap items-center gap-3">
-        <button
-          onClick={() => setContent(SAMPLE)}
-          className="rounded-lg border border-dashed border-hairline px-3 py-1.5 text-xs text-muted transition hover:border-accent/50 hover:text-ink-2"
-        >
-          use sample script
-        </button>
+        {kind === "text" && (
+          <button
+            onClick={() => setAsset({ kind: "text", text: SAMPLE })}
+            className="rounded-lg border border-dashed border-hairline px-3 py-1.5 text-xs text-muted transition hover:border-accent/50 hover:text-ink-2"
+          >
+            use sample script
+          </button>
+        )}
         <label className="flex items-center gap-2 text-xs text-muted">
           Twins / persona
           <input
@@ -113,8 +179,9 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
         <LoadToggle value={load} onChange={setLoad} id="content-load" />
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || content.trim().length < 20 || personaCount === 0}
+          disabled={busy || !!assetReady(kind, asset) || personaCount === 0}
           onClick={run}
+          title={assetReady(kind, asset) ?? undefined}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >
           {busy ? "Screening…" : "Run neuro-impact study"}
@@ -139,6 +206,37 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
           <p className="verdict rounded-xl border border-accent/25 bg-accent/5 px-3 py-2 text-ink-2">
             <span className="hud-label mr-2">VERDICT</span>{result.verdict}
           </p>
+
+          {/* How the beats were derived, and what this format cannot support.
+              An absent statistic and an inapplicable one look identical in a
+              UI, and only one of them is a finding — so the reasons are shown
+              rather than the rows silently missing. */}
+          {(result.axis || result.beat_notes) && (
+            <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted">
+              {result.modality && <>{result.modality} · </>}
+              {result.axis && <>{result.axis} axis · </>}
+              {result.beat_source === "paragraph_fallback" ? (
+                <span className="text-critical">
+                  beats are a mechanical split, not model-identified structure
+                </span>
+              ) : (
+                <>beats via {result.beat_source}</>
+              )}
+              {result.beat_notes && <> · {result.beat_notes}</>}
+            </p>
+          )}
+          {result.withheld && Object.keys(result.withheld).length > 0 && (
+            <div className="mt-2 rounded-xl border border-hairline bg-surface-2/40 px-3 py-2">
+              <span className="hud-label text-muted">NOT COMPUTED FOR THIS FORMAT</span>
+              <ul className="mt-1 space-y-1">
+                {Object.entries(result.withheld).map(([stat, reason]) => (
+                  <li key={stat} className="text-[10px] leading-relaxed text-muted">
+                    <b className="text-ink-2">{stat.replace(/_/g, " ")}</b> — {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           <div className="grid gap-5 lg:grid-cols-2">
             {/* brain atlas with beat scrubber */}
@@ -197,29 +295,82 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
                 </div>
               )}
 
-              {/* memory */}
+              {/* memory — the peak-index DISTRIBUTION, not a softmax.
+                  Peak-end is a within-subject phenomenon, so this is where
+                  each twin individually peaked. One tall bar = the audience
+                  shares a peak; several = the audience is split, which the old
+                  mean-curve version silently averaged away. */}
               {result.memory && (
                 <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
-                  <span className="hud-label">WHAT MEMORY KEEPS</span>
+                  <span className="hud-label">WHERE EACH TWIN PEAKED</span>
                   <div className="mt-2 flex items-end gap-1">
-                    {result.memory.recall_probability.map((p, i) => (
-                      <div key={i} className="flex-1 text-center">
+                    {result.memory.peak_index_distribution.map((count, i) => {
+                      const top = Math.max(...result.memory!.peak_index_distribution, 1);
+                      return (
+                        <div key={i} className="flex-1 text-center">
+                          <div
+                            className="mx-auto w-full rounded-t-sm"
+                            style={{
+                              height: `${4 + (count / top) * 94}px`,
+                              background: i === result.memory!.peak_index ? "#f2ad1f" : "#3f8ff0",
+                              opacity: count ? 0.85 : 0.18,
+                            }}
+                            title={`${count} of ${result.memory!.n_twins} twins peaked on beat ${i + 1}`}
+                          />
+                          <span className="font-mono text-[8px] text-muted">B{i + 1}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-1 text-[9px] text-muted">
+                    peak agreement {(result.memory.peak_agreement * 100).toFixed(0)}%
+                    {result.memory.peak_agreement < 0.5 && (
+                      <span className="text-critical">
+                        {" "}— the audience does not share a peak
+                      </span>
+                    )}
+                    {" "}· remembered affect {result.memory.remembered_affect > 0 ? "+" : ""}
+                    {result.memory.remembered_affect.toFixed(2)} · encoding{" "}
+                    {result.memory.encoding_strength.toFixed(2)}
+                  </p>
+                </div>
+              )}
+
+              {/* retention — the commercially load-bearing number for anything
+                  with a running order: where do people stop. */}
+              {result.retention && result.retention.steps.length > 0 && (
+                <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
+                  <span className="hud-label">RETENTION</span>
+                  <div className="mt-2 flex items-end gap-1">
+                    {result.retention.steps.map((st) => (
+                      <div key={st.beat} className="flex-1 text-center">
                         <div
                           className="mx-auto w-full rounded-t-sm"
                           style={{
-                            height: `${8 + p * 90}px`,
-                            background: i === result.memory!.peak_index ? "#f2ad1f" : i === result.memory!.recall_probability.length - 1 ? "#b07ff0" : "#3f8ff0",
-                            opacity: 0.8,
+                            height: `${4 + st.survival * 94}px`,
+                            // An undefined hazard (empty risk set) is drawn
+                            // hollow, never as a zero-hazard bar — "nobody left
+                            // here" and "nobody was left to leave" are
+                            // different findings.
+                            background: st.hazard === null ? "transparent" : "#4fb477",
+                            border: st.hazard === null ? "1px dashed rgba(255,255,255,0.25)" : "none",
+                            opacity: 0.85,
                           }}
-                          title={`recall p=${p}`}
+                          title={
+                            st.hazard === null
+                              ? `beat ${st.beat + 1}: nobody left at risk — hazard undefined`
+                              : `beat ${st.beat + 1}: ${st.dropped} of ${st.entered} dropped (hazard ${st.hazard})`
+                          }
                         />
-                        <span className="font-mono text-[8px] text-muted">B{i + 1}</span>
+                        <span className="font-mono text-[8px] text-muted">B{st.beat + 1}</span>
                       </div>
                     ))}
                   </div>
                   <p className="mt-1 text-[9px] text-muted">
-                    {result.memory.model} · remembered affect {result.memory.remembered_affect > 0 ? "+" : ""}{result.memory.remembered_affect.toFixed(2)}
-                    {" "}· <span className="text-accent-2">peak</span> / <span style={{ color: "#b07ff0" }}>ending</span> dominate
+                    {(result.retention.completion_rate * 100).toFixed(0)}% reached the end
+                    {result.retention.worst_beat !== null && (
+                      <> · steepest drop at beat {result.retention.worst_beat + 1}</>
+                    )}
                   </p>
                 </div>
               )}
@@ -298,7 +449,7 @@ function AttentionField({
           <polyline fill="none" stroke="#4fb6ff" strokeWidth="2"
             points={mean.map((v, i) => `${x(i)},${y(v)}`).join(" ")} />
         )}
-        {result?.change_points.map((cp) => (
+        {result?.change_points?.map((cp) => (
           <g key={cp}>
             <line x1={x(cp)} y1={padY} x2={x(cp)} y2={H - padY} stroke="#f0605f" strokeWidth="1" strokeDasharray="3 3" />
             <text x={x(cp) + 3} y={padY + 7} fontSize="7" fill="#f0605f" fontFamily="ui-monospace, monospace">regime shift</text>

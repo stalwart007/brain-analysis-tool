@@ -71,8 +71,8 @@ export interface Sector {
 export const SECTORS: Sector[] = [
   {
     href: "/",
-    label: "Forecast",
-    code: "FCST",
+    label: "Swarm",
+    code: "SWRM",
     region: "prefrontal",
     anatomy: "whole cortex",
     rationale: "the intact brain — telemetry in, simulated minds out",
