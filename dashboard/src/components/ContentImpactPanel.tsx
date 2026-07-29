@@ -123,6 +123,18 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
   );
   const beat = beatCursor.index;
   const setBeat = (i: number | null) => (i === null ? beatCursor.clear() : beatCursor.togglePin(i));
+  // Twins are a different axis from beats — a separate domain, so hovering a
+  // twin never lights up "beat 3" somewhere else and imply a link that does
+  // not exist.
+  const looCursor = useChartCursor(
+    "twins",
+    result?.isc?.leave_one_out.length ?? 0,
+    "Per-twin leave-one-out synchrony",
+    (i) => {
+      const r = result?.isc?.leave_one_out[i];
+      return `twin ${i + 1} left out, synchrony ${r == null ? "unresolvable" : r.toFixed(2)}`;
+    }
+  );
 
   async function run() {
     setBusy(true); setError(null); setResult(null);
@@ -362,15 +374,55 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
                       {result.isc.overall.toFixed(2)} · {result.isc.grip}
                     </span>
                   </div>
-                  <div className="mt-2 flex h-6 items-end gap-0.5">
+                  {/* Leave-one-out ISC: each bar is the synchrony of the group
+                      WITHOUT that twin, so a conspicuously tall bar marks the
+                      twin who was dragging agreement down. That is the whole
+                      diagnostic, and it was previously a `title` away. */}
+                  <div
+                    {...looCursor.surfaceProps}
+                    className="mt-2 flex h-6 items-end gap-0.5 focus-visible:ring-1 focus-visible:ring-accent/60"
+                  >
                     {result.isc.leave_one_out.map((r, i) => (
-                      <div key={i} title={`twin ${i + 1}: r=${r ?? "—"}`}
-                        className="flex-1 rounded-t-sm bg-accent"
-                        style={{ height: `${Math.max(6, ((r ?? 0) + 1) * 50)}%`, opacity: 0.35 + ((r ?? 0) + 1) * 0.3 }}
+                      <div key={i}
+                        className="flex-1 rounded-t-sm bg-accent transition-opacity"
+                        style={{
+                          height: `${Math.max(6, ((r ?? 0) + 1) * 50)}%`,
+                          opacity:
+                            looCursor.index === null
+                              ? 0.35 + ((r ?? 0) + 1) * 0.3
+                              : looCursor.isMarked(i)
+                                ? 1
+                                : 0.18,
+                          outline: looCursor.isPinned(i) ? "1px solid rgb(var(--region-rgb))" : undefined,
+                        }}
                       />
                     ))}
                   </div>
-                  <p className="mt-1 text-[9px] text-muted">{result.isc.method} · per-twin leave-one-out synchrony</p>
+                  <p className="mt-1 min-h-3 font-mono text-[9px] text-muted">
+                    {looCursor.index !== null ? (
+                      <span className="text-ink-2">
+                        twin {looCursor.index + 1} left out · r ={" "}
+                        <span className="text-accent">
+                          {result.isc.leave_one_out[looCursor.index] == null
+                            ? "unresolvable"
+                            : result.isc.leave_one_out[looCursor.index]!.toFixed(3)}
+                        </span>
+                        <span className="text-muted">
+                          {" "}
+                          {(result.isc.leave_one_out[looCursor.index] ?? 0) > result.isc.overall
+                            ? "· synchrony rises without them — this twin dissents"
+                            : "· synchrony falls without them — this twin was with the group"}
+                        </span>
+                        {looCursor.pinned !== null && (
+                          <button onClick={looCursor.clear} className="ml-2 text-accent transition hover:text-ink">
+                            pinned ✕
+                          </button>
+                        )}
+                      </span>
+                    ) : (
+                      <>{result.isc.method} · per-twin leave-one-out synchrony</>
+                    )}
+                  </p>
                 </div>
               )}
 
@@ -390,7 +442,7 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
                       // lights it up in all three. These are three reductions
                       // of one tensor; reading across them used to mean
                       // counting bars with a finger.
-                      const on = beatCursor.isActive(i);
+                      const on = beatCursor.isMarked(i);
                       return (
                         <div key={i} className="flex-1 text-center">
                           <div
@@ -441,15 +493,15 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
                             // different findings.
                             background: st.hazard === null ? "transparent" : "#4fb477",
                             border: st.hazard === null ? "1px dashed rgba(255,255,255,0.25)" : "none",
-                            opacity: beatCursor.isActive(st.beat) ? 1 : 0.85,
-                            outline: beatCursor.isActive(st.beat)
+                            opacity: beatCursor.isMarked(st.beat) ? 1 : 0.85,
+                            outline: beatCursor.isMarked(st.beat)
                               ? "1px solid rgba(255,255,255,0.55)"
                               : "none",
                           }}
                         />
                         <span
                           className={`font-mono text-[8px] ${
-                            beatCursor.isActive(st.beat) ? "text-ink" : "text-muted"
+                            beatCursor.isMarked(st.beat) ? "text-ink" : "text-muted"
                           }`}
                         >
                           B{st.beat + 1}
@@ -580,7 +632,7 @@ function AttentionField({
         ))}
         {segments.map((_, i) => (
           <text key={i} x={x(i)} y={H - 3} fontSize="7"
-            fill={cursor.isActive(i) ? "#dfd9d9" : "#5f6b7d"}
+            fill={cursor.isMarked(i) ? "#dfd9d9" : "#5f6b7d"}
             textAnchor="middle" fontFamily="ui-monospace, monospace">B{i + 1}</text>
         ))}
         {/* the cursor's own marker on the mean series — the crosshair band

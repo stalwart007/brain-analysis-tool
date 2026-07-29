@@ -14,6 +14,8 @@ import { CognitiveLoad, GenerationBand, ViralityResult } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
 import { useAgentCanvas } from "./sim/useAgentCanvas";
+import { ChartCursorProvider, useChartCursor, type ChartCursor } from "./charts/cursor";
+import ChartFrame from "./charts/ChartFrame";
 
 /* Types come from lib/api — this panel used to declare its own copies, and
    they had drifted: the local ViralityResult omitted six fields and typed
@@ -23,7 +25,18 @@ type Gen = GenerationBand;
 
 const SAMPLE = `POV: you open your laptop Monday morning and an AI already triaged your inbox, drafted the 3 replies that matter, and cancelled the meeting nobody wanted. Atlas. Get your week back. (30-sec demo in comments)`;
 
+/* The provider wraps the panel rather than living inside it: a component
+   cannot consume a context it renders itself, so the cascade tree and the
+   quantile fan would each get a private cursor and stop linking. */
 export default function ViralityPanel({ personaCount }: { personaCount: number }) {
+  return (
+    <ChartCursorProvider>
+      <ViralityInner personaCount={personaCount} />
+    </ChartCursorProvider>
+  );
+}
+
+function ViralityInner({ personaCount }: { personaCount: number }) {
   const [content, setContent] = useState("");
   const [fanout, setFanout] = useState(6);
   const [twins, setTwins] = useState(3);
@@ -34,8 +47,26 @@ export default function ViralityPanel({ personaCount }: { personaCount: number }
   const [gens, setGens] = useState<Gen[]>([]);
   const [result, setResult] = useState<ViralityResult | null>(null);
 
+  // Generations are their OWN domain — deliberately not "beats". Linking a
+  // cascade generation to a narrative beat would be a false equivalence
+  // between two unrelated axes that happen to both be small integers.
+  const cursor = useChartCursor(
+    "generations",
+    gens.length,
+    "Cascade size by generation",
+    (i) => {
+      const g = gens[i];
+      if (!g) return `generation ${i + 1}`;
+      return `generation ${g.g}: median ${Math.round(g.cum_q50)} cumulative, ${Math.round(g.active_q50)} still active`;
+    },
+    // The SVG carries a 30/340 label gutter on the left and 8/340 of padding
+    // on the right, and it is a line chart, so vertices — not slices.
+    { inset: [30 / 340, 8 / 340], mapping: "point" }
+  );
+
   async function run() {
     setBusy(true); setError(null); setResult(null); setShares([]); setGens([]);
+    cursor.clear();
     try {
       await streamRun(
         "/studies/virality/stream",
@@ -113,11 +144,10 @@ export default function ViralityPanel({ personaCount }: { personaCount: number }
               <span className="hud-label">CASCADE TREE (median run)</span>
               <span className="font-mono text-[9px] text-muted">gen-by-gen from 2,000 simulations</span>
             </div>
-            <div className="h-56"><CascadeCanvas gens={gens} supercritical={result?.supercritical ?? true} /></div>
+            <div className="h-56"><CascadeCanvas gens={gens} supercritical={result?.supercritical ?? true} activeGen={cursor.index === null ? null : gens[cursor.index]?.g ?? null} /></div>
           </div>
           <div className="rounded-xl border border-hairline bg-black/40 p-3">
-            <span className="hud-label">CASCADE SIZE — QUANTILE FAN</span>
-            <BandChart gens={gens} />
+            <BandChart gens={gens} cursor={cursor} />
             {result?.final_size_bins && <SizeHistogram bins={result.final_size_bins} />}
           </div>
         </div>
@@ -235,7 +265,14 @@ function Stat({ label, value, sub, tone }: { label: string; value: string; sub?:
 }
 
 /* radial cascade tree animated from real generation quantiles */
-function CascadeCanvas({ gens, supercritical }: { gens: Gen[]; supercritical: boolean }) {
+function CascadeCanvas({ gens, supercritical, activeGen }: {
+  gens: Gen[];
+  supercritical: boolean;
+  /** the generation the shared cursor is on, so hovering the quantile fan
+   *  picks out the same ring in the tree — this is the whole point of a
+   *  linked cursor: two views of one cascade, read together */
+  activeGen: number | null;
+}) {
   const nodes = useRef<{ x: number; y: number; tx: number; ty: number; g: number; born: number }[]>([]);
   const links = useRef<[number, number][]>([]);
   const consumed = useRef(0);
@@ -259,25 +296,41 @@ function CascadeCanvas({ gens, supercritical }: { gens: Gen[]; supercritical: bo
         if (parents.length) links.current.push([parents[j % parents.length].i, idx]);
       }
     }
-    ctx.strokeStyle = "rgba(120,195,255,0.18)";
+    ctx.strokeStyle = activeGen === null ? "rgba(120,195,255,0.18)" : "rgba(120,195,255,0.08)";
     for (const [a, b] of links.current) {
       const na = nodes.current[a], nb = nodes.current[b];
       ctx.beginPath(); ctx.moveTo(na.x, na.y); ctx.lineTo(nb.x, nb.y); ctx.stroke();
+    }
+    // the cursor's generation as a ring, drawn under the nodes
+    if (activeGen !== null && activeGen > 0) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, (activeGen / G) * maxR, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgb(var(--region-rgb) / 0.55)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
     }
     for (const n of nodes.current) {
       n.x += (n.tx - n.x) * Math.min(1, dt * 5);
       n.y += (n.ty - n.y) * Math.min(1, dt * 5);
       const age = Math.min(1, (t - n.born) * 2);
+      // Dim everything that is not the cursor's generation. Without this the
+      // tree is a pretty texture; with it, it answers "which ring is that?"
+      const dim = activeGen !== null && n.g !== activeGen ? 0.22 : 1;
+      ctx.globalAlpha = dim;
       ctx.fillStyle = n.g === 0 ? "#f2ad1f" : supercritical ? `rgba(22,208,22,${0.35 + age * 0.5})` : `rgba(120,195,255,${0.3 + age * 0.5})`;
       ctx.beginPath(); ctx.arc(n.x, n.y, n.g === 0 ? 4 : 2.2, 0, Math.PI * 2); ctx.fill();
     }
+    ctx.globalAlpha = 1;
     if (nodes.current.length > 900) { nodes.current.splice(1, 200); links.current = []; }
-  });
+    // Repaint on a new generation as well as a cursor move: under reduced
+    // motion the loop stops after one frame, which lands before any generation
+    // has streamed in, so without this the tree stays empty for good.
+  }, `${gens.length}:${activeGen}`);
   return <canvas ref={ref} className="h-full w-full" />;
 }
 
 /* log-scale quantile fan of cumulative cascade size */
-function BandChart({ gens }: { gens: Gen[] }) {
+function BandChart({ gens, cursor }: { gens: Gen[]; cursor: ChartCursor }) {
   if (gens.length < 2) return null;
   const W = 340, H = 120, pad = 30;
   const maxC = Math.max(...gens.map((g) => g.cum_q90), 2);
@@ -285,36 +338,119 @@ function BandChart({ gens }: { gens: Gen[] }) {
   const x = (i: number) => pad + (i / (gens.length - 1)) * (W - pad - 8);
   const y = (v: number) => H - 18 - (lg(v) / lg(maxC)) * (H - 30);
   const line = (key: "cum_q10" | "cum_q50" | "cum_q90") => gens.map((g, i) => `${x(i)},${y(g[key])}`).join(" ");
+  const i = cursor.index;
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="mt-1 w-full">
-      {[1, 10, 100, 1000, 10000].filter((v) => v <= maxC * 1.5).map((v) => (
-        <g key={v}>
-          <line x1={pad} y1={y(v)} x2={W - 8} y2={y(v)} stroke="rgba(120,165,230,0.08)" />
-          <text x={pad - 3} y={y(v) + 2.5} fontSize="6.5" fill="#5f6b7d" textAnchor="end" fontFamily="ui-monospace, monospace">{v}</text>
-        </g>
-      ))}
-      <path d={`M ${line("cum_q90").split(" ").join(" L ")} L ${[...gens].reverse().map((g, ri) => `${x(gens.length - 1 - ri)},${y(g.cum_q10)}`).join(" L ")} Z`}
-        fill="rgba(79,182,255,0.12)" />
-      <polyline points={line("cum_q50")} fill="none" stroke="#4fb6ff" strokeWidth="1.6" />
-      <text x={W - 8} y={H - 6} fontSize="6.5" fill="#5f6b7d" textAnchor="end" fontFamily="ui-monospace, monospace">generation → · size (log)</text>
-    </svg>
+    <ChartFrame
+      cursor={cursor}
+      title="CASCADE SIZE — QUANTILE FAN"
+      height="auto"
+      categories={gens.map((g) => `Gen ${g.g}`)}
+      series={[
+        {
+          key: "cum",
+          label: "cumulative",
+          color: "#4fb6ff",
+          values: gens.map((g) => g.cum_q50),
+          // The fan IS the interval — showing the median without q10–q90 is
+          // the specific misreading this chart exists to prevent.
+          intervals: gens.map((g) => [g.cum_q10, g.cum_q90] as [number, number]),
+          format: (v) => Math.round(v).toLocaleString(),
+        },
+        {
+          key: "active",
+          label: "still active",
+          color: "#16d016",
+          values: gens.map((g) => g.active_q50),
+          format: (v) => Math.round(v).toLocaleString(),
+        },
+        {
+          key: "alive",
+          label: "runs alive",
+          color: "#f2ad1f",
+          values: gens.map((g) => g.alive_frac),
+          format: (v) => `${(v * 100).toFixed(0)}%`,
+        },
+      ]}
+      footnote="Median cumulative reach with the 10th–90th percentile fan, over 2,000 simulated cascades."
+    >
+      <svg viewBox={`0 0 ${W} ${H}`} className="mt-1 w-full">
+        {[1, 10, 100, 1000, 10000].filter((v) => v <= maxC * 1.5).map((v) => (
+          <g key={v}>
+            <line x1={pad} y1={y(v)} x2={W - 8} y2={y(v)} stroke="rgba(120,165,230,0.08)" />
+            <text x={pad - 3} y={y(v) + 2.5} fontSize="6.5" fill="#5f6b7d" textAnchor="end" fontFamily="ui-monospace, monospace">{v}</text>
+          </g>
+        ))}
+        <path d={`M ${line("cum_q90").split(" ").join(" L ")} L ${[...gens].reverse().map((g, ri) => `${x(gens.length - 1 - ri)},${y(g.cum_q10)}`).join(" L ")} Z`}
+          fill="rgba(79,182,255,0.12)" />
+        <polyline points={line("cum_q50")} fill="none" stroke="#4fb6ff" strokeWidth="1.6" />
+        {/* the cursor's generation, marked on all three quantiles at once, so
+            hovering reads the spread and not just the median */}
+        {i !== null && gens[i] && (
+          <g>
+            <line x1={x(i)} y1={y(gens[i].cum_q10)} x2={x(i)} y2={y(gens[i].cum_q90)}
+              stroke={cursor.isPinned(i) ? "rgb(var(--region-rgb))" : "rgba(255,255,255,0.5)"} strokeWidth="0.8" />
+            {(["cum_q10", "cum_q90"] as const).map((k) => (
+              <circle key={k} cx={x(i)} cy={y(gens[i][k])} r="1.4" fill="rgba(255,255,255,0.55)" />
+            ))}
+            <circle cx={x(i)} cy={y(gens[i].cum_q50)} r="2.6"
+              fill={cursor.isPinned(i) ? "rgb(var(--region-rgb))" : "#4fb6ff"}
+              stroke="rgba(0,0,0,0.6)" strokeWidth="0.8" />
+          </g>
+        )}
+        <text x={W - 8} y={H - 6} fontSize="6.5" fill="#5f6b7d" textAnchor="end" fontFamily="ui-monospace, monospace">generation → · size (log)</text>
+      </svg>
+    </ChartFrame>
   );
 }
 
 /* log-binned final-size histogram — the heavy-tail fingerprint */
 function SizeHistogram({ bins }: { bins: [number, number, number][] }) {
+  // Its own domain. Final-size bins are not generations — bin 3 and generation
+  // 3 have nothing to do with each other, and linking them would invent a
+  // relationship the model never claims.
+  const cursor = useChartCursor(
+    "cascade-size",
+    bins.length,
+    "Final cascade size distribution",
+    (i) => {
+      const b = bins[i];
+      return b ? `sizes ${b[0]} to ${b[1]}: ${b[2]} of 2,000 cascades` : `bin ${i + 1}`;
+    }
+  );
   if (!bins.length) return null;
   const maxC = Math.max(...bins.map((b) => b[2]));
+  const total = bins.reduce((sum, b) => sum + b[2], 0) || 1;
   return (
     <div className="mt-2">
-      <div className="flex h-12 items-end gap-0.5">
-        {bins.map(([lo, , c], i) => (
-          <div key={i} className="flex-1 rounded-t-sm bg-accent"
-            style={{ height: `${8 + (Math.log10(1 + c) / Math.log10(1 + maxC)) * 88}%`, opacity: 0.75 }}
-            title={`size ${lo}–${lo * 2}: ${c} of 2,000 cascades`} />
-        ))}
-      </div>
-      <div className="mt-0.5 font-mono text-[8px] text-muted">final cascade size (log₂ bins) · height log-scaled</div>
+      <ChartFrame
+        cursor={cursor}
+        title="FINAL SIZE — LOG₂ BINS"
+        height={48}
+        categories={bins.map(([lo, hi]) => `${lo}–${hi}`)}
+        series={[
+          {
+            key: "count",
+            label: "cascades",
+            color: "rgb(var(--region-rgb))",
+            values: bins.map((b) => b[2]),
+            format: (v) => `${v.toLocaleString()} (${((v / total) * 100).toFixed(1)}%)`,
+          },
+        ]}
+        footnote="Height is log-scaled; a fat right tail is the signature of a supercritical process."
+      >
+        <div className="flex h-full items-end gap-0.5">
+          {bins.map(([, , c], i) => (
+            <div key={i} className="flex-1 rounded-t-sm transition-[opacity,background-color] duration-150"
+              style={{
+                height: `${8 + (Math.log10(1 + c) / Math.log10(1 + maxC)) * 88}%`,
+                background: cursor.isPinned(i) ? "rgb(var(--region-rgb))" : "var(--accent, #4fb6ff)",
+                // Dimming the rest is what makes one bar readable; the audit
+                // found every chart here rendered all bars identically lit.
+                opacity: cursor.index === null ? 0.75 : cursor.isMarked(i) ? 1 : 0.28,
+              }} />
+          ))}
+        </div>
+      </ChartFrame>
     </div>
   );
 }

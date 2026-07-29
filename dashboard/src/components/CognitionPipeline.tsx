@@ -18,6 +18,7 @@ import {
   PersonaSeed,
 } from "@/lib/api";
 import { streamRun, StreamEvent } from "@/lib/stream";
+import { keyboardOnlyProps, useChartCursor, useMatrixCursor } from "./charts/cursor";
 import { useAgentCanvas } from "./sim/useAgentCanvas";
 
 const STAGES = [
@@ -244,6 +245,16 @@ function HMMPanel({ hmm }: { hmm: HMMResult }) {
     else runs.push({ state: s, len: 1 });
   }
   const total = hmm.state_path.length;
+  const runCursor = useChartCursor(
+    "hmm-runs",
+    runs.length,
+    "Decoded cognitive-state timeline",
+    (i) =>
+      runs[i]
+        ? `${hmm.states[runs[i].state]?.label ?? `state ${runs[i].state}`}, ${runs[i].len} events, ${((runs[i].len / total) * 100).toFixed(0)} percent of the session`
+        : `segment ${i + 1}`
+  );
+  const activeRun = runCursor.index;
   return (
     <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
       <div className="mb-1 flex items-baseline justify-between">
@@ -252,30 +263,84 @@ function HMMPanel({ hmm }: { hmm: HMMResult }) {
           Baum-Welch EM · Viterbi · BIC picks K={hmm.n_states}
         </span>
       </div>
-      {/* the session, decoded */}
-      <div className="flex h-7 w-full overflow-hidden rounded-md">
+      {/* The session, decoded. Runs are variable width — a run is however long
+          the user stayed in that state — so hit areas are per segment rather
+          than equal slices of the bar. */}
+      <div
+        {...keyboardOnlyProps(runCursor)}
+        onPointerLeave={() => runCursor.setHovered(null)}
+        className="flex h-7 w-full overflow-hidden rounded-md focus-visible:ring-1 focus-visible:ring-accent/60"
+      >
         {runs.map((r, i) => (
           <div
             key={i}
-            title={hmm.states[r.state]?.label}
+            onPointerEnter={() => runCursor.setHovered(i)}
+            onPointerDown={() => runCursor.togglePin(i)}
+            className="cursor-pointer transition-opacity"
             style={{
               width: `${(r.len / total) * 100}%`,
               background: STATE_COLORS[r.state % STATE_COLORS.length],
-              opacity: 0.75,
+              // Every OTHER run in the same state lights up too. "When else was
+              // this person disengaged?" is the question a decoded timeline is
+              // for, and counting stripes by eye is how it was answered before.
+              opacity:
+                activeRun === null
+                  ? 0.75
+                  : runs[activeRun]?.state === r.state
+                    ? 1
+                    : 0.2,
+              outline: runCursor.isPinned(i) ? "1px solid #dfd9d9" : undefined,
+              outlineOffset: "-1px",
             }}
           />
         ))}
       </div>
-      <div className="mt-1.5 flex flex-wrap gap-3">
-        {hmm.states.map((s, i) => (
-          <span key={i} className="flex items-center gap-1 font-mono text-[10px] text-ink-2">
-            <span
-              className="inline-block h-2 w-2 rounded-sm"
-              style={{ background: STATE_COLORS[i % STATE_COLORS.length] }}
-            />
-            {s.label}
+      <div className="mt-1 min-h-4 font-mono text-[9px]">
+        {activeRun !== null && runs[activeRun] ? (
+          <span className="text-ink-2">
+            <span className="text-ink">{hmm.states[runs[activeRun].state]?.label}</span>
+            {" · "}
+            {runs[activeRun].len} event{runs[activeRun].len === 1 ? "" : "s"}
+            {" · "}
+            {((runs[activeRun].len / total) * 100).toFixed(1)}% of the session
+            {" · "}
+            {runs.filter((x) => x.state === runs[activeRun].state).length} episode
+            {runs.filter((x) => x.state === runs[activeRun].state).length === 1 ? "" : "s"} in this state
+            {runCursor.pinned !== null && (
+              <button onClick={runCursor.clear} className="ml-2 text-accent transition hover:text-ink">
+                pinned ✕
+              </button>
+            )}
           </span>
-        ))}
+        ) : (
+          <span className="text-muted">Hover a segment to see the state and how often it recurs.</span>
+        )}
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-3">
+        {hmm.states.map((s, i) => {
+          const lit = activeRun !== null && runs[activeRun]?.state === i;
+          return (
+            <button
+              key={i}
+              onPointerEnter={() => {
+                const first = runs.findIndex((r) => r.state === i);
+                if (first >= 0) runCursor.setHovered(first);
+              }}
+              className={`flex items-center gap-1 font-mono text-[10px] transition-colors ${
+                lit ? "text-ink" : "text-ink-2"
+              }`}
+            >
+              <span
+                className="inline-block h-2 w-2 rounded-sm"
+                style={{
+                  background: STATE_COLORS[i % STATE_COLORS.length],
+                  opacity: activeRun === null || lit ? 1 : 0.35,
+                }}
+              />
+              {s.label}
+            </button>
+          );
+        })}
       </div>
       <div className="mt-3 grid grid-cols-2 gap-3">
         <div>
@@ -326,6 +391,15 @@ const SYMBOLS = ["scroll", "dwell", "click", "hesit", "rage", "back", "zone"];
 
 function InfoPanel({ info }: { info: InfoDynamics }) {
   const P = info.transition;
+  const n = P?.length ?? 0;
+  const cursor = useMatrixCursor(
+    "behaviour-transition",
+    n,
+    n,
+    "Behavioural transition matrix",
+    (r, c) =>
+      `probability of ${SYMBOLS[c]} after ${SYMBOLS[r]}: ${(P?.[r]?.[c] ?? 0).toFixed(3)}`
+  );
   return (
     <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
       <div className="mb-1 flex items-baseline justify-between">
@@ -334,31 +408,70 @@ function InfoPanel({ info }: { info: InfoDynamics }) {
       </div>
       {P && (
         <div
-          className="grid gap-px"
+          {...keyboardOnlyProps(cursor)}
+          onPointerLeave={cursor.clearHover}
+          className="grid gap-px focus-visible:ring-1 focus-visible:ring-accent/60"
           style={{ gridTemplateColumns: `auto repeat(${P.length}, minmax(0,1fr))` }}
         >
           <span />
-          {SYMBOLS.slice(0, P.length).map((s) => (
-            <span key={s} className="text-center font-mono text-[8px] text-muted">{s}</span>
+          {SYMBOLS.slice(0, P.length).map((s, j) => (
+            <span key={s} className={`text-center font-mono text-[8px] transition-colors ${
+              cursor.cell?.col === j ? "text-ink" : "text-muted"
+            }`}>{s}</span>
           ))}
           {P.map((row, i) => {
             const rowMax = Math.max(...row, 1e-9);
             return [
-              <span key={`l${i}`} className="pr-1 text-right font-mono text-[8px] leading-4 text-muted">
+              <span key={`l${i}`} className={`pr-1 text-right font-mono text-[8px] leading-4 transition-colors ${
+                cursor.cell?.row === i ? "text-ink" : "text-muted"
+              }`}>
                 {SYMBOLS[i]}
               </span>,
+              // Per-cell pointer handlers rather than surface hit-testing: the
+              // label column is `auto`-width, so there is no fixed fraction to
+              // subtract and any geometric guess drifts with the label text.
               ...row.map((p, j) => (
                 <div
                   key={`${i}-${j}`}
-                  title={`P(${SYMBOLS[i]}→${SYMBOLS[j]}) = ${p.toFixed(3)}`}
-                  className="h-4 rounded-[2px]"
-                  style={{ background: `rgba(79,182,255,${0.06 + (p / rowMax) * 0.75})` }}
+                  onPointerEnter={() => cursor.setHovered(i, j)}
+                  onPointerDown={() => cursor.togglePin(i, j)}
+                  className="h-4 cursor-pointer rounded-[2px] transition-opacity"
+                  style={{
+                    background: `rgba(79,182,255,${0.06 + (p / rowMax) * 0.75})`,
+                    // Dimming everything off the cross is what turns a field of
+                    // similar blues into one readable comparison.
+                    opacity: !cursor.cell ? 1 : cursor.inCross(i, j) ? 1 : 0.25,
+                    outline: cursor.isPinned(i, j)
+                      ? "1px solid rgb(var(--region-rgb))"
+                      : cursor.isActive(i, j)
+                        ? "1px solid rgba(255,255,255,0.7)"
+                        : undefined,
+                  }}
                 />
               )),
             ];
           })}
         </div>
       )}
+      {/* The readout, so a transition probability is a sentence rather than a
+          shade of blue to be decoded against its row maximum. */}
+      <div className="mt-1 min-h-4 font-mono text-[9px]">
+        {P && cursor.cell ? (
+          <span className="text-ink-2">
+            P({SYMBOLS[cursor.cell.row]} → {SYMBOLS[cursor.cell.col]}) ={" "}
+            <span className="text-accent">
+              {(P[cursor.cell.row]?.[cursor.cell.col] ?? 0).toFixed(3)}
+            </span>
+            {cursor.pinnedCell && (
+              <button onClick={cursor.clear} className="ml-2 text-accent transition hover:text-ink">
+                pinned ✕
+              </button>
+            )}
+          </span>
+        ) : (
+          <span className="text-muted">Hover a cell — the row is the state you are in.</span>
+        )}
+      </div>
       <div className="mt-2 flex flex-wrap gap-4 font-mono text-[10px] tabular-nums text-ink-2">
         {info.entropy_rate_bits != null && (
           <span>entropy rate <b className="text-accent">{info.entropy_rate_bits}</b> bits</span>

@@ -1,6 +1,9 @@
 node_modules/
 dist/
 .next/
+# verification builds go to a separate dir so they cannot corrupt a running
+# dev server's .next tree (see dashboard/next.config.mjs)
+.next-verify/
 .venv/
 __pycache__/
 *.pyc

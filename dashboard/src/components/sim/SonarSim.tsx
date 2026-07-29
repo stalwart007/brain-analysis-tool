@@ -195,7 +195,7 @@ export default function SonarSim({
     ctx.beginPath();
     ctx.arc(cx, cy, 3, 0, Math.PI * 2);
     ctx.fill();
-  });
+  }, `${pings?.length ?? 0}:${blips?.length ?? 0}:${active}`);
 
   return <canvas ref={ref} className="h-full w-full" />;
 }

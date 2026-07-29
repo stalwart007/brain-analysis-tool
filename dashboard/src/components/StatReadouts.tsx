@@ -199,8 +199,11 @@ export function BayesianPanel({ bayes }: { bayes: BayesianResult }) {
               <span className="text-ink-2">{a.name}</span>
               <span className="font-mono tabular-nums text-muted">
                 {a.successes}/{a.trials} conv · P(best){" "}
-                <span className="text-accent">{(a.p_best * 100).toFixed(0)}%</span> · E[loss]{" "}
-                {a.expected_loss.toFixed(3)}
+                <span className="text-accent">{(a.p_best * 100).toFixed(0)}%</span>{" "}
+                <span className="text-[10px] text-muted">
+                  [{(a.ci_low * 100).toFixed(0)}–{(a.ci_high * 100).toFixed(0)}%]
+                </span>{" "}
+                · E[loss] {a.expected_loss.toFixed(3)}
               </span>
             </div>
             {/* P(best) bar with the 95% credible interval drawn beneath */}
@@ -217,7 +220,7 @@ export function BayesianPanel({ bayes }: { bayes: BayesianResult }) {
                   left: `${a.ci_low * 100}%`,
                   width: `${Math.max(1, (a.ci_high - a.ci_low) * 100)}%`,
                 }}
-                title={`95% credible interval ${a.ci_low.toFixed(2)}–${a.ci_high.toFixed(2)}`}
+                aria-label={`95% credible interval ${a.ci_low.toFixed(2)} to ${a.ci_high.toFixed(2)}`}
               />
             </div>
           </div>
@@ -262,14 +265,36 @@ export function SurvivalPanel({
               </span>
               <span className="font-mono tabular-nums text-muted">
                 hazard {(s.hazard * 100).toFixed(0)}% · S {(s.survival * 100).toFixed(0)}%
+                <span className="ml-1 text-[10px] text-muted">
+                  {s.survival_ci_high - s.survival_ci_low <= 0
+                    ? "· no spread"
+                    : `· [${(s.survival_ci_low * 100).toFixed(0)}–${(s.survival_ci_high * 100).toFixed(0)}%]`}
+                </span>
               </span>
             </div>
             <div className="flex gap-1">
-              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/[0.06]">
+              {/* The band is DRAWN now. This bar carried a `title` promising a
+                  survival band and rendered only the point estimate, so the
+                  interval existed in the payload, was named in a tooltip
+                  nobody waits for, and was invisible in the one place it
+                  mattered. A survival curve without its band is the single
+                  most over-read chart in analytics. */}
+              <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-white/[0.06]">
                 <div
-                  className="h-full rounded-full bg-accent/70"
+                  className="absolute inset-y-0 rounded-full bg-accent/25"
+                  style={{
+                    left: `${s.survival_ci_low * 100}%`,
+                    width: `${Math.max(0, s.survival_ci_high - s.survival_ci_low) * 100}%`,
+                  }}
+                />
+                <div
+                  className="absolute inset-y-0 left-0 rounded-full bg-accent/70"
                   style={{ width: `${s.survival * 100}%` }}
-                  title={`survival band ${s.survival_ci_low.toFixed(2)}–${s.survival_ci_high.toFixed(2)}`}
+                />
+                {/* the point estimate, so it stays readable inside the band */}
+                <div
+                  className="absolute inset-y-0 w-px bg-ink"
+                  style={{ left: `${s.survival * 100}%` }}
                 />
               </div>
               <div className="h-1.5 w-24 overflow-hidden rounded-full bg-white/[0.06]">

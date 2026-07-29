@@ -147,7 +147,7 @@ export default function TensorSim({
         ctx.fillText(s.label, x, y + 14);
       });
     }
-  });
+  }, `${rows.length}:${beats}:${stages.filter((s) => s.done).length}:${stages.filter((s) => s.active).length}`);
 
   return <canvas ref={ref} className="h-full w-full" />;
 }

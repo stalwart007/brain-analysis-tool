@@ -134,7 +134,7 @@ export default function ArenaSim({
       }
     }
     if (agents.current.length > 400) agents.current.splice(0, 80);
-  });
+  }, `${arrivals?.length ?? 0}:${lanes?.length ?? 0}`);
 
   return <canvas ref={ref} className="h-full w-full" />;
 }

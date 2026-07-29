@@ -50,7 +50,9 @@ export default function ChartFrame({
   hidden?: Set<string>;
   onToggleSeries?: (key: string) => void;
   footnote?: string;
-  height?: number;
+  /** "auto" lets an SVG with a viewBox set its own height — forcing a pixel
+   *  height on one either letterboxes it or stretches its type. */
+  height?: number | "auto";
   children: ReactNode;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -142,28 +144,58 @@ export default function ChartFrame({
           setPointer(null);
         }}
         className="relative focus-visible:ring-1 focus-visible:ring-accent/60"
-        style={{ ...cursor.surfaceProps.style, height }}
+        style={{
+          ...cursor.surfaceProps.style,
+          height: height === "auto" ? undefined : height,
+        }}
       >
         {children}
 
-        {/* crosshair: a band rather than a line, because every axis here is
-            categorical and a line between two bars is ambiguous */}
-        {i !== null && cursor.length > 0 && (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-y-0"
-            style={{
-              left: `${(i / cursor.length) * 100}%`,
-              width: `${(1 / cursor.length) * 100}%`,
-              background: cursor.isPinned(i)
-                ? "rgb(var(--region-rgb) / 0.16)"
-                : "rgba(255,255,255,0.06)",
-              borderLeft: cursor.isPinned(i)
-                ? "1px solid rgb(var(--region-rgb) / 0.6)"
-                : "1px solid rgba(255,255,255,0.18)",
-            }}
-          />
-        )}
+        {/* Crosshair. A band over bars — a line between two bars is ambiguous
+            about which one it means — and a hairline over a line chart, where
+            the datum really does sit at a single x. The geometry comes from the
+            cursor rather than being re-derived here, so the highlight cannot
+            drift away from the hit-testing that produced it.
+
+            Pin and hover are drawn SEPARATELY and can sit at different
+            positions: the pin is a marker you left behind, the hover is where
+            you are looking now. Collapsing them into one would mean pinning a
+            position then losing sight of it the moment you move the mouse. */}
+        {cursor.length > 0 &&
+          ([
+            cursor.pinned !== null ? { at: cursor.pinned, pinned: true } : null,
+            cursor.hovered !== null && cursor.hovered !== cursor.pinned
+              ? { at: cursor.hovered, pinned: false }
+              : null,
+          ] as const)
+            .filter((m): m is { at: number; pinned: boolean } => m !== null)
+            .map(({ at, pinned }) => {
+              const b = cursor.band(at);
+              const line = b.width <= 0;
+              return (
+                <div
+                  key={pinned ? "pin" : "hover"}
+                  aria-hidden
+                  className="pointer-events-none absolute inset-y-0"
+                  style={{
+                    left: `${b.left * 100}%`,
+                    width: line ? "1px" : `${b.width * 100}%`,
+                    background: line
+                      ? pinned
+                        ? "rgb(var(--region-rgb) / 0.75)"
+                        : "rgba(255,255,255,0.3)"
+                      : pinned
+                        ? "rgb(var(--region-rgb) / 0.16)"
+                        : "rgba(255,255,255,0.06)",
+                    borderLeft: line
+                      ? undefined
+                      : pinned
+                        ? "1px solid rgb(var(--region-rgb) / 0.6)"
+                        : "1px solid rgba(255,255,255,0.18)",
+                  }}
+                />
+              );
+            })}
       </div>
 
       {footnote && (
@@ -211,9 +243,12 @@ export default function ChartFrame({
                       {/* Zero width is not precision — it is the 0.1 quantisation
                           of twin scores showing through, so it says so rather
                           than rendering as a very tight interval. */}
+                      {/* The bound uses the SERIES formatter, not the default:
+                          a cascade size reading "35" next to "[2.00, 77.00]"
+                          looks like two different quantities. */}
                       {ci[1] - ci[0] <= 0
                         ? " · no spread"
-                        : ` · [${fmtDefault(ci[0])}, ${fmtDefault(ci[1])}]`}
+                        : ` · [${(s.format ?? fmtDefault)(ci[0])}, ${(s.format ?? fmtDefault)(ci[1])}]`}
                     </span>
                   )}
                 </span>

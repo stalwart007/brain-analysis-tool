@@ -20,6 +20,7 @@ import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
 import SimStage from "./sim/SimStage";
+import { keyboardOnlyProps, useChartCursor } from "./charts/cursor";
 
 interface PopVariant {
   id: string;
@@ -96,13 +97,43 @@ function Lineage({ result }: { result: OptimizerResult }) {
         });
     }
     const edges = result.lineage_edges
-      .map(([from, to]) => ({ a: pos.get(from), b: pos.get(to) }))
-      .filter((e) => e.a && e.b) as { a: { x: number; y: number }; b: { x: number; y: number } }[];
+      .map(([from, to]) => ({ a: pos.get(from), b: pos.get(to), from, to }))
+      .filter((e) => e.a && e.b) as {
+        a: { x: number; y: number };
+        b: { x: number; y: number };
+        from: string;
+        to: string;
+      }[];
     return { nodes: [...pos.values()], edges, W, H };
   }, [result]);
 
+  // A graph, not an axis — so the index cursor is driven per node rather than
+  // by pointer geometry, and the nodes carry their own hit areas. It still
+  // buys hover, pin, keyboard traversal and Escape from the same primitive.
+  const cursor = useChartCursor(
+    "optimizer-lineage",
+    nodes.length,
+    "Variant lineage",
+    (i) => {
+      const v = nodes[i]?.v;
+      if (!v) return `variant ${i + 1}`;
+      return `generation ${v.generation}, ${v.operation}, mean intent ${v.mean_intent.toFixed(2)} over ${v.trials} trials`;
+    }
+  );
+  const activeId = cursor.index === null ? null : nodes[cursor.index]?.v.id ?? null;
+  // A node's parents, so hovering shows what it descended FROM — the only
+  // question a lineage tree is really asked.
+  const activeParents = new Set(
+    cursor.index === null ? [] : nodes[cursor.index]?.v.parents ?? []
+  );
+  const active = cursor.index === null ? null : nodes[cursor.index]?.v ?? null;
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+    <>
+    <svg {...keyboardOnlyProps(cursor)}
+      onPointerLeave={() => cursor.setHovered(null)}
+      viewBox={`0 0 ${W} ${H}`}
+      className="w-full focus-visible:ring-1 focus-visible:ring-accent/60">
       {[0, 0.25, 0.5, 0.75, 1].map((v) => (
         <g key={v}>
           <line
@@ -117,29 +148,49 @@ function Lineage({ result }: { result: OptimizerResult }) {
       ))}
       {/* descent edges drawn as curves — a straight line reads as a chart
           series rather than an inheritance */}
-      {edges.map((e, i) => (
-        <path
-          key={i}
-          d={`M ${e.a.x},${e.a.y} C ${(e.a.x + e.b.x) / 2},${e.a.y} ${(e.a.x + e.b.x) / 2},${e.b.y} ${e.b.x},${e.b.y}`}
-          fill="none"
-          stroke="rgb(var(--region-rgb) / 0.34)"
-          strokeWidth="1"
-        />
-      ))}
-      {nodes.map(({ x, y, v }) => {
+      {edges.map((e, i) => {
+        // an edge touching the cursor's node is its ancestry or its descent
+        const lit = activeId !== null && (e.from === activeId || e.to === activeId);
+        return (
+          <path
+            key={i}
+            d={`M ${e.a.x},${e.a.y} C ${(e.a.x + e.b.x) / 2},${e.a.y} ${(e.a.x + e.b.x) / 2},${e.b.y} ${e.b.x},${e.b.y}`}
+            fill="none"
+            stroke={lit ? "rgb(var(--region-rgb) / 0.9)" : "rgb(var(--region-rgb) / 0.34)"}
+            strokeWidth={lit ? 1.8 : 1}
+            opacity={activeId && !lit ? 0.28 : 1}
+            className="pointer-events-none"
+          />
+        );
+      })}
+      {nodes.map(({ x, y, v }, i) => {
         const isBest = v.id === result.best_variant_id;
         const isSeed = v.id === result.seed_variant_id;
+        const lit = cursor.isMarked(i);
+        const kin = activeParents.has(v.id);
         return (
           <g key={v.id}>
+            {/* A 3.5px dot is not a hit target. This invisible disc is what
+                makes the tree hoverable at all — Fitts's law, not decoration. */}
+            <circle
+              cx={x} cy={y} r={11} fill="transparent" className="cursor-pointer"
+              onPointerEnter={() => cursor.setHovered(i)}
+              onPointerDown={() => cursor.togglePin(i)}
+            />
             <circle
               cx={x} cy={y}
-              r={isBest ? 5.5 : 3.5}
+              r={isBest ? 5.5 : lit ? 5 : 3.5}
               fill={isBest ? "#16d016" : isSeed ? "#dfd9d9" : "rgb(var(--region-rgb))"}
-              opacity={v.trials > 0 ? 0.95 : 0.3}
+              stroke={cursor.isPinned(i) ? "#dfd9d9" : kin ? "rgba(255,255,255,0.7)" : "none"}
+              strokeWidth={cursor.isPinned(i) ? 1.6 : 1}
+              opacity={
+                activeId && !lit && !kin ? 0.22 : v.trials > 0 ? 0.95 : 0.3
+              }
+              className="pointer-events-none"
             />
-            {isBest && <circle cx={x} cy={y} r={9} fill="none" stroke="#16d016" strokeWidth="1" opacity="0.5" />}
+            {isBest && <circle cx={x} cy={y} r={9} fill="none" stroke="#16d016" strokeWidth="1" opacity="0.5" className="pointer-events-none" />}
             {isSeed && (
-              <text x={x} y={y - 10} fontSize="7" fill="#dfd9d9" textAnchor="middle" fontFamily="ui-monospace, monospace">
+              <text x={x} y={y - 10} fontSize="7" fill="#dfd9d9" textAnchor="middle" fontFamily="ui-monospace, monospace" className="pointer-events-none">
                 seed
               </text>
             )}
@@ -150,6 +201,42 @@ function Lineage({ result }: { result: OptimizerResult }) {
         generation →   ↑ mean intent
       </text>
     </svg>
+
+    {/* The variant text itself. A dot on a tree cannot tell you what the copy
+        SAYS, which is the one thing a copy optimiser is asked. */}
+    <div className="mt-1.5 min-h-14 rounded-lg border border-hairline/60 bg-black/20 px-2.5 py-1.5">
+      {active ? (
+        <>
+          <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[9px] text-muted">
+            <span className="text-ink-2">gen {active.generation}</span>
+            <span>· {active.operation}</span>
+            <span>
+              · intent{" "}
+              <span className="text-accent">{active.mean_intent.toFixed(3)}</span>
+            </span>
+            {/* A mean over few trials is the classic optimiser trap, so the
+                denominator travels with it rather than being a hover away. */}
+            <span>· {active.trials} trial{active.trials === 1 ? "" : "s"}</span>
+            <span>· act rate {(active.act_rate * 100).toFixed(0)}%</span>
+            {active.id === result.best_variant_id && <span className="text-good">· best</span>}
+            {cursor.pinned !== null && (
+              <button onClick={cursor.clear} className="ml-auto text-accent transition hover:text-ink">
+                pinned ✕
+              </button>
+            )}
+          </div>
+          <p className="mt-1 text-[11px] leading-snug text-ink-2">{active.text}</p>
+          {active.rationale && (
+            <p className="mt-0.5 text-[10px] leading-snug text-muted">{active.rationale}</p>
+          )}
+        </>
+      ) : (
+        <p className="font-mono text-[10px] text-muted">
+          Hover a node to read its variant — arrow keys work too, Enter pins.
+        </p>
+      )}
+    </div>
+    </>
   );
 }
 

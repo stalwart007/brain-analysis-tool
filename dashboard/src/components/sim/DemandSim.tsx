@@ -108,7 +108,7 @@ export default function DemandSim({
       ctx.fill();
     }
     if (dots.current.length > 600) dots.current.splice(0, 120);
-  });
+  }, `${curves?.length ?? 0}:${cols?.length ?? 0}`);
 
   return <canvas ref={ref} className="h-full w-full" />;
 }

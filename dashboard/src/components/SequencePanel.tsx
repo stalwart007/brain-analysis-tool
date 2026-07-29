@@ -21,6 +21,7 @@ import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import { useMatrixCursor } from "./charts/cursor";
 import SimStage from "./sim/SimStage";
 
 interface SequenceResult {
@@ -67,40 +68,100 @@ function AdvantageMatrix({ m, labels }: { m: number[][]; labels: string[] }) {
   const n = m.length;
   const cell = 34;
   const pad = 22;
+  const span = pad + n * cell + 8;
+  // The label gutters are dead space for hit-testing; without telling the
+  // cursor about them every reading lands a cell up and to the left.
+  const cursor = useMatrixCursor(
+    "sequence-advantage",
+    n,
+    n,
+    "Net advantage matrix",
+    (r, c) =>
+      r === c
+        ? `${labels[r]} against itself — not defined`
+        : `${labels[c]} after ${labels[r]}: ${m[r]?.[c] >= 0 ? "gains" : "loses"} ${Math.abs(m[r]?.[c] ?? 0).toFixed(3)}`,
+    { inset: { left: pad / span, top: pad / span } }
+  );
+  const active = cursor.cell;
+
   return (
-    <svg viewBox={`0 0 ${pad + n * cell + 8} ${pad + n * cell + 8}`} className="w-full max-w-sm">
-      {m.map((row, i) =>
-        row.map((v, j) => {
-          if (i === j) {
+    <div>
+      <svg
+        {...cursor.surfaceProps}
+        viewBox={`0 0 ${span} ${span}`}
+        className="w-full max-w-sm focus-visible:ring-1 focus-visible:ring-accent/60"
+      >
+        {m.map((row, i) =>
+          row.map((v, j) => {
+            const lit = cursor.isActive(i, j);
+            const cross = cursor.inCross(i, j);
+            // Dim everything outside the cursor's row and column. A 6×6 grid of
+            // similar greens is unreadable until you can isolate one comparison.
+            const alpha = !active ? 1 : lit ? 1 : cross ? 0.75 : 0.16;
+            if (i === j) {
+              return (
+                <rect key={`${i}-${j}`} x={pad + j * cell} y={pad + i * cell}
+                  width={cell - 2} height={cell - 2} fill="rgba(223,217,217,0.04)"
+                  opacity={alpha} />
+              );
+            }
+            // green = j genuinely benefits from following i; red = it costs
+            const t = v / peak;
+            const color = t >= 0 ? "22,208,22" : "240,96,95";
             return (
               <rect key={`${i}-${j}`} x={pad + j * cell} y={pad + i * cell}
-                width={cell - 2} height={cell - 2} fill="rgba(223,217,217,0.04)" />
+                width={cell - 2} height={cell - 2}
+                opacity={alpha}
+                stroke={cursor.isPinned(i, j) ? "rgb(var(--region-rgb))" : lit ? "rgba(255,255,255,0.75)" : "none"}
+                strokeWidth={cursor.isPinned(i, j) ? 1.6 : 1}
+                fill={`rgb(${color} / ${Math.min(0.88, Math.abs(t) * 0.85 + 0.06)})`} />
             );
-          }
-          // green = j genuinely benefits from following i; red = it costs
-          const t = v / peak;
-          const color = t >= 0 ? "22,208,22" : "240,96,95";
-          return (
-            <rect key={`${i}-${j}`} x={pad + j * cell} y={pad + i * cell}
-              width={cell - 2} height={cell - 2}
-              fill={`rgb(${color} / ${Math.min(0.88, Math.abs(t) * 0.85 + 0.06)})`}>
-              <title>{`${labels[j]} after ${labels[i]}: ${v >= 0 ? "+" : ""}${v.toFixed(3)}`}</title>
-            </rect>
-          );
-        })
-      )}
-      {labels.map((l, i) => (
-        <g key={i}>
-          <text x={pad - 5} y={pad + i * cell + cell / 2} fontSize="9" fill="#a8a3a3"
-            textAnchor="end" dominantBaseline="middle" fontFamily="ui-monospace, monospace">{l}</text>
-          <text x={pad + i * cell + (cell - 2) / 2} y={pad - 7} fontSize="9" fill="#a8a3a3"
-            textAnchor="middle" fontFamily="ui-monospace, monospace">{l}</text>
-        </g>
-      ))}
-      <text x={pad} y={pad + n * cell + 6} fontSize="7" fill="#6f6c6c" fontFamily="ui-monospace, monospace">
-        row = precedes · column = follows
-      </text>
-    </svg>
+          })
+        )}
+        {labels.map((l, i) => (
+          <g key={i}>
+            <text x={pad - 5} y={pad + i * cell + cell / 2} fontSize="9"
+              fill={active?.row === i ? "#dfd9d9" : "#a8a3a3"}
+              textAnchor="end" dominantBaseline="middle" fontFamily="ui-monospace, monospace">{l}</text>
+            <text x={pad + i * cell + (cell - 2) / 2} y={pad - 7} fontSize="9"
+              fill={active?.col === i ? "#dfd9d9" : "#a8a3a3"}
+              textAnchor="middle" fontFamily="ui-monospace, monospace">{l}</text>
+          </g>
+        ))}
+        <text x={pad} y={pad + n * cell + 6} fontSize="7" fill="#6f6c6c" fontFamily="ui-monospace, monospace">
+          row = precedes · column = follows
+        </text>
+      </svg>
+
+      {/* The readout, in words. A signed number in a coloured square is the
+          kind of thing that gets read backwards under time pressure. */}
+      <div className="mt-1.5 min-h-8 font-mono text-[10px] leading-relaxed">
+        {active && m[active.row] ? (
+          active.row === active.col ? (
+            <span className="text-muted">{labels[active.row]} against itself — not defined.</span>
+          ) : (
+            <span className="text-ink-2">
+              <span className="text-ink">{labels[active.col]}</span> after{" "}
+              <span className="text-ink">{labels[active.row]}</span>:{" "}
+              <span className={m[active.row][active.col] >= 0 ? "text-good" : "text-critical"}>
+                {m[active.row][active.col] >= 0 ? "+" : ""}
+                {m[active.row][active.col].toFixed(3)}
+              </span>
+              <span className="text-muted">
+                {" "}· {m[active.row][active.col] >= 0 ? "gains from" : "is hurt by"} that order
+              </span>
+              {cursor.pinnedCell && (
+                <button onClick={cursor.clear} className="ml-2 text-accent transition hover:text-ink">
+                  pinned ✕
+                </button>
+              )}
+            </span>
+          )
+        ) : (
+          <span className="text-muted">Hover a cell, or use arrow keys — Enter pins.</span>
+        )}
+      </div>
+    </div>
   );
 }
 

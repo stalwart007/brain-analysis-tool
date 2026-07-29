@@ -132,7 +132,7 @@ export default function FunnelSim({
     }
     dots.current = alive;
     if (dots.current.length > 300) dots.current.splice(0, 60);
-  });
+  }, `${events?.length ?? 0}:${steps.length}`);
 
   return <canvas ref={ref} className="h-full w-full" />;
 }
