@@ -15,6 +15,8 @@ import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
 import BrainMap, { SystemScores } from "./BrainMap";
+import SimStage from "./sim/SimStage";
+import TensorSim from "./sim/TensorSim";
 import { AssetInput, assetReady, KINDS, type AssetKind, type ContentAsset } from "./AssetInput";
 
 interface RetentionStep {
@@ -71,6 +73,19 @@ Scene 4 (0:26): The founder types one sentence; Atlas drafts the plan, books the
 Scene 5 (0:34): Morning. The founder is asleep. Atlas's status: "11 hours of busywork handled."
 Scene 6 (0:40): Logo. "Atlas — get your week back." Free 14-day trial.`;
 
+/** The reductions the backend runs once every twin has reported. Named here
+ *  so the wait after the last arrival reads as work rather than a stall — ISC
+ *  alone runs 500 permutations plus a twin-level bootstrap. Ids match the
+ *  `stage` field on the wire; axis-inapplicable passes simply never fire. */
+const ANALYSIS_PASSES = [
+  { id: "isc", label: "synchrony" },
+  { id: "changepoints", label: "change points" },
+  { id: "memory", label: "peak-end" },
+  { id: "retention", label: "retention" },
+  { id: "systems", label: "systems" },
+] as const;
+
+
 export default function ContentImpactPanel({ personaCount }: { personaCount: number }) {
   const [kind, setKind] = useState<AssetKind>("text");
   const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
@@ -81,12 +96,15 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
   const [stage, setStage] = useState<string | null>(null);
   const [segments, setSegments] = useState<string[]>([]);
   const [traces, setTraces] = useState<number[][]>([]); // live attention curves
+  const [expected, setExpected] = useState(0);   // twins dispatched, from `start`
+  const [passes, setPasses] = useState<string[]>([]); // analysis stages seen
   const [result, setResult] = useState<ContentResult | null>(null);
   const [beat, setBeat] = useState<number | null>(null); // brain-map scrubber
 
   async function run() {
     setBusy(true); setError(null); setResult(null);
-    setTraces([]); setSegments([]); setBeat(null); setStage("segmenting content…");
+    setTraces([]); setSegments([]); setBeat(null); setPasses([]); setExpected(0);
+    setStage("segmenting content…");
     try {
       await streamRun(
         "/studies/content/stream",
@@ -96,9 +114,17 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
           cognitive_load: load,
         },
         (evt) => {
-          if (evt.type === "stage") setStage(String(evt.detail));
+          if (evt.type === "stage") {
+            setStage(String(evt.detail));
+            // Analysis passes arrive AFTER the last twin. Without them the
+            // stage sat silent through ISC's 500 permutations and read as a
+            // hang at exactly the moment the heaviest work is happening.
+            const id = String(evt.stage ?? "");
+            if (id && id !== "segmenting") setPasses((p) => (p.includes(id) ? p : [...p, id]));
+          }
           else if (evt.type === "start") {
             setSegments(evt.segments as string[]);
+            setExpected(Number(evt.total ?? 0) || 0);
             setStage(`${(evt.segments as string[]).length} beats — audience experiencing content…`);
           } else if (evt.type === "agent") setTraces((t) => [...t, evt.attention as number[]]);
           else if (evt.type === "done") setResult(evt.result as unknown as ContentResult);
@@ -187,6 +213,36 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
           {busy ? "Screening…" : "Run neuro-impact study"}
         </motion.button>
       </div>
+
+      {/* The appraisal tensor filling in. This panel was the only one of the
+          six with a live stage that showed NOTHING on Run, while starting the
+          heaviest computation in the product. The tensor is the honest subject:
+          ISC, change points, peak-end and retention are all reductions over it,
+          so watching it populate is watching the actual work. */}
+      <SimStage
+        show={busy || !!result}
+        busy={busy}
+        runningLabel={
+          segments.length
+            ? `${traces.length}/${expected || "…"} twins × ${segments.length} beats`
+            : "reading content"
+        }
+        doneLabel={`tensor complete · ${traces.length} × ${segments.length} × 9 dims`}
+        progress={stage ?? undefined}
+        height={250}
+      >
+        <TensorSim
+          rows={traces.map((attention) => ({ attention }))}
+          beats={segments.length}
+          expected={expected}
+          stages={ANALYSIS_PASSES.map((p) => ({
+            id: p.id,
+            label: p.label,
+            done: passes.includes(p.id) && !busy,
+            active: busy && passes[passes.length - 1] === p.id,
+          }))}
+        />
+      </SimStage>
 
       {stage && (
         <p className="mt-3 font-mono text-[11px] text-accent">
