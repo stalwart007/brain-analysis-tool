@@ -16,6 +16,8 @@ import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
 import BrainMap, { SystemScores } from "./BrainMap";
 import SimStage from "./sim/SimStage";
+import { ChartCursorProvider, useChartCursor } from "./charts/cursor";
+import ChartFrame from "./charts/ChartFrame";
 import TensorSim from "./sim/TensorSim";
 import { AssetInput, assetReady, KINDS, type AssetKind, type ContentAsset } from "./AssetInput";
 
@@ -86,7 +88,16 @@ const ANALYSIS_PASSES = [
 ] as const;
 
 
-export default function ContentImpactPanel({ personaCount }: { personaCount: number }) {
+export default function ContentImpactPanel(props: { personaCount: number }) {
+  return (
+    <ChartCursorProvider>
+      <ContentImpactInner {...props} />
+    </ChartCursorProvider>
+  );
+}
+
+
+function ContentImpactInner({ personaCount }: { personaCount: number }) {
   const [kind, setKind] = useState<AssetKind>("text");
   const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
   const [twins, setTwins] = useState(3);
@@ -99,11 +110,23 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
   const [expected, setExpected] = useState(0);   // twins dispatched, from `start`
   const [passes, setPasses] = useState<string[]>([]); // analysis stages seen
   const [result, setResult] = useState<ContentResult | null>(null);
-  const [beat, setBeat] = useState<number | null>(null); // brain-map scrubber
+  // ONE cursor for the beat axis, shared by the attention field, the
+  // peak-index distribution, the retention curve and the brain-map scrubber.
+  // The scrubber used to own a separate `beat` state, so clicking a beat there
+  // highlighted nothing anywhere else — four views of one tensor behaving as
+  // four unrelated pictures.
+  const beatCursor = useChartCursor(
+    "beats",
+    segments.length,
+    "Content beats",
+    (i) => `beat ${i + 1} of ${segments.length}`
+  );
+  const beat = beatCursor.index;
+  const setBeat = (i: number | null) => (i === null ? beatCursor.clear() : beatCursor.togglePin(i));
 
   async function run() {
     setBusy(true); setError(null); setResult(null);
-    setTraces([]); setSegments([]); setBeat(null); setPasses([]); setExpected(0);
+    setTraces([]); setSegments([]); beatCursor.clear(); setPasses([]); setExpected(0);
     setStage("segmenting content…");
     try {
       await streamRun(
@@ -362,18 +385,26 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
                   <div className="mt-2 flex items-end gap-1">
                     {result.memory.peak_index_distribution.map((count, i) => {
                       const top = Math.max(...result.memory!.peak_index_distribution, 1);
+                      // Shares the "beats" domain with the attention field and
+                      // the retention curve, so hovering a beat in any of them
+                      // lights it up in all three. These are three reductions
+                      // of one tensor; reading across them used to mean
+                      // counting bars with a finger.
+                      const on = beatCursor.isActive(i);
                       return (
                         <div key={i} className="flex-1 text-center">
                           <div
-                            className="mx-auto w-full rounded-t-sm"
+                            className="mx-auto w-full rounded-t-sm transition-opacity"
                             style={{
                               height: `${4 + (count / top) * 94}px`,
                               background: i === result.memory!.peak_index ? "#f2ad1f" : "#3f8ff0",
-                              opacity: count ? 0.85 : 0.18,
+                              opacity: on ? 1 : count ? 0.85 : 0.18,
+                              outline: on ? "1px solid rgba(255,255,255,0.55)" : "none",
                             }}
-                            title={`${count} of ${result.memory!.n_twins} twins peaked on beat ${i + 1}`}
                           />
-                          <span className="font-mono text-[8px] text-muted">B{i + 1}</span>
+                          <span className={`font-mono text-[8px] ${on ? "text-ink" : "text-muted"}`}>
+                            B{i + 1}
+                          </span>
                         </div>
                       );
                     })}
@@ -401,7 +432,7 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
                     {result.retention.steps.map((st) => (
                       <div key={st.beat} className="flex-1 text-center">
                         <div
-                          className="mx-auto w-full rounded-t-sm"
+                          className="mx-auto w-full rounded-t-sm transition-opacity"
                           style={{
                             height: `${4 + st.survival * 94}px`,
                             // An undefined hazard (empty risk set) is drawn
@@ -410,15 +441,19 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
                             // different findings.
                             background: st.hazard === null ? "transparent" : "#4fb477",
                             border: st.hazard === null ? "1px dashed rgba(255,255,255,0.25)" : "none",
-                            opacity: 0.85,
+                            opacity: beatCursor.isActive(st.beat) ? 1 : 0.85,
+                            outline: beatCursor.isActive(st.beat)
+                              ? "1px solid rgba(255,255,255,0.55)"
+                              : "none",
                           }}
-                          title={
-                            st.hazard === null
-                              ? `beat ${st.beat + 1}: nobody left at risk — hazard undefined`
-                              : `beat ${st.beat + 1}: ${st.dropped} of ${st.entered} dropped (hazard ${st.hazard})`
-                          }
                         />
-                        <span className="font-mono text-[8px] text-muted">B{st.beat + 1}</span>
+                        <span
+                          className={`font-mono text-[8px] ${
+                            beatCursor.isActive(st.beat) ? "text-ink" : "text-muted"
+                          }`}
+                        >
+                          B{st.beat + 1}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -481,15 +516,47 @@ function AttentionField({
   const band = cis && cis.every(Boolean)
     ? `M ${cis.map((c, i) => `${x(i)},${y((c as [number, number])[1])}`).join(" L ")} L ${[...cis].reverse().map((c, ri) => `${x(cis.length - 1 - ri)},${y((c as [number, number])[0])}`).join(" L ")} Z`
     : null;
+  const cursor = useChartCursor(
+    "beats",
+    n,
+    "Audience attention across beats",
+    (i) => `beat ${i + 1}: mean attention ${(mean[i] ?? 0).toFixed(2)}`
+  );
+  const [muted, setMuted] = useState<Set<string>>(new Set());
+
   return (
     <div className="mt-4 rounded-xl border border-hairline bg-black/40 p-3">
-      <div className="flex items-baseline justify-between">
-        <span className="hud-label">AUDIENCE ATTENTION FIELD</span>
-        <span className="font-mono text-[9px] text-muted">
-          one trace per twin · bold = population mean · dashed = detected change points
-        </span>
-      </div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="mt-1 w-full">
+      <ChartFrame
+        cursor={cursor}
+        title="AUDIENCE ATTENTION FIELD"
+        categories={segments.map((_, i) => `Beat ${i + 1}`)}
+        hidden={muted}
+        onToggleSeries={(k) =>
+          setMuted((m) => {
+            const next = new Set(m);
+            next.has(k) ? next.delete(k) : next.add(k);
+            return next;
+          })
+        }
+        series={[
+          {
+            key: "attention",
+            label: "attention",
+            color: "#4fb6ff",
+            values: mean,
+            intervals: (cis ?? undefined) as ([number, number] | null)[] | undefined,
+          },
+          ...(result
+            ? [
+                { key: "arousal", label: "arousal", color: "#f2ad1f", values: result.curves.arousal },
+                { key: "valence", label: "valence", color: "#b07ff0", values: result.curves.valence },
+              ]
+            : []),
+        ]}
+        footnote="one trace per twin · bold = population mean · dashed = detected change points · click to pin a beat, arrow keys to step"
+        height={150}
+      >
+      <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full">
         {[0, 0.5, 1].map((v) => (
           <g key={v}>
             <line x1={padX} y1={y(v)} x2={W - padX} y2={y(v)} stroke="rgba(120,165,230,0.10)" />
@@ -512,9 +579,18 @@ function AttentionField({
           </g>
         ))}
         {segments.map((_, i) => (
-          <text key={i} x={x(i)} y={H - 3} fontSize="7" fill="#5f6b7d" textAnchor="middle" fontFamily="ui-monospace, monospace">B{i + 1}</text>
+          <text key={i} x={x(i)} y={H - 3} fontSize="7"
+            fill={cursor.isActive(i) ? "#dfd9d9" : "#5f6b7d"}
+            textAnchor="middle" fontFamily="ui-monospace, monospace">B{i + 1}</text>
         ))}
+        {/* the cursor's own marker on the mean series — the crosshair band
+            locates the beat, this locates the VALUE at that beat */}
+        {cursor.index !== null && mean[cursor.index] != null && (
+          <circle cx={x(cursor.index)} cy={y(mean[cursor.index])} r={3.5}
+            fill={cursor.isPinned(cursor.index) ? "rgb(var(--region-rgb))" : "#dfd9d9"} />
+        )}
       </svg>
+      </ChartFrame>
     </div>
   );
 }
