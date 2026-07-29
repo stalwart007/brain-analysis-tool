@@ -31,6 +31,13 @@ primary_region = "bom"          # keep the same region as the backend
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
+  # Fly creates a second machine for HA unless told otherwise. bom had no
+  # capacity for it, which failed the deploy AFTER the first machine was
+  # already serving — a confusing partial success. One machine is the honest
+  # configuration here regardless: the backend is pinned to one by the job
+  # worker and SQLite, so a second dashboard buys availability in front of a
+  # single point of failure behind it.
+  max_machines_running = 1
 
 [[vm]]
   # 1 GB, not 512 MB: the Next build needs roughly 2 GB and is done at image

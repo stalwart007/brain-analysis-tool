@@ -41,6 +41,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /srv
 COPY app ./app
+COPY serve.py .
 
 # Non-root. The volume is chowned so the app can write its database; /srv stays
 # owned by root and read-only to the app, so a compromise cannot rewrite the
@@ -57,5 +58,22 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"
 
-# Single worker, deliberately — see the note at the top of this file.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Not `uvicorn --host …`, because neither host value works here. Both were
+# tried against this deployment and both failed, in opposite directions:
+#
+#   --host 0.0.0.0   IPv4 only. Fly's private network is IPv6, so
+#                    cogniswarm-api.internal:8000 resolved to fdaa:… and found
+#                    nothing listening — the dashboard's ingest passthrough
+#                    returned 502 while this app's health check stayed green.
+#
+#   --host ::        IPv6 only. Uvicorn sets IPV6_V6ONLY even with the kernel's
+#                    bindv6only=0, so private networking started working and
+#                    Fly's health check — which probes over IPv4 — began
+#                    failing with connection refused. Verified from inside the
+#                    machine: 127.0.0.1:8000 refused, [::1]:8000 answered.
+#
+# serve.py binds ONE dual-stack socket instead, which serves both. Compose is
+# unaffected either way: its default bridge is IPv4, which is also why the
+# local verification could not have caught this — it passed precisely because
+# the network was the wrong shape.
+CMD ["python", "serve.py"]
