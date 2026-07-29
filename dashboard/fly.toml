@@ -1,0 +1,40 @@
+# CogniSwarm dashboard — the ONLY public surface.
+app = "cogniswarm-app"
+primary_region = "bom"          # keep the same region as the backend
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # `.internal` is Fly's private 6PN DNS. The backend has no public address,
+  # so this is the only way to reach it — and the reason the analysis API is
+  # not on the internet. Must match the backend's app name.
+  COGNISWARM_BACKEND = "http://cogniswarm-api.internal:8000"
+  # Members live in a mounted secret, not in the image: `npm run add-user`
+  # writes this file, so baking it in would lose every account on the next
+  # deploy, and the symptom reads as an auth bug rather than a deploy one.
+  COGNISWARM_USERS_FILE = "/secrets/users.json"
+
+# Fly writes this file into the machine from a secret at boot. Populate it with
+#   fly secrets set --app cogniswarm-app USERS_JSON="$(base64 -i dashboard/data/users.json)"
+# Fly base64-decodes `secret_name` contents into `guest_path`.
+[[files]]
+  guest_path = "/secrets/users.json"
+  secret_name = "USERS_JSON"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # Never suspend. A stopped machine drops in-flight SSE streams mid-run, and
+  # a cold start in front of an investor is the one thing worth paying to
+  # avoid at this scale.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  # 1 GB, not 512 MB: the Next build needs roughly 2 GB and is done at image
+  # build time, but the runtime carries three.js and the R3F scene graph and
+  # will OOM on 512 under load.
+  size = "shared-cpu-1x"
+  memory = "1gb"

@@ -1,0 +1,55 @@
+# CogniSwarm backend — PRIVATE.
+#
+# Set `app` and `primary_region` to match what `fly launch` created, or pass
+# --name / --region when launching.
+app = "cogniswarm-api"
+primary_region = "bom"          # Mumbai. Change to the region nearest you.
+
+[build]
+  dockerfile = "Dockerfile"
+
+# ── THERE IS DELIBERATELY NO [http_service] AND NO [[services]] BLOCK ──────
+#
+# That omission is the entire security posture of this deployment, not an
+# oversight. Without a services block Fly gives this app NO public address: it
+# is reachable only at cogniswarm-api.internal over the private 6PN network,
+# from the dashboard app in the same organisation.
+#
+# `fly launch` ADDS an http_service block by default. If you re-run it, delete
+# the block again before deploying, or the analysis surface — run history with
+# every twin's inner monologue, panel membership, and every endpoint that
+# spends OpenAI credit — becomes reachable from the internet.
+#
+# Telemetry still gets in: browsers post to the dashboard's public
+# /api/ingest, which forwards only that one path and injects no API key.
+#
+# A second consequence of having no proxy in front: machines are never
+# auto-stopped, which is what we want. A suspended machine would kill
+# in-flight swarm runs and the in-process job worker.
+
+[env]
+  # Explicit rather than relying on config.py's /data autodetection: if the
+  # volume fails to mount, this path is unwritable and the app fails loudly at
+  # boot instead of silently opening an empty database on the machine's own
+  # disk and serving a product with no data.
+  COGNISWARM_DB = "/data/cogniswarm.db"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+[[vm]]
+  # ONE machine, always. jobs.py re-queues every queued+running job at startup
+  # with no compare-and-swap claim, so a second instance executes every job a
+  # second time and bills OpenAI twice. SQLite has a single writer and the job
+  # worker is an in-process thread. Do not scale this to 2.
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[checks.health]
+  type = "http"
+  port = 8000
+  path = "/healthz"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"

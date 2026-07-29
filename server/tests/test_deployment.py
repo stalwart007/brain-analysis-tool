@@ -166,3 +166,35 @@ def test_every_schema_resolves_without_forward_references():
     assert len(models) > 20, "sanity: the schema module should expose many models"
     for model in models:
         TypeAdapter(model)  # raises if any annotation cannot be resolved
+
+
+# ── the deploy mistake that would silently expose everything ──────────────
+
+
+def test_backend_fly_config_declares_no_public_service():
+    """`fly launch` adds an [http_service] block by default, and re-running it
+    would hand the backend a public address — putting run history with every
+    twin's inner monologue, panel membership and every credit-spending
+    endpoint on the internet, with nothing failing and no error to notice.
+
+    The absence of that block IS the security posture, so it is asserted here
+    rather than left to a comment nobody re-reads at 2am.
+    """
+    import pathlib
+
+    toml = pathlib.Path(__file__).resolve().parents[1] / "fly.toml"
+    if not toml.exists():
+        return  # config is optional; only assert it when present
+    text = toml.read_text()
+    body = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "[http_service]" not in body, (
+        "backend fly.toml declares a public HTTP service — remove it, or the "
+        "analysis surface is reachable from the internet"
+    )
+    assert "[[services]]" not in body, (
+        "backend fly.toml declares a public service — remove it"
+    )
+    # and the volume must be mounted, or every deploy silently starts empty
+    assert "[mounts]" in body and "/data" in body
