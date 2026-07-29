@@ -39,6 +39,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import jobs, storage
 from .config import MAX_TWINS_PER_RUN, REPO_ROOT
+from .audience import infer_audience, provenance_note
+from .oai import Refusal
 from .persona import seed_persona
 from .cognition import full_cognitive_profile, iter_cognitive_profile
 from .profiler import profile_features
@@ -497,6 +499,39 @@ def template_path(path: str) -> str:
     return "/".join(":id" if _ID_SEGMENT.match(p) else p for p in parts)
 
 
+#: Where each request keeps the thing the audience is reacting to. Ordered by
+#: specificity so a request carrying several fields yields the most
+#: representative one. Read off the request rather than switched on per
+#: endpoint, so a study added later inherits audience inference for free.
+_STIMULUS_FIELDS = ("scenario", "content", "pitch", "brief", "seed_variant", "product")
+
+
+def stimulus_of(request) -> str:
+    """The text an inferred audience would be reacting to, or ''."""
+    for field in _STIMULUS_FIELDS:
+        v = getattr(request, field, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # Multi-part stimuli: variants, walk steps, sequence messages.
+    for field in ("variants", "steps", "messages"):
+        v = getattr(request, field, None)
+        if v:
+            parts = [
+                getattr(x, "scenario", None) or (x if isinstance(x, str) else None)
+                for x in v
+            ]
+            joined = "\n\n".join(p for p in parts if p)
+            if joined.strip():
+                return joined.strip()
+    asset = getattr(request, "asset", None)
+    if asset is not None:
+        for field in ("text", "brief"):
+            v = getattr(asset, field, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
 def estimate_twin_calls(personas: int, request) -> int:
     """Twin calls one request will dispatch, before it dispatches any.
 
@@ -531,7 +566,9 @@ def _enforce_budget(personas: list[PersonaSeed], request) -> None:
         )
 
 
-def _load_personas(session_ids: list[str], caller: Caller) -> list[PersonaSeed]:
+async def _load_personas(
+    session_ids: list[str], caller: Caller, stimulus: str = ""
+) -> list[PersonaSeed]:
     candidates = (
         [storage.get_session(sid, site_id=caller.site_id) for sid in session_ids]
         if session_ids
@@ -559,16 +596,42 @@ def _load_personas(session_ids: list[str], caller: Caller) -> list[PersonaSeed]:
             log.warning("session %s has an unreadable persona blob; skipping", s.get("id"))
     if skipped:
         log.warning("%d of %d personas were unreadable", skipped, skipped + len(personas))
-    if not personas:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No profiled personas available. Profile at least one session first."
-                if not skipped
-                else f"No readable personas: {skipped} stored persona(s) failed validation."
-            ),
-        )
-    return personas
+    if personas:
+        return personas
+
+    # COLD START. No observed telemetry — infer the audience from the stimulus
+    # rather than refusing. Without this a new account can do nothing at all
+    # until a collector has been installed and has accumulated traffic, which
+    # is every prospective customer on day one.
+    #
+    # Never a blend: observed personas above return immediately, so a run is
+    # entirely measured or entirely inferred. Mixing them would make the
+    # aggregate uninterpretable, because no reader could tell which half moved
+    # the number. The provenance rides along on every persona and is reported
+    # with every result.
+    if stimulus and not skipped:
+        try:
+            inferred = await infer_audience(stimulus)
+            if inferred:
+                log.info("no observed personas; inferred %d from stimulus", len(inferred))
+                return inferred
+        except (openai.OpenAIError, Refusal, RuntimeError, ValueError) as exc:
+            # Fall through to the original error. The user asked for a study,
+            # not for inference, so "no personas" is the message they can act
+            # on — a failure inside a fallback they never requested would only
+            # confuse.
+            log.warning("audience inference failed: %s", exc)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No profiled personas available, and the audience could not be "
+            "inferred from this request. Profile at least one session, or "
+            "include a scenario or brief to infer an audience from."
+            if not skipped
+            else f"No readable personas: {skipped} stored persona(s) failed validation."
+        ),
+    )
 
 
 def _llm_errors(exc: Exception) -> HTTPException:
@@ -610,7 +673,7 @@ def _llm_errors(exc: Exception) -> HTTPException:
 
 @app.post("/v1/swarm/run")
 async def swarm_run(caller: CallerDep, request: SwarmRunRequest) -> dict:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     try:
         aggregate = await run_swarm(
@@ -663,7 +726,7 @@ def _sse(generator, request_model, kind: str, caller: Caller) -> StreamingRespon
 
 @app.post("/v1/swarm/stream")
 async def swarm_stream(caller: CallerDep, request: SwarmRunRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(
         stream_swarm(
@@ -680,7 +743,7 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(
         stream_compare(
@@ -698,7 +761,7 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
 
 @app.post("/v1/swarm/walk/stream")
 async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(
         stream_walkthrough(
@@ -712,7 +775,7 @@ async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingRespo
 
 @app.post("/v1/studies/price/stream")
 async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(
         stream_price_sensitivity(
@@ -730,7 +793,7 @@ async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> S
 
 @app.post("/v1/studies/objection/stream")
 async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> StreamingResponse:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(
         stream_objection_scan(
@@ -746,7 +809,7 @@ async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> Stre
 async def virality_stream(caller: CallerDep, request: ViralityRequest) -> StreamingResponse:
     """Virality forecast: Galton-Watson branching process over twin share
     intents — R0, extinction probability, seeded cascade quantile bands."""
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(stream_virality(personas, request), request, "virality", caller)
 
@@ -755,7 +818,7 @@ async def virality_stream(caller: CallerDep, request: ViralityRequest) -> Stream
 async def content_stream(caller: CallerDep, request: ContentStudyRequest) -> StreamingResponse:
     """Neuro-impact study: beat-by-beat audience response with ISC,
     change-point, peak-end memory, and functional-system mapping."""
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(stream_content_study(personas, request), request, "content", caller)
 
@@ -766,7 +829,7 @@ async def optimize_stream(caller: CallerDep, request: CopyOptimizerRequest) -> S
     populations, Thompson-allocated budget within each generation, LLM crossover
     and mutation between them, and a win claimed only when the champion's
     credible interval clears the seed's."""
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(stream_copy_optimizer(personas, request), request, "optimize", caller)
 
@@ -777,7 +840,7 @@ async def sequence_stream(caller: CallerDep, request: SequenceRequest) -> Stream
     matrix from a sampled subset of the N! orderings, then solves the linear
     ordering problem heuristically for the ordering that ends with the most
     intent — reporting primacy/recency separately from message strength."""
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     return _sse(stream_sequence(personas, request), request, "sequence", caller)
 
@@ -787,7 +850,7 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     try:
         compared = await run_compare(
@@ -808,7 +871,7 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
 
 @app.post("/v1/swarm/walk")
 async def swarm_walk(caller: CallerDep, request: WalkRequest) -> dict:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     try:
         aggregate = await run_walkthrough(
@@ -837,7 +900,7 @@ def swarm_runs(caller: CallerDep, kind: Optional[str] = None) -> list[dict]:
 
 @app.post("/v1/studies/price")
 async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> dict:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     try:
         result = await run_price_sensitivity(
@@ -859,7 +922,7 @@ async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> di
 
 @app.post("/v1/studies/objection")
 async def study_objection(caller: CallerDep, request: ObjectionRequest) -> dict:
-    personas = _load_personas(request.session_ids, caller)
+    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
     _enforce_budget(personas, request)
     try:
         result = await run_objection_scan(

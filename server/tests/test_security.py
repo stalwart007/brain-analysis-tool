@@ -378,7 +378,11 @@ def test_one_unreadable_persona_does_not_disable_every_study():
     bad_id = storage.insert_session(site_id="resil", page_path="/", features={"event_count": 3})
     storage.set_persona(bad_id, {"persona_id": "truncated", "label": "written by an older schema"})
 
-    personas = _load_personas([], Caller(site_id="resil"))
+    import asyncio
+
+    # `_load_personas` is async now: it may fall back to inferring an
+    # audience from the stimulus when no observed persona survives.
+    personas = asyncio.run(_load_personas([], Caller(site_id="resil")))
     assert len(personas) == 1
     assert personas[0].persona_id == good["persona_id"]
 
@@ -473,3 +477,75 @@ def test_the_limiter_does_not_grow_without_bound(monkeypatch):
     for i in range(50):
         limiter.allow(f"site-{i}", "1.2.3.4")
     assert all(len(v) <= 5 for v in limiter._hits.values())
+
+
+# ── cold start: a new account must be able to do something ────────────────
+
+
+def test_stimulus_is_extracted_from_every_study_shape():
+    """Audience inference is only reachable if the stimulus can be found, and
+    it is read off the request generically so a study added later inherits the
+    behaviour instead of silently losing it."""
+    from app.main import stimulus_of
+    from app.schemas import (
+        CompareRequest,
+        ContentStudyRequest,
+        ObjectionRequest,
+        SwarmRunRequest,
+        WalkRequest,
+    )
+
+    assert "buy this" in stimulus_of(SwarmRunRequest(scenario="buy this"))
+    assert "pitch text" in stimulus_of(ObjectionRequest(pitch="pitch text"))
+    assert "variant A" in stimulus_of(
+        CompareRequest(
+            variants=[
+                {"name": "A", "scenario": "variant A"},
+                {"name": "B", "scenario": "variant B"},
+            ]
+        )
+    )
+    assert "step one" in stimulus_of(WalkRequest(steps=["step one", "step two"]))
+    assert "the script" in stimulus_of(ContentStudyRequest(content="the script"))
+    # and an asset-shaped content study
+    assert "page copy" in stimulus_of(
+        ContentStudyRequest(asset={"kind": "text", "text": "page copy"})
+    )
+    # nothing to infer from → empty, so the loader raises rather than guessing
+    assert stimulus_of(SwarmRunRequest(scenario="x")) != ""
+
+
+def test_inferred_personas_are_labelled_and_never_blended():
+    """The failure worth preventing is not inference — it is inference a reader
+    mistakes for measurement. Provenance rides on the persona and is summarised
+    with every result."""
+    from app.audience import provenance_note
+    from app.persona import seed_persona
+    from app.schemas import PersonaSeed
+
+    observed = seed_persona(_signal())
+    assert observed.provenance == "observed"  # default protects stored personas
+
+    inferred = observed.model_copy(update={"provenance": "inferred"})
+    note = provenance_note([inferred, inferred])
+    assert note["provenance"] == "inferred"
+    assert "not measurements" in note["note"]
+
+    assert provenance_note([observed, observed])["provenance"] == "observed"
+    # a blend would be uninterpretable, and must announce itself loudest
+    mixed = provenance_note([observed, inferred])
+    assert mixed["provenance"] == "mixed" and mixed["inferred"] == 1
+
+
+def test_inferred_traits_still_come_from_the_transparent_rules():
+    """Inference supplies the CATEGORICAL signal; it never invents trait
+    numbers. So an inferred persona and an observed one with the same signal
+    are byte-identical in their Big Five vector — the rule table is the single
+    source of those numbers either way."""
+    from app.persona import derive_traits
+
+    sig = _signal(deliberation="high", frustration_signal="elevated")
+    a = derive_traits(sig)
+    b = derive_traits(sig)
+    assert a.model_dump() == b.model_dump()
+    assert a.conscientiousness.score > 0.5  # high deliberation moved it, per the table

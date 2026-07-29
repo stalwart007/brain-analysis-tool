@@ -303,7 +303,7 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
         </span>
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || !brief.trim() || !seed.trim() || personaCount === 0}
+          disabled={busy || !brief.trim() || !seed.trim()}
           onClick={run}
           className="ml-auto bg-accent px-5 py-2 disabled:opacity-40"
         >

@@ -179,7 +179,7 @@ export default function ContentImpactPanel({ personaCount }: { personaCount: num
         <LoadToggle value={load} onChange={setLoad} id="content-load" />
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || !!assetReady(kind, asset) || personaCount === 0}
+          disabled={busy || !!assetReady(kind, asset)}
           onClick={run}
           title={assetReady(kind, asset) ?? undefined}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"

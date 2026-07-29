@@ -90,7 +90,9 @@ export default function SwarmPanel({
       <div className="mb-4 flex items-baseline justify-between">
         <h2 className="font-display text-lg font-medium tracking-tight">Forecast response</h2>
         <span className="text-xs text-muted">
-          {personaCount} persona{personaCount === 1 ? "" : "s"} seeded
+          {personaCount > 0
+            ? `${personaCount} persona${personaCount === 1 ? "" : "s"} seeded`
+            : "no telemetry yet — audience will be inferred from your stimulus"}
         </span>
       </div>
 
@@ -181,7 +183,7 @@ export default function SwarmPanel({
 
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || !scenario.trim() || personaCount === 0}
+          disabled={busy || !scenario.trim()}
           onClick={run}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >

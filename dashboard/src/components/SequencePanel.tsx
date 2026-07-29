@@ -236,7 +236,7 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
         <LoadToggle value={load} onChange={setLoad} id="sequence-load" />
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || messages.length < 2 || personaCount === 0}
+          disabled={busy || messages.length < 2}
           onClick={run}
           className="ml-auto bg-accent px-5 py-2 disabled:opacity-40"
         >

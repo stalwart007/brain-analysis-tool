@@ -132,7 +132,7 @@ export default function FlowPanel({ personaCount }: { personaCount: number }) {
         <LoadToggle value={load} onChange={setLoad} id="flow-load" />
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || steps.length < 2 || personaCount === 0}
+          disabled={busy || steps.length < 2}
           onClick={run}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >

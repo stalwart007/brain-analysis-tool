@@ -185,6 +185,36 @@ class PersonaSeed(BaseModel):
     signal: BehavioralSignal
     traits: TraitVector
     system_prompt: str = Field(description="Rendered twin conditioning prompt.")
+    #: Where this persona came from. "observed" = derived from real behavioural
+    #: telemetry. "inferred" = proposed from the stimulus when no telemetry
+    #: existed. The distinction has to travel with the persona: a run against an
+    #: imagined audience and one against a measured audience are different
+    #: claims, and only the label stops a reader conflating them. Defaults to
+    #: observed so personas stored before this existed keep their meaning.
+    provenance: Literal["observed", "inferred"] = "observed"
+
+
+class AudienceSegment(BaseModel):
+    """One inferred audience segment. Supplies the CATEGORICAL signal only —
+    trait numbers still come from persona.derive_traits, so the Big Five vector
+    stays a documented function of a small input rather than something a model
+    was free to invent."""
+
+    label: str = Field(description="Short human name for the segment.")
+    rationale: str = Field(description="Why this stimulus reaches them, citing something concrete.")
+    likely_mindset: str = Field(description="One in-character sentence, present tense.")
+    deliberation: Literal["low", "medium", "high"]
+    frustration_signal: Literal["none", "mild", "elevated"]
+    exploration_style: Literal["scanner", "reader", "goal_directed", "wandering"]
+    price_sensitivity_signal: Literal["unknown", "low", "medium", "high"]
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="How strongly the stimulus supports this segment existing. Reading copy, not data.",
+    )
+
+
+class AudienceInference(BaseModel):
+    segments: list[AudienceSegment] = Field(description="3-5 behaviourally distinct segments.")
 
 
 # ---------------------------------------------------------------- swarm

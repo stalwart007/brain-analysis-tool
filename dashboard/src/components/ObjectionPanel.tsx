@@ -135,7 +135,7 @@ export default function ObjectionPanel({ personaCount }: { personaCount: number 
         <LoadToggle value={load} onChange={setLoad} id="objection-load" />
         <motion.button
           whileTap={{ scale: 0.97 }}
-          disabled={busy || !pitch.trim() || personaCount === 0}
+          disabled={busy || !pitch.trim()}
           onClick={run}
           className="ml-auto rounded-xl bg-accent px-5 py-2 font-display text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-40"
         >
