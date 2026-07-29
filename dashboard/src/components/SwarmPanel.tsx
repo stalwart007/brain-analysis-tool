@@ -16,6 +16,7 @@ import { SwarmAggregate } from "@/lib/api";
 import { streamSwarm } from "@/lib/stream";
 import { useEntranceEnabled } from "./Reveal";
 import { CIStat, ConsensusBadge, SegmentsPanel } from "./StatReadouts";
+import AudiencePanel, { type Persona } from "./AudiencePanel";
 
 // 3D network is lazy — kept out of the initial dashboard bundle.
 const SwarmNetwork = dynamic(() => import("./SwarmNetwork"), { ssr: false });
@@ -40,6 +41,7 @@ export default function SwarmPanel({
   const [scenario, setScenario] = useState("");
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<(typeof LOADS)[number]>("low");
+  const [audience, setAudience] = useState<Persona[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SwarmAggregate | null>(null);
@@ -52,7 +54,7 @@ export default function SwarmPanel({
     setResult(null);
     setLive({ total: personaCount * twins, verdicts: [] });
     try {
-      await streamSwarm({ scenario, twins_per_persona: twins, cognitive_load: load }, (evt) => {
+      await streamSwarm({ scenario, twins_per_persona: twins, cognitive_load: load, personas: audience }, (evt) => {
         if (evt.type === "start") {
           setLive({ total: evt.total, verdicts: [] });
         } else if (evt.type === "agent") {
@@ -95,6 +97,14 @@ export default function SwarmPanel({
             : "no telemetry yet — audience will be inferred from your stimulus"}
         </span>
       </div>
+
+      <AudiencePanel
+        stimulus={scenario}
+        personas={audience}
+        onChange={setAudience}
+        observedCount={personaCount}
+        disabled={busy}
+      />
 
       {/* live swarm network — appears while running and stays to show verdicts */}
       <AnimatePresence>

@@ -39,13 +39,14 @@ from fastapi.staticfiles import StaticFiles
 
 from . import jobs, storage
 from .config import MAX_TWINS_PER_RUN, REPO_ROOT
-from .audience import infer_audience, provenance_note
+from .audience import compose_audience, infer_audience, provenance_note
 from .oai import Refusal
 from .persona import seed_persona
 from .cognition import full_cognitive_profile, iter_cognitive_profile
 from .profiler import profile_features
 from .schemas import (
     ActualsPayload,
+    AudienceComposeRequest,
     CalibrationReport,
     CompareRequest,
     FeaturePayload,
@@ -567,8 +568,17 @@ def _enforce_budget(personas: list[PersonaSeed], request) -> None:
 
 
 async def _load_personas(
-    session_ids: list[str], caller: Caller, stimulus: str = ""
+    session_ids: list[str],
+    caller: Caller,
+    stimulus: str = "",
+    supplied: Optional[list[PersonaSeed]] = None,
 ) -> list[PersonaSeed]:
+    # A panel the researcher curated wins over everything. They have already
+    # seen it and shaped it; reconstructing an audience per run would silently
+    # replace the thing they approved, and two runs of "the same" study would
+    # not be comparable.
+    if supplied:
+        return supplied
     candidates = (
         [storage.get_session(sid, site_id=caller.site_id) for sid in session_ids]
         if session_ids
@@ -673,7 +683,10 @@ def _llm_errors(exc: Exception) -> HTTPException:
 
 @app.post("/v1/swarm/run")
 async def swarm_run(caller: CallerDep, request: SwarmRunRequest) -> dict:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     try:
         aggregate = await run_swarm(
@@ -726,7 +739,10 @@ def _sse(generator, request_model, kind: str, caller: Caller) -> StreamingRespon
 
 @app.post("/v1/swarm/stream")
 async def swarm_stream(caller: CallerDep, request: SwarmRunRequest) -> StreamingResponse:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(
         stream_swarm(
@@ -743,7 +759,10 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(
         stream_compare(
@@ -761,7 +780,10 @@ async def compare_stream(caller: CallerDep, request: CompareRequest) -> Streamin
 
 @app.post("/v1/swarm/walk/stream")
 async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingResponse:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(
         stream_walkthrough(
@@ -775,7 +797,10 @@ async def walk_stream(caller: CallerDep, request: WalkRequest) -> StreamingRespo
 
 @app.post("/v1/studies/price/stream")
 async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> StreamingResponse:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(
         stream_price_sensitivity(
@@ -793,7 +818,10 @@ async def price_stream(caller: CallerDep, request: PriceSensitivityRequest) -> S
 
 @app.post("/v1/studies/objection/stream")
 async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> StreamingResponse:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(
         stream_objection_scan(
@@ -809,7 +837,10 @@ async def objection_stream(caller: CallerDep, request: ObjectionRequest) -> Stre
 async def virality_stream(caller: CallerDep, request: ViralityRequest) -> StreamingResponse:
     """Virality forecast: Galton-Watson branching process over twin share
     intents — R0, extinction probability, seeded cascade quantile bands."""
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(stream_virality(personas, request), request, "virality", caller)
 
@@ -818,7 +849,10 @@ async def virality_stream(caller: CallerDep, request: ViralityRequest) -> Stream
 async def content_stream(caller: CallerDep, request: ContentStudyRequest) -> StreamingResponse:
     """Neuro-impact study: beat-by-beat audience response with ISC,
     change-point, peak-end memory, and functional-system mapping."""
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(stream_content_study(personas, request), request, "content", caller)
 
@@ -829,7 +863,10 @@ async def optimize_stream(caller: CallerDep, request: CopyOptimizerRequest) -> S
     populations, Thompson-allocated budget within each generation, LLM crossover
     and mutation between them, and a win claimed only when the champion's
     credible interval clears the seed's."""
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(stream_copy_optimizer(personas, request), request, "optimize", caller)
 
@@ -840,7 +877,10 @@ async def sequence_stream(caller: CallerDep, request: SequenceRequest) -> Stream
     matrix from a sampled subset of the N! orderings, then solves the linear
     ordering problem heuristically for the ordering that ends with the most
     intent — reporting primacy/recency separately from message strength."""
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     return _sse(stream_sequence(personas, request), request, "sequence", caller)
 
@@ -850,7 +890,10 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
     names = [v.name for v in request.variants]
     if len(set(names)) != len(names):
         raise HTTPException(status_code=400, detail="Variant names must be unique.")
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     try:
         compared = await run_compare(
@@ -871,7 +914,10 @@ async def swarm_compare(caller: CallerDep, request: CompareRequest) -> dict:
 
 @app.post("/v1/swarm/walk")
 async def swarm_walk(caller: CallerDep, request: WalkRequest) -> dict:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     try:
         aggregate = await run_walkthrough(
@@ -900,7 +946,10 @@ def swarm_runs(caller: CallerDep, kind: Optional[str] = None) -> list[dict]:
 
 @app.post("/v1/studies/price")
 async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> dict:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     try:
         result = await run_price_sensitivity(
@@ -922,7 +971,10 @@ async def study_price(caller: CallerDep, request: PriceSensitivityRequest) -> di
 
 @app.post("/v1/studies/objection")
 async def study_objection(caller: CallerDep, request: ObjectionRequest) -> dict:
-    personas = await _load_personas(request.session_ids, caller, stimulus_of(request))
+    personas = await _load_personas(
+        request.session_ids, caller, stimulus_of(request),
+        supplied=getattr(request, "personas", None),
+    )
     _enforce_budget(personas, request)
     try:
         result = await run_objection_scan(
@@ -960,6 +1012,37 @@ def validation_report(caller: CallerDep) -> CalibrationReport:
     return calibration_report(
         storage.list_swarm_runs(limit=500, kind="swarm", site_id=caller.site_id)
     )
+
+
+# ------------------------------------------------------------------ audience
+
+
+@app.post("/v1/audience/compose")
+async def audience_compose(caller: CallerDep, request: AudienceComposeRequest) -> dict:
+    """Build or refine an audience panel from a plain-language instruction.
+
+    Returns the FULL resulting panel, not a diff — a diff would need merge
+    rules, and every one of those is a place for the panel the researcher sees
+    to drift from the panel that actually runs.
+
+    Everything returned is `inferred`, including segments the researcher asked
+    for by name: asserting a segment exists is a stated assumption, not
+    evidence, and marking it observed because a human typed it is exactly the
+    confusion provenance exists to prevent.
+    """
+    try:
+        if request.instruction.strip():
+            personas = await compose_audience(
+                request.stimulus, request.instruction, request.existing
+            )
+        else:
+            personas = await infer_audience(request.stimulus)
+    except (openai.OpenAIError, Refusal, RuntimeError, ValueError) as exc:
+        raise _llm_errors(exc) from exc
+    return {
+        "personas": [p.model_dump() for p in personas],
+        "provenance": provenance_note(personas),
+    }
 
 
 # ------------------------------------------------------------------ jobs (Phase 3)

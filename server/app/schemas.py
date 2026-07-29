@@ -213,6 +213,22 @@ class AudienceSegment(BaseModel):
     )
 
 
+class AudienceComposeRequest(BaseModel):
+    """Build or refine an audience panel from a plain-language instruction."""
+
+    stimulus: str = Field(min_length=1, max_length=20_000)
+    instruction: str = Field(
+        default="",
+        max_length=1_000,
+        description="What to change, e.g. 'add price-conscious students'. Empty = infer from scratch.",
+    )
+    existing: list["PersonaSeed"] = Field(
+        default_factory=list,
+        max_length=8,
+        description="The panel to refine. The FULL resulting panel is returned.",
+    )
+
+
 class AudienceInference(BaseModel):
     segments: list[AudienceSegment] = Field(description="3-5 behaviourally distinct segments.")
 
@@ -319,6 +335,10 @@ class ScenarioVariant(BaseModel):
 class CompareRequest(BaseModel):
     variants: list[ScenarioVariant] = Field(min_length=2, max_length=8)
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
     adaptive: bool = Field(
@@ -369,6 +389,10 @@ class WalkRequest(BaseModel):
         description="The flow, one described step per entry (screen, section, or moment).",
     )
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=2, ge=1, le=10)
     cognitive_load: Literal["low", "medium", "high"] = "low"
 
@@ -477,6 +501,10 @@ class PriceSensitivityRequest(BaseModel):
         min_length=2, max_length=8, description="Candidate price points to test."
     )
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
 
@@ -590,6 +618,10 @@ class ContentStudyRequest(BaseModel):
     content_type: Literal["video_script", "ad_copy", "article", "storyboard"] = "video_script"
     asset: Optional[ContentAsset] = None
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
 
@@ -622,6 +654,10 @@ class ViralityRequest(BaseModel):
     content: str = Field(min_length=20, description="The shareable asset (post, ad, video script).")
     fanout: int = Field(default=6, ge=1, le=25, description="Contacts exposed per sharer (k).")
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
 
@@ -634,6 +670,10 @@ class TwinShare(BaseModel):
 class ObjectionRequest(BaseModel):
     pitch: str = Field(min_length=1, description="The claim / pitch / copy to stress-test.")
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
 
@@ -719,6 +759,10 @@ class CopyOptimizerRequest(BaseModel):
     population_size: int = Field(default=4, ge=2, le=8)
     generations: int = Field(default=3, ge=1, le=5)
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=2, ge=1, le=10)
     cognitive_load: Literal["low", "medium", "high"] = "low"
     min_evals_per_variant: int = Field(
@@ -777,6 +821,10 @@ class SequenceRequest(BaseModel):
         ),
     )
     session_ids: list[str] = Field(default_factory=list)
+    #: A curated panel, supplied directly. Takes precedence over session_ids
+    #: and over inference, so a researcher who has shaped an audience gets
+    #: exactly that audience rather than one reconstructed per run.
+    personas: list[PersonaSeed] = Field(default_factory=list, max_length=8)
     twins_per_persona: int = Field(default=3, ge=1, le=20)
     cognitive_load: Literal["low", "medium", "high"] = "low"
     orderings_sampled: int = Field(

@@ -97,7 +97,14 @@ export type SwarmStreamEvent =
   | { type: "error"; detail: string };
 
 export async function streamSwarm(
-  body: { scenario: string; twins_per_persona: number; cognitive_load: string },
+  body: {
+    scenario: string;
+    twins_per_persona: number;
+    cognitive_load: string;
+    /** A curated panel. Empty lets the server choose: observed telemetry
+     *  if any exists, otherwise an audience inferred from the scenario. */
+    personas?: unknown[];
+  },
   onEvent: (evt: SwarmStreamEvent) => void
 ): Promise<void> {
   await streamRun("/swarm/stream", body, (e) => onEvent(e as unknown as SwarmStreamEvent));

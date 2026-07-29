@@ -549,3 +549,41 @@ def test_inferred_traits_still_come_from_the_transparent_rules():
     b = derive_traits(sig)
     assert a.model_dump() == b.model_dump()
     assert a.conscientiousness.score > 0.5  # high deliberation moved it, per the table
+
+
+def test_a_curated_panel_wins_over_telemetry_and_inference():
+    """A researcher who has shaped an audience gets exactly that audience.
+    Reconstructing one per run would silently replace what they approved, and
+    two runs of 'the same' study would not be comparable."""
+    import asyncio
+
+    from app.main import Caller, _load_personas
+    from app.persona import seed_persona
+
+    curated = [seed_persona(_signal(segment_label="curated-only"))]
+    got = asyncio.run(
+        _load_personas([], Caller(), stimulus="an ad", supplied=curated)
+    )
+    assert len(got) == 1 and got[0].label == curated[0].label
+
+
+def test_the_compose_endpoint_is_authenticated(monkeypatch):
+    """It spends an LLM call, so it belongs behind the same gate as everything
+    else that costs money.
+
+    Uses monkeypatch, NOT os.environ. An earlier version of this test popped
+    COGNISWARM_ALLOW_ANONYMOUS and never restored it, so every test that ran
+    afterwards saw neither that nor COGNISWARM_API_KEYS and got the fail-closed
+    503 — three unrelated failures in validation and sequence, none of which
+    had anything wrong with them.
+    """
+    c = _client_with_keys(monkeypatch, "k-compose")
+    assert c.post("/v1/audience/compose", json={"stimulus": "an ad"}).status_code == 401
+    # and a valid key gets past auth (the LLM call itself fails without a key,
+    # which is a 502/503 — the point here is that it is no longer a 401)
+    r = c.post(
+        "/v1/audience/compose",
+        headers={"X-API-Key": "k-compose"},
+        json={"stimulus": "an ad"},
+    )
+    assert r.status_code != 401
