@@ -29,10 +29,17 @@ That distinction is the whole reason this file exists rather than a `str`
 conversion. A number computed on the wrong axis is not slightly wrong; it is a
 category error wearing a decimal point.
 
-SECURITY: nothing here fetches a URL. Server-side fetching of caller-supplied
-URLs is an SSRF primitive — it would let anyone with an API key read the
-metadata service, the private backend, or anything else reachable from inside
-the network. Callers supply bytes or text; the browser can fetch its own.
+SECURITY: nothing here fetches a URL, and `ContentAsset` has no url field.
+Server-side fetching of caller-supplied URLs is an SSRF primitive — it would
+let anyone with an API key read the metadata service, the private backend, or
+anything else reachable from inside the network.
+
+A landing page is the one case the browser cannot fetch for itself, because
+cross-origin reads are blocked. That goes through `app.fetching`, which refuses
+any URL not resolving to a publicly routable address, and returns extracted
+prose rather than the page. It is a separate module and a separate endpoint on
+purpose: there is exactly one place in this service that opens an outbound
+connection to an address a caller chose, and it should stay countable.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ import base64
 import binascii
 import re
 from enum import Enum
+from html import unescape
 from typing import Literal, Optional
 
 import openai
@@ -354,13 +362,98 @@ async def _beats_from_audio(asset: ContentAsset) -> BeatSequence:
 
 # ── page / document / text ───────────────────────────────────────────────
 
+#: `header` and `footer` used to be in this list, and `div` still is. Measured
+#: against real sites, that produced beats like "Products Solutions Developers
+#: Resources Pricing Sign in Start now Contact sales" — Stripe's navigation bar,
+#: read as though it were the opening moment of the page. Linear and Vercel gave
+#: the same. A study over those beats reports how an audience feels about a
+#: MENU, with confidence intervals, which is worse than reporting nothing.
+#:
+#: `div` stays because a great many pages wrap real copy in nothing else, but
+#: chrome is now stripped first and blocks must read as prose (`_is_prose`).
 _TAG_BLOCK = re.compile(
-    r"<(h[1-6]|section|article|header|footer|main|div|p|li)\b[^>]*>(.*?)</\1>",
+    r"<(h[1-6]|section|article|main|div|p|li)\b[^>]*>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
 )
+
+#: Site furniture — but only the parts that are UNAMBIGUOUSLY furniture.
+#:
+#: `header` and `footer` were in this list and had to come out. On a real site
+#: `<header>` is usually the nav bar, but it is also the correct HTML5 element
+#: for a hero — headline, subhead, call to action — which is the single most
+#: important beat on a landing page. Stripping it wholesale threw away the hero
+#: to remove the menu, and a page study missing its opening is not a page study.
+#: `<footer>` similarly carries real social proof.
+#:
+#: So only `nav`, `menu`, `dialog` and the matching ARIA roles are removed
+#: structurally, and link-label soup is caught by `_is_prose` on its content
+#: instead of by its container. Judging a block by what it SAYS survives a
+#: hero in a `<header>`; judging it by its wrapper does not.
+_CHROME = re.compile(
+    r"""<(nav|menu|dialog)\b.*?</\1>
+      |<(\w+)\b[^>]*?role\s*=\s*["'](?:navigation|menu|menubar|dialog|search)["'].*?</\2>""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+#: Does this block read like something a person wrote to be read, or like a
+#: list of link labels? Navigation survives tag-stripping as a run of short
+#: Title Case fragments with no sentence in it, so that is what this tests.
+def _is_prose(text: str, inner_html: str = "") -> bool:
+    words = text.split()
+    if len(words) < 8:
+        return False
+
+    # What is left once the links are removed. A menu is links and nothing
+    # else; a hero is a headline that happens to sit beside two buttons.
+    #
+    # A link-DENSITY ratio was tried first and was wrong: at 0.6 it correctly
+    # rejected Stripe's secondary nav and then also rejected Stripe's hero,
+    # because "Financial infrastructure to grow your revenue" shares a wrapper
+    # with "Start now" and "Contact sales". The ratio punishes a block for
+    # having calls to action, which every landing page hero has by design.
+    # Asking whether real copy exists OUTSIDE the links separates the two
+    # cleanly and needs no threshold tuning.
+    if inner_html:
+        outside = _WS.sub(" ", _TAGS.sub(" ", _ANCHORS.sub(" ", inner_html))).strip()
+        if len(outside) < 40:
+            return False
+
+    # A sentence mark is the strongest single signal, but a headline legitimately
+    # has none — so a long block with normal lower-case flow also qualifies.
+    has_sentence = any(mark in text for mark in (". ", "! ", "? ", ", "))
+    lowercase = sum(1 for w in words if w[:1].islower())
+    # Nav items are overwhelmingly capitalised; prose is mostly not.
+    return has_sentence or lowercase / len(words) > 0.5
 _TAGS = re.compile(r"<[^>]+>")
+#: Whole anchor elements, removed to see what copy a block has of its own.
+_ANCHORS = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
 _WS = re.compile(r"\s+")
-_DROPPED = re.compile(r"<(script|style|noscript|svg)\b.*?</\1>", re.IGNORECASE | re.DOTALL)
+_DROPPED = re.compile(
+    r"<(script|style|noscript|svg|template)\b.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+
+#: Content the visitor never sees. Dropping it is an ANALYSIS correctness fix
+#: before it is a security one: a closed nav menu, a cookie modal, tab panels
+#: behind other tabs and screen-reader-only text are all in the markup on
+#: arrival, and counting them as beats means reporting an audience reaction to
+#: something nobody looked at.
+#:
+#: It also happens to remove the classic prompt-injection vector, since text
+#: planted for a scraper is planted where a human will not see it. That is a
+#: side effect, not the defence — the real bound is that twin output is a
+#: structured appraisal object per beat, so hostile copy can skew the numbers
+#: it was measured on but cannot change what this service does.
+#:
+#: Regex over HTML is approximate and nesting will defeat it in places. It is
+#: the same approximation the extractor above already makes, and the failure
+#: mode is a beat that should have been dropped, not a crash.
+_HIDDEN = re.compile(
+    r"""<(div|section|p|li|span|aside|nav|header|footer)\b[^>]*?
+        (?:\shidden(?:\s|=|>)|aria-hidden\s*=\s*["']true["']
+          |style\s*=\s*["'][^"']*?(?:display\s*:\s*none|visibility\s*:\s*hidden)
+        )[^>]*>.*?</\1>""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
 
 
 def _beats_from_page(asset: ContentAsset) -> BeatSequence:
@@ -372,12 +465,21 @@ def _beats_from_page(asset: ContentAsset) -> BeatSequence:
     """
     if not asset.text:
         raise UnsupportedAsset("a page asset needs its HTML or extracted text")
-    html = _DROPPED.sub(" ", asset.text)
+    # Order matters: unrenderable tags, then hidden content, then site
+    # furniture. Stripping chrome last would leave a nav whose wrapper was
+    # already consumed as a block.
+    html = _CHROME.sub(" ", _HIDDEN.sub(" ", _DROPPED.sub(" ", asset.text)))
     blocks: list[str] = []
     for _tag, inner in _TAG_BLOCK.findall(html):
-        text = _WS.sub(" ", _TAGS.sub(" ", inner)).strip()
-        # Drop chrome and fragments: a nav link is not a beat.
-        if len(text) >= 40 and text not in blocks:
+        # Entities are decoded here, not left as written. python.org's code
+        # samples came through as `&#39;` and `&gt;&gt;&gt;`, and a twin asked
+        # to react to a beat containing raw entity references is reacting to
+        # markup rather than to the page.
+        text = unescape(_WS.sub(" ", _TAGS.sub(" ", inner))).strip()
+        text = _WS.sub(" ", text)
+        # Drop chrome and fragments: a nav link is not a beat, and neither is
+        # a run of them that happened to share a wrapper.
+        if len(text) >= 40 and _is_prose(text, inner) and text not in blocks:
             blocks.append(text)
     if len(blocks) < MIN_BEATS:
         # Not HTML, or HTML with no prose — fall through to the text path
@@ -473,6 +575,35 @@ def _sentence_beats(text: str) -> list[str]:
 # ── entry point ──────────────────────────────────────────────────────────
 
 Kind = Literal["text", "image", "video", "audio", "page", "document"]
+
+
+def visible_text_length(html: str) -> int:
+    """Roughly how much readable prose a page carries, after stripping.
+
+    Used to tell two failures apart. Measured on the STRIPPED document, not the
+    raw one: a modern marketing page is mostly inlined JavaScript, so counting
+    characters before `_DROPPED` runs reports a JS-rendered shell as text-rich
+    and produces exactly the wrong advice.
+    """
+    stripped = _CHROME.sub(" ", _HIDDEN.sub(" ", _DROPPED.sub(" ", html)))
+    return len(_WS.sub(" ", _TAGS.sub(" ", stripped)).strip())
+
+
+def preview_page(asset: ContentAsset) -> list[str]:
+    """The sections a fetched page yields, without spending a model call.
+
+    Shown to the researcher before the study runs so they can see the page was
+    read the way they expect. `_beats_from_page` is purely structural — DOM
+    order, no model — so this is exactly what the study will consume, not an
+    approximation of it. Raises `UnsupportedAsset` when there is no prose to
+    find, which is the single-page-app case worth naming explicitly.
+
+    Returned in full. Truncating here for display would be a quiet data loss,
+    because the caller submits these same strings back as the study body —
+    blocks are already capped at 400 characters upstream. Shortening for the
+    eye is the UI's job.
+    """
+    return _beats_from_page(asset).beats
 
 
 async def extract_beats(asset: ContentAsset) -> BeatSequence:

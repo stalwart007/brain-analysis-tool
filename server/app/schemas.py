@@ -213,6 +213,19 @@ class AudienceSegment(BaseModel):
     )
 
 
+class PageFetchRequest(BaseModel):
+    """Resolve a URL to markup so a researcher can paste a link, not HTML.
+
+    This is the ONE place a caller-supplied URL is accepted, and it stays
+    separate from `ContentAsset` on purpose: the asset model remains
+    URL-free, so no other code path can grow a fetch by accident. Everything
+    dangerous about it is handled in `app.fetching`, which refuses anything
+    that does not resolve to a publicly routable address.
+    """
+
+    url: str = Field(min_length=4, max_length=2048)
+
+
 class AudienceComposeRequest(BaseModel):
     """Build or refine an audience panel from a plain-language instruction."""
 

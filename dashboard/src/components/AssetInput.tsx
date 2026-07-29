@@ -6,13 +6,18 @@
  * Everything here happens in the BROWSER, including video keyframe extraction.
  * That is a deliberate boundary, not a shortcut: decoding caller-supplied
  * media server-side means running a decoder on untrusted input, which is a
- * large and historically hostile attack surface, and the API deliberately has
- * no `url` field because fetching a caller-supplied URL server-side is an SSRF
- * primitive. The browser already has a video decoder and already has
- * permission to read the user's own files.
+ * large and historically hostile attack surface. The browser already has a
+ * video decoder and already has permission to read the user's own files.
+ *
+ * The one exception is a landing page URL, which the browser CANNOT fetch —
+ * cross-origin reads are blocked, and no amount of wanting changes that. So
+ * that single case goes through `POST /v1/content/fetch`, which is guarded
+ * against SSRF rather than being refused outright. `ContentAsset` still has no
+ * `url` field: the fetch is its own step, and what comes back is submitted as
+ * ordinary `page` text.
  */
 
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 
 export type AssetKind = "text" | "image" | "video" | "audio" | "page" | "document";
 
@@ -38,7 +43,7 @@ export const KINDS: { id: AssetKind; label: string; hint: string }[] = [
   { id: "image", label: "Image", hint: "a static ad, poster, banner, screenshot" },
   { id: "video", label: "Video", hint: "keyframes are extracted here in your browser" },
   { id: "audio", label: "Audio", hint: "a transcript, with timings if you have them" },
-  { id: "page", label: "Landing page", hint: "paste the page HTML" },
+  { id: "page", label: "Landing page", hint: "paste a link — we read the page for you" },
   { id: "document", label: "Deck / document", hint: "one block per slide or page" },
 ];
 
@@ -251,13 +256,172 @@ export function AssetInput({
     );
   }
 
+  if (kind === "page") {
+    return (
+      <PageInput asset={asset} onChange={onChange} textarea={textarea} />
+    );
+  }
+
   return textarea(
-    kind === "page"
-      ? "Paste the page HTML. Sections are read in DOM order — the order a scroller meets them."
-      : "Paste a video script, storyboard, ad copy, or article.",
+    "Paste a video script, storyboard, ad copy, or article.",
     asset.text ?? "",
     (v) => onChange({ ...asset, text: v }),
-    kind === "page" ? 8 : 6
+    6
+  );
+}
+
+/**
+ * A landing page, from a link.
+ *
+ * The obvious version of this screen asked for HTML, which meant telling a
+ * researcher to open DevTools and copy `outerHTML`. Nobody does that. They
+ * paste a link, so this pastes a link — the server fetches it behind an SSRF
+ * guard and hands back the markup.
+ *
+ * The fetch is a SEPARATE step from the study on purpose. It shows what came
+ * back — the final URL after redirects, and the actual sections found — before
+ * any twin calls are spent. A study that silently ran against a cookie wall is
+ * worse than one that refused, because it produces numbers that look fine.
+ *
+ * Pasting HTML directly still works, for pages behind a login.
+ */
+function PageInput({
+  asset,
+  onChange,
+  textarea,
+}: {
+  asset: ContentAsset;
+  onChange: (a: ContentAsset) => void;
+  textarea: (ph: string, value: string, set: (v: string) => void, rows?: number) => ReactNode;
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fetched, setFetched] = useState<{
+    final_url: string;
+    hops: string[];
+    sections: string[];
+  } | null>(null);
+  const [manual, setManual] = useState(false);
+
+  async function load() {
+    const target = url.trim();
+    if (!target) return;
+    setBusy(true);
+    setError(null);
+    setFetched(null);
+    try {
+      const res = await fetch("/api/cs/content/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Sent as typed. Adding a scheme here would mean guessing https for a
+        // host that only serves http and reporting the wrong failure.
+        body: JSON.stringify({ url: target }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.detail ?? `Could not fetch that page (${res.status})`);
+      setFetched({ final_url: data.final_url, hops: data.hops ?? [], sections: data.sections ?? [] });
+      // The server returns extracted prose, not the page: real marketing HTML
+      // runs to megabytes and would blow the asset's text limit.
+      onChange({ ...asset, text: data.text });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not fetch that page");
+      onChange({ ...asset, text: "" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const redirected = fetched && fetched.hops.length > 1;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="url"
+          inputMode="url"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (!busy && url.trim()) load();
+            }
+          }}
+          disabled={busy}
+          placeholder="https://yourproduct.com/landing"
+          aria-label="Landing page URL"
+          className="min-w-56 flex-1 rounded-lg border border-hairline bg-surface-2 px-3 py-2 text-sm outline-none placeholder:text-muted focus:border-accent/60 disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={load}
+          disabled={busy || !url.trim()}
+          className="rounded-lg border border-hairline px-3 py-2 text-xs text-ink-2 transition hover:border-accent/50 hover:text-ink disabled:opacity-40"
+        >
+          {busy ? "fetching…" : "fetch page"}
+        </button>
+      </div>
+
+      {error && (
+        <p className="text-[11px] leading-relaxed text-critical">
+          {error}{" "}
+          <button type="button" onClick={() => setManual(true)} className="underline hover:text-ink">
+            paste the HTML instead
+          </button>
+        </p>
+      )}
+
+      {fetched && (
+        <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
+          <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
+            <span className="text-good">✓ {fetched.sections.length} sections</span>
+            {/* Where we ENDED UP, which is not always where they pointed —
+                an apex that lands on a regional or consent URL is a different
+                page from the one they meant to study. */}
+            <span className="truncate text-muted">{fetched.final_url}</span>
+            {redirected && (
+              <span className="text-accent-2">· redirected {fetched.hops.length - 1}×</span>
+            )}
+          </div>
+          <ol className="mt-1.5 space-y-0.5">
+            {fetched.sections.slice(0, 4).map((s, i) => (
+              <li key={i} className="truncate text-[11px] leading-snug text-ink-2">
+                <span className="mr-1 font-mono text-[9px] text-muted">{i + 1}</span>
+                {s}
+              </li>
+            ))}
+            {fetched.sections.length > 4 && (
+              <li className="font-mono text-[9px] text-muted">
+                +{fetched.sections.length - 4} more
+              </li>
+            )}
+          </ol>
+          <p className="mt-1.5 font-mono text-[9px] leading-relaxed text-muted">
+            In DOM order — the order a scroller meets them. Hidden elements and
+            unopened menus are excluded, so this is what a visitor sees.
+          </p>
+        </div>
+      )}
+
+      {!fetched && !error && !manual && (
+        <p className="font-mono text-[10px] leading-relaxed text-muted">
+          Paste a link and we read the page for you.{" "}
+          <button type="button" onClick={() => setManual(true)} className="underline hover:text-ink-2">
+            or paste HTML
+          </button>{" "}
+          — for pages behind a login.
+        </p>
+      )}
+
+      {(manual || (asset.text ?? "").length > 0) &&
+        textarea(
+          "Paste the page HTML. Sections are read in DOM order.",
+          asset.text ?? "",
+          (v) => onChange({ ...asset, text: v }),
+          fetched ? 4 : 8
+        )}
+    </div>
   );
 }
 

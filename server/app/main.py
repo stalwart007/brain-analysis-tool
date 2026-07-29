@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import json
+from html import escape as html_escape
 
 import openai
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -40,6 +41,8 @@ from fastapi.staticfiles import StaticFiles
 from . import jobs, storage
 from .config import MAX_TWINS_PER_RUN, REPO_ROOT
 from .audience import compose_audience, infer_audience, provenance_note
+from .fetching import FetchFailed, UnsafeURL, fetch_page
+from .modality import UnsupportedAsset, preview_page, visible_text_length
 from .oai import Refusal
 from .persona import seed_persona
 from .cognition import full_cognitive_profile, iter_cognitive_profile
@@ -60,8 +63,10 @@ from .schemas import (
 from .neuro import stream_content_study
 from .optimizer import stream_copy_optimizer
 from .schemas import (
+    ContentAsset,
     ContentStudyRequest,
     CopyOptimizerRequest,
+    PageFetchRequest,
     ObjectionRequest,
     PriceSensitivityRequest,
     SequenceRequest,
@@ -1042,6 +1047,85 @@ async def audience_compose(caller: CallerDep, request: AudienceComposeRequest) -
     return {
         "personas": [p.model_dump() for p in personas],
         "provenance": provenance_note(personas),
+    }
+
+
+# ------------------------------------------------------------------ page fetch
+
+
+@app.post("/v1/content/fetch")
+async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
+    """Turn a pasted URL into markup the `page` modality can study.
+
+    Deliberately a SEPARATE step from running the study rather than a `url`
+    field on the asset. Three reasons, in order of how much they matter:
+
+    1. The researcher sees what was actually retrieved — the final URL after
+       redirects and how many sections were found — BEFORE spending twin calls
+       on it. A study that silently ran against a cookie wall is worse than one
+       that refused, because it produces numbers.
+    2. `ContentAsset` keeps its no-URL guarantee, so no other endpoint can grow
+       a server-side fetch without coming through here.
+    3. The failure modes are completely different. "That host is not reachable"
+       and "the model refused" want different messages, and folding them into
+       one call means reporting a network problem as an analysis problem.
+
+    Returns the HTML for the client to submit back as a normal `page` asset.
+    """
+    try:
+        fetched = await fetch_page(request.url)
+    except UnsafeURL as exc:
+        # 400, not 403: the caller is authenticated and permitted, the URL is
+        # the thing that is wrong, and they can fix it by pasting another one.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FetchFailed as exc:
+        # 502: we are reporting someone else's failure, not our own.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        sections = preview_page(ContentAsset.model_construct(kind="page", text=fetched.html))
+    except UnsupportedAsset as exc:
+        # Reached and read, but no prose came out.
+        #
+        # This deliberately does NOT diagnose why. Two heuristics were tried —
+        # an absolute character threshold and a prose-to-markup ratio — and
+        # both misclassified real sites in both directions: tailwindcss.com
+        # SUCCEEDS at a lower prose ratio (0.008) than stripe.com FAILS at
+        # (0.014), because what matters is not how much text a page has but
+        # whether any of it sits in blocks long enough to be a beat. Guessing
+        # "your page uses JavaScript" and being wrong sends someone to fix
+        # something that is not broken.
+        #
+        # So it reports the measurement and the options, and lets the person
+        # looking at their own page draw the conclusion.
+        visible = visible_text_length(fetched.html)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{exc}. We reached the page and found {visible:,} characters of "
+                "readable text, but not two sections long enough to read as "
+                "separate beats — which is usual for pages that build their copy "
+                "in the browser. Paste the copy as a script, or upload a "
+                "screenshot and study it as an image."
+            ),
+        ) from exc
+
+    # Send back the EXTRACTED PROSE, not the page.
+    #
+    # Returning raw HTML for the client to submit was wrong twice over. It blew
+    # ContentAsset's 200 kB text limit on every real marketing site tested —
+    # Stripe, Notion, Vercel and Tailwind all failed with an unhandled
+    # ValidationError, which is to say the feature did not work on the web —
+    # and it round-tripped a hostile document through the browser for no
+    # reason. Escaped and re-wrapped, the payload is a few kB of the same text
+    # the study will actually consume, and the researcher can edit it.
+    body = "\n".join(f"<p>{html_escape(s)}</p>" for s in sections)
+    return {
+        "text": body,
+        "final_url": fetched.final_url,
+        "hops": list(fetched.hops),
+        "bytes": fetched.bytes_read,
+        "sections": sections,
     }
 
 
