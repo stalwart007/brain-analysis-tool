@@ -1397,6 +1397,50 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
                     "in your browser."
                 ),
             )
+
+        # ── the bottom rung: the thumbnail ──────────────────────────────
+        #
+        # Reached whenever InnerTube refused us and only the public preview
+        # survived — which, measured from Fly, is the COMMON case rather than an
+        # edge one. Answered as an ordinary image study of the thumbnail rather
+        # than as a video study with nothing in it, because that is what it
+        # actually is, and returning `kind: video` here would fail downstream on
+        # "a video asset needs keyframes" after the researcher had been told the
+        # link was read successfully.
+        if rung == "metadata":
+            envelope = manifest_envelope(manifest, cues, frames)
+            try:
+                hero = await fetch_url(manifest.thumbnail_url, kinds=("image",))
+            except (UnsafeURL, FetchFailed) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"YouTube would not describe '{manifest.title}' to this "
+                        f"server and its thumbnail could not be fetched either "
+                        f"({exc}). Download the video and upload it instead."
+                    ),
+                ) from exc
+            return {
+                "kind": "image",
+                "final_url": manifest.watch_url,
+                "hops": [request.url],
+                "bytes": hero.bytes_read,
+                "content_type": hero.content_type,
+                "rung": "metadata",
+                "youtube": envelope,
+                "asset": {
+                    "kind": "image",
+                    "image_b64": base64.b64encode(hero.content).decode("ascii"),
+                    "media_type": hero.content_type,
+                    "brief": (
+                        f'YouTube thumbnail for "{manifest.title}"'
+                        + (f" by {manifest.author}" if manifest.author else "")
+                        + ". The video itself could not be read."
+                    ),
+                },
+                "note": envelope["note"],
+            }
+
         return {
             # Declared as a video whatever rung it lands on, so the client's
             # kind check passes and the ladder is reported in `youtube.rung`

@@ -193,9 +193,13 @@ class VideoManifest:
     chapters: list[dict] = field(default_factory=list)
     caption_tracks: list[CaptionTrack] = field(default_factory=list)
     storyboard: Optional[StoryboardLevel] = None
-    #: Which InnerTube client answered, for the receipt and for debugging a
-    #: failure that only reproduces against one of them.
+    #: Which client answered — `ANDROID`, `IOS`, or `oembed` when InnerTube
+    #: refused and only the public preview was available.
     client: str = ""
+    #: Why InnerTube refused, when it did. Carried so the receipt can say
+    #: "this server is being rate-limited" instead of implying the video is
+    #: private — they call for completely different actions from the reader.
+    blocked_reason: str = ""
 
     @property
     def watch_url(self) -> str:
@@ -437,10 +441,71 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
             client=name,
         )
 
+    # ── InnerTube refused. Fall back to oEmbed. ─────────────────────────
+    #
+    # MEASURED IN PRODUCTION, and the reason this branch exists at all. From a
+    # residential address InnerTube answers for everything; from Fly's
+    # datacentre IPs it answers "Sign in to confirm you're not a bot" for most
+    # videos — two of three tested, consistently, across both clients and
+    # retries. So the path that works in development is the path that fails
+    # once deployed, which is the worst shape a failure can have.
+    #
+    # oEmbed is unauthenticated, is not subject to that check, and answered 200
+    # for every video InnerTube had just refused. It gives a title, an author
+    # and a thumbnail — no duration, no chapters, no captions, no filmstrip —
+    # which is not a video study and is a real one. Taking it beats returning
+    # a 502 for a public video.
+    fallback = await _oembed_manifest(video_id, last_reason)
+    if fallback is not None:
+        return fallback
+
     raise YouTubeUnavailable(
-        f"YouTube would not describe that video ({last_reason or 'no client answered'}). "
-        "Private, age-restricted, members-only and region-blocked videos all "
-        "look like this from a server."
+        f"YouTube would not describe that video ({last_reason or 'no client answered'}), "
+        "and its public preview is unavailable too. Private, age-restricted, "
+        "members-only and deleted videos all look like this from a server."
+    )
+
+
+#: YouTube's own oEmbed endpoint. Public, unauthenticated, and — unlike
+#: InnerTube — not gated behind the bot check that fires on datacentre IPs.
+_OEMBED = "https://www.youtube.com/oembed?url={url}&format=json"
+
+#: What the bot check says when it fires. Matched so the failure can be
+#: reported as what it is — a transient block on THIS SERVER — rather than as a
+#: property of the video. The old message named four permission states, none of
+#: which applied, and sent people to check the settings of a public video.
+_BOT_WALL = ("not a bot", "sign in to confirm")
+
+
+def _is_bot_wall(reason: str) -> bool:
+    lowered = (reason or "").lower()
+    return any(marker in lowered for marker in _BOT_WALL)
+
+
+async def _oembed_manifest(video_id: str, blocked_reason: str) -> Optional[VideoManifest]:
+    """A metadata-only manifest from YouTube's public oEmbed. None if that fails too."""
+    from urllib.parse import quote
+
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        doc, _final = await fetch_json(_OEMBED.format(url=quote(watch, safe="")))
+    except (UnsafeURL, FetchFailed):
+        return None
+    title = str(doc.get("title") or "").strip()
+    if not title:
+        return None
+    return VideoManifest(
+        video_id=video_id,
+        title=title,
+        author=str(doc.get("author_name") or "").strip(),
+        # oEmbed carries no runtime. Left at zero rather than guessed, because
+        # every timestamp downstream is derived from it and an invented
+        # duration would place beats on a clock that does not exist.
+        duration_s=0,
+        description="",
+        thumbnail_url=str(doc.get("thumbnail_url") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+        client="oembed",
+        blocked_reason=blocked_reason,
     )
 
 
@@ -599,6 +664,7 @@ LADDER = {
     "video": "keyframes from the scrub-bar filmstrip, described by a vision model",
     "audio": "the published transcript, on its own timings",
     "text": "the creator's own chapter list and description — NOT the video itself",
+    "metadata": "the thumbnail and title only — NOT the video itself",
 }
 
 
@@ -609,6 +675,12 @@ def choose_rung(manifest: VideoManifest, cues: list[dict], frames: list[dict]) -
     Keyframes plus optional speech beat speech alone, and both beat the
     creator's description of their own video — which is a study of the pitch,
     not of the thing.
+
+    The bottom rung is the thumbnail. It exists because InnerTube is blocked
+    from datacentre addresses often enough that it is the COMMON case in
+    production, not an edge case, and a thumbnail study is a legitimate answer
+    to "does this earn a click" even though it is no answer at all to "what
+    does this video do to an audience". Both facts are stated in the receipt.
     """
     if len(frames) >= 2:
         return "video"
@@ -616,6 +688,8 @@ def choose_rung(manifest: VideoManifest, cues: list[dict], frames: list[dict]) -
         return "audio"
     if len(manifest.chapters) >= 2:
         return "text"
+    if manifest.thumbnail_url:
+        return "metadata"
     return "none"
 
 
@@ -632,21 +706,46 @@ def manifest_envelope(manifest: VideoManifest, cues: list[dict], frames: list[di
     have_text = bool(cues)
     rung = choose_rung(manifest, cues, frames)
     parts: list[str] = []
+
+    # The cause comes FIRST when there is one, because it is the only line that
+    # tells the reader whether to do something. "YouTube is rate-limiting this
+    # server" is a transient condition they can retry or ignore; the old
+    # message named four permission states instead and sent people to check the
+    # settings of a video that was public all along.
+    if manifest.client == "oembed":
+        parts.append(
+            "YouTube refused to describe this video to our server"
+            + (
+                " — it is rate-limiting us, which is temporary and nothing to do "
+                "with the video. Retrying later usually works"
+                if _is_bot_wall(manifest.blocked_reason)
+                else f" ({manifest.blocked_reason})"
+            )
+            + ", so only its public preview was available"
+        )
+
     if frames and board:
         parts.append(
             f"{len(frames)} keyframes at {board.width}×{board.height} from "
             f"YouTube's own scrub-bar filmstrip"
             + (" at chapter midpoints" if frames[0].get("source") == "chapters" else "")
         )
-    elif board is None:
+    elif board is None and manifest.client != "oembed":
         # Not a failure and worth saying so plainly: YouTube does not generate
         # a filmstrip for very short clips, so this is a property of the video
         # rather than something that went wrong or can be retried.
+        #
+        # Suppressed on the oEmbed path, where the filmstrip is absent because
+        # we were never told about it — attributing that to the video's length
+        # would be inventing a second, wrong explanation on top of the real one
+        # already printed above.
         parts.append(
             "YouTube publishes no scrub-bar filmstrip for this video — usually "
             "because it is too short — so there are no keyframes to read"
         )
-    if have_text:
+    if manifest.client == "oembed":
+        pass  # captions were never offered either; the cause is already stated
+    elif have_text:
         parts.append(f"{len(cues)} transcript cues")
     elif manifest.caption_tracks:
         parts.append(

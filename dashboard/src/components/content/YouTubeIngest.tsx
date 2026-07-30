@@ -74,8 +74,11 @@ export interface YouTubeManifest {
     sheets: number;
   } | null;
   client: string;
+  /** Why InnerTube refused, when it did — so the receipt can say "this server
+   *  is rate-limited" rather than implying the video is private. */
+  blocked_reason?: string;
   note: string;
-  rung: "video" | "audio" | "text";
+  rung: "video" | "audio" | "text" | "metadata";
   rung_basis: string;
   degraded: boolean;
 }
@@ -313,12 +316,18 @@ export function VideoReceipt({ manifest }: { manifest: YouTubeManifest }) {
         <div className="min-w-0 flex-1">
           <p className="truncate text-[12px] leading-snug text-ink">{manifest.title}</p>
           <p className="mt-0.5 flex flex-wrap gap-x-2 font-mono text-[10px] text-muted">
-            <span className="text-ink-2">{manifest.author}</span>
-            <span>{clock(manifest.duration_s)}</span>
+            {manifest.author && <span className="text-ink-2">{manifest.author}</span>}
+            {/* Omitted rather than shown as 0:00. The public preview carries no
+                runtime, and printing a zero duration states a fact about the
+                video that is false — "0:00" reads as an empty clip, not as
+                "we were not told". */}
+            {manifest.duration_s > 0 && <span>{clock(manifest.duration_s)}</span>}
             {manifest.view_count != null && (
               <span>{manifest.view_count.toLocaleString()} views</span>
             )}
-            <span className="text-accent-2">via {manifest.client}</span>
+            <span className="text-accent-2">
+              via {manifest.client === "oembed" ? "public preview" : manifest.client}
+            </span>
           </p>
         </div>
       </div>
