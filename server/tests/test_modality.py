@@ -7,6 +7,7 @@ the system REFUSES to compute.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -336,3 +337,36 @@ def test_hidden_and_unrendered_content_never_becomes_a_beat():
     blocks = extract_blocks(html)
     assert len(blocks) == 1
     assert blocks[0].startswith("The only visible copy")
+
+
+# ── the text floor ─────────────────────────────────────────────────────────
+
+
+def test_trivially_short_text_is_refused_before_any_model_call():
+    """THE credit leak, found by probing the deployed API.
+
+    `{"content": "hi"}` was accepted, segmented, and dispatched to the full twin
+    swarm — real OpenAI spend producing confident synchrony, peak-end and
+    retention numbers about two characters. The dashboard had enforced a
+    20-character floor since the panel was written; the API had not, so the
+    guard was client-side only and any direct caller walked past it.
+
+    Refused before the segmenter on purpose: that is itself an LLM call, and the
+    twins after it are many more, so the cheapest place to decline is the first.
+    """
+    from app.modality import MIN_TEXT_CHARS, UnsupportedAsset, _beats_from_text
+
+    for junk in ("hi", "   ", "\n\t ", "a" * (MIN_TEXT_CHARS - 1)):
+        with pytest.raises(UnsupportedAsset) as caught:
+            asyncio.run(_beats_from_text(ContentAsset(kind="text", text=junk)))
+        # Whitespace-only still reports the empty message, not a length one.
+        assert "needs text" in str(caught.value) or "characters" in str(caught.value)
+
+
+def test_the_server_floor_matches_the_button_the_dashboard_shows():
+    """A server floor that disagreed with `assetReady` would either reject what
+    the UI had just enabled or accept what it had greyed out, and either reads
+    as a bug in whichever half you are looking at."""
+    from app.modality import MIN_TEXT_CHARS
+
+    assert MIN_TEXT_CHARS == 20

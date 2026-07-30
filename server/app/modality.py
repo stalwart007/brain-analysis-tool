@@ -748,9 +748,35 @@ async def _llm_segments(content: str, content_type: str) -> list[str]:
     return segs
 
 
+#: The floor for a text asset, in characters after stripping.
+#:
+#: The dashboard has enforced this since the panel was written (`assetReady`),
+#: and the API did not — so the guard lived entirely in the client and any
+#: direct caller walked straight past it. Measured against the deployed API:
+#: `{"content": "hi"}` was accepted, segmented into beats, and dispatched to the
+#: full twin swarm, which spends real OpenAI credit producing confident
+#: statistics — synchrony, peak-end, a retention curve — about two characters.
+#:
+#: Twenty is the client's number, kept identical on purpose. A server floor that
+#: disagreed with the button would either reject something the UI had just
+#: enabled or accept something it had greyed out, and both read as a bug in
+#: whichever half the reader is looking at.
+MIN_TEXT_CHARS = 20
+
+
 async def _beats_from_text(asset: ContentAsset) -> BeatSequence:
-    if not asset.text:
+    text = (asset.text or "").strip()
+    if not text:
         raise UnsupportedAsset("a text asset needs text")
+    if len(text) < MIN_TEXT_CHARS:
+        # Refused BEFORE the segmenter, which is the whole point: the segmenter
+        # is an LLM call and the twins after it are many more, so the cheapest
+        # place to decline is the first one.
+        raise UnsupportedAsset(
+            f"that is {len(text)} characters, and a study needs at least "
+            f"{MIN_TEXT_CHARS} to have anything to read. Paste the script, the "
+            "copy, or a link to the content."
+        )
     try:
         segs = await _llm_segments(asset.text, asset.content_type or "text")
         return BeatSequence(segs, BeatAxis.SEQUENTIAL, source="llm")
