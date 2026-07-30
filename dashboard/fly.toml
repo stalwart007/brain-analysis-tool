@@ -39,6 +39,25 @@ primary_region = "bom"          # keep the same region as the backend
   # single point of failure behind it.
   max_machines_running = 1
 
+  # There was NO check here, which is why `fly status` showed an empty CHECKS
+  # column for the one app users actually reach — the backend has been checked
+  # on /healthz since it was deployed, the public surface was not. Without it
+  # Fly cannot tell a serving process from a wedged one, and traffic keeps
+  # arriving at a hung Node process forever.
+  #
+  # Points at a dedicated route rather than at `/`: `/` is a 307 to /login for
+  # anyone without a session, and a check that treats a redirect as success is
+  # measuring the middleware rather than the app. `/api/health` is exempted in
+  # PUBLIC_PATHS and answers liveness only — deliberately NOT readiness, so a
+  # backend outage does not pull the dashboard out of rotation and turn "the
+  # API is down" into "the site is unreachable".
+  [[http_service.checks]]
+    grace_period = "20s"   # Next.js needs a few seconds before it listens
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/health"
+
 [[vm]]
   # 1 GB, not 512 MB: the Next build needs roughly 2 GB and is done at image
   # build time, but the runtime carries three.js and the R3F scene graph and
