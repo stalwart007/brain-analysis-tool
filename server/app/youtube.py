@@ -43,6 +43,7 @@ tomorrow, and a second transport is how an SSRF guard ends up with a hole in it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -354,17 +355,54 @@ def _storyboard_from_spec(spec: str, duration_s: int) -> Optional[StoryboardLeve
     )
 
 
+#: When to re-ask, in seconds, after the client list is exhausted by the bot
+#: wall. Measured: the wall is RATE-based, not per-video and not permanent —
+#: the same video that answers `LOGIN_REQUIRED` on one request answers `OK` on
+#: another seconds later, and ANDROID succeeds where every other client fails.
+#:
+#: This matters more than it looks. Without a retry, one throttled moment
+#: permanently downgraded the study from "keyframes and 33 caption tracks" to
+#: "a thumbnail" — and the researcher saw the content-type picker jump to Image
+#: with no idea why. The backoff converts most of those back into real video
+#: studies for the cost of a few seconds on the unlucky requests only.
+#:
+#: Deliberately short and bounded. This is one interactive request a person is
+#: waiting on, not a background job; two extra tries is the point where waiting
+#: longer costs more than the better rung is worth.
+_RETRY_DELAYS = (1.5, 4.0)
+
+
 async def fetch_manifest(video_id: str) -> VideoManifest:
-    """Ask InnerTube what this video is. Tries each client until one answers.
+    """Ask InnerTube what this video is, with a backoff on the rate limiter.
 
     A per-client failure is not fatal and a per-client REFUSAL is not either:
     the WEB client answers 200 with `playabilityStatus: UNPLAYABLE` from a
     datacentre address, which is a refusal wearing a success code. Only the
-    exhaustion of every client is reported to the caller, and it carries
-    whatever reason the last one gave rather than a generic failure.
+    exhaustion of every client — and then of the retries, and then of oEmbed —
+    is reported to the caller.
     """
     last_reason = ""
-    for name, context, agent in _CLIENTS:
+
+    # The full client list, then ANDROID again after a pause, and again.
+    # ANDROID rather than round-robin because the client matrix run against the
+    # production host is unambiguous: ANDROID answers for videos every other
+    # client refuses. Re-asking the strongest client beats cycling weak ones.
+    schedule: list[tuple[str, dict, str, float]] = [
+        (name, context, agent, 0.0) for name, context, agent in _CLIENTS
+    ]
+    primary = _CLIENTS[0]
+    schedule += [(primary[0], primary[1], primary[2], delay) for delay in _RETRY_DELAYS]
+
+    for name, context, agent, delay in schedule:
+        if delay:
+            # Retry ONLY the rate limiter. A private, deleted or region-blocked
+            # video answers the same way however many times it is asked, so
+            # backing off on those spends five seconds of someone's attention to
+            # arrive at the identical refusal — and the reason string is what
+            # tells the two apart.
+            if not _is_bot_wall(last_reason):
+                break
+            await asyncio.sleep(delay)
         payload = json.dumps(
             {
                 "videoId": video_id,

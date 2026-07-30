@@ -452,16 +452,27 @@ def test_innertube_refusal_falls_back_to_the_public_preview(monkeypatch):
             url,
         )
 
+    slept: list[float] = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+
     monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    # Patched so the suite does not actually wait out the backoff. The DELAYS
+    # are asserted instead, which is the part that could regress.
+    monkeypatch.setattr(yt.asyncio, "sleep", no_sleep)
     manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
 
     assert manifest.client == "oembed"
     assert manifest.title == "Me at the zoo"
     assert manifest.author == "jawed"
     assert manifest.thumbnail_url.endswith("hqdefault.jpg")
-    # Both InnerTube clients are tried before falling back — giving up after one
-    # would degrade videos that the second client would have served in full.
-    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS)
+    # Every client, THEN the backoff retries, before settling for the preview.
+    # Measured from the production host, the wall is rate-based rather than
+    # per-video — so giving up on the first refusal permanently downgrades a
+    # study that a retry three seconds later would have served in full.
+    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS) + len(yt._RETRY_DELAYS)
+    assert slept == list(yt._RETRY_DELAYS)
     # Duration is NOT invented. Every downstream timestamp derives from it.
     assert manifest.duration_s == 0
     assert yt._is_bot_wall(manifest.blocked_reason)
@@ -500,3 +511,32 @@ def test_everything_failing_still_raises(monkeypatch):
     monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
     with pytest.raises(yt.YouTubeUnavailable):
         asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+
+def test_a_permanent_refusal_is_not_retried(monkeypatch):
+    """Backoff is for the RATE LIMITER only.
+
+    A private, deleted or region-blocked video answers identically however many
+    times it is asked, so retrying spends five seconds of an interactive
+    request to reach the same refusal. The reason string is what separates the
+    transient case from the permanent one.
+    """
+    import app.youtube as yt
+
+    slept: list[float] = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "ERROR", "reason": "This video is private"},
+                     "videoDetails": {}}, url)
+        return ({"title": "T", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    monkeypatch.setattr(yt.asyncio, "sleep", no_sleep)
+    yt_manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+    assert yt_manifest.client == "oembed"
+    assert slept == []   # no backoff burned on a permanent condition
