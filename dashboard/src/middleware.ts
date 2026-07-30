@@ -16,7 +16,17 @@ const SESSION_COOKIE = "cs_session";
  * along with it — an unauthenticated hole created by a route that was only
  * ever meant to be one URL.
  */
-const PUBLIC_PATHS = new Set(["/login", "/api/auth/login", "/api/ingest"]);
+// `/api/health` is the platform's liveness probe. It arrives with no session
+// and must not be redirected to /login — a health check that follows a 307 to a
+// login page reports a wedged process as healthy. It discloses nothing beyond a
+// fixed string and this process's uptime. Exact-match, like the others, so
+// `/api/healthwhatever` stays closed.
+const PUBLIC_PATHS = new Set([
+  "/login",
+  "/api/auth/login",
+  "/api/ingest",
+  "/api/health",
+]);
 
 function secret(): Uint8Array {
   const raw = process.env.AUTH_SECRET;
