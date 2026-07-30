@@ -38,17 +38,34 @@ export interface YouTubeChapter {
   title: string;
 }
 
-export interface YouTubeKeyframe {
-  t_ms: number;
-  sheet: number;
-  sheet_url: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  label: string;
-  source: "chapters" | "even";
-}
+/** Either a tile to cut out of a spritesheet, or a whole image to relay.
+ *
+ *  The two coexist in one running order because they are good at different
+ *  things: the filmstrip supplies DENSITY (a frame every two seconds) and the
+ *  published stills supply DETAIL (1280×720 against a tile's 160×90). Taking
+ *  either alone throws away the other. */
+export type YouTubeKeyframe =
+  | {
+      kind: "tile";
+      t_ms: number;
+      sheet: number;
+      sheet_url: string;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      label: string;
+      source: "chapters" | "even";
+    }
+  | {
+      kind: "image";
+      t_ms: number;
+      fraction: number;
+      /** Resolution candidates, best first: maxres, sd, hq, mq. */
+      urls: string[];
+      label?: string;
+      source?: string;
+    };
 
 export interface YouTubeManifest {
   video_id: string;
@@ -139,16 +156,23 @@ async function cropKeyframes(
   keyframes: YouTubeKeyframe[],
   onProgress: (done: number, total: number, phase: "fetch" | "crop") => void
 ): Promise<{ t_ms: number; image_b64: string; media_type: string }[]> {
-  const sheetUrls = Array.from(new Set(keyframes.map((f) => f.sheet_url)));
+  // Sheets are fetched ONCE each and reused. Eight tiles over a five-sheet
+  // filmstrip touch three or four sheets; fetching per frame would pull the
+  // same 25 kB image up to eight times and, worse, decode it eight times.
+  const sheetUrls = Array.from(
+    new Set(keyframes.flatMap((f) => (f.kind === "tile" ? [f.sheet_url] : [])))
+  );
   const sheets = new Map<string, ImageBitmap>();
-
   for (const [i, url] of sheetUrls.entries()) {
     onProgress(i, sheetUrls.length, "fetch");
-    const blob = await relay(url);
-    // createImageBitmap decodes off the main thread, which matters: these are
-    // 800×450 sheets and decoding five of them synchronously visibly stalls
-    // the pipeline animation that is meant to be showing progress.
-    sheets.set(url, await createImageBitmap(blob));
+    try {
+      // createImageBitmap decodes off the main thread, which matters: these
+      // are 800×450 sheets and decoding five synchronously visibly stalls the
+      // pipeline animation that is meant to be showing progress.
+      sheets.set(url, await createImageBitmap(await relay(url)));
+    } catch {
+      // One unreadable sheet costs its tiles, not the study.
+    }
   }
   onProgress(sheetUrls.length, sheetUrls.length, "fetch");
 
@@ -158,24 +182,47 @@ async function cropKeyframes(
 
   const out: { t_ms: number; image_b64: string; media_type: string }[] = [];
   for (const [i, frame] of keyframes.entries()) {
-    const sheet = sheets.get(frame.sheet_url);
-    if (!sheet) continue;
-    canvas.width = frame.w;
-    canvas.height = frame.h;
-    ctx.drawImage(sheet, frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
-    // Quality 0.85 rather than the 0.7 the upload path uses. These tiles are
-    // already only 160×90; a second lossy pass at 0.7 puts compression
-    // artefacts into the very detail the vision model is being asked to read.
-    out.push({
-      t_ms: frame.t_ms,
-      image_b64: canvas.toDataURL("image/jpeg", 0.85).split(",")[1],
-      media_type: "image/jpeg",
-    });
+    if (frame.kind === "image") {
+      // Whole images: nothing to crop, and the resolution ladder is walked
+      // here rather than server-side. Picking the tier on the server would
+      // cost up to three extra requests per frame against the host that is
+      // already rate-limiting us, and the browser fetches the winner anyway.
+      for (const url of frame.urls) {
+        try {
+          const blob = await relay(url);
+          out.push({
+            t_ms: frame.t_ms,
+            image_b64: await blobToBase64(blob),
+            media_type:
+              blob.type && blob.type !== "application/octet-stream" ? blob.type : "image/jpeg",
+          });
+          break;
+        } catch {
+          // 404 at this tier — an older upload with no maxres. Step down.
+        }
+      }
+    } else {
+      const sheet = sheets.get(frame.sheet_url);
+      if (sheet) {
+        canvas.width = frame.w;
+        canvas.height = frame.h;
+        ctx.drawImage(sheet, frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
+        // Quality 0.85 rather than the 0.7 the upload path uses. These tiles
+        // are already only 160×90; a second lossy pass puts compression
+        // artefacts into the very detail the model is being asked to read.
+        out.push({
+          t_ms: frame.t_ms,
+          image_b64: canvas.toDataURL("image/jpeg", 0.85).split(",")[1],
+          media_type: "image/jpeg",
+        });
+      }
+    }
     onProgress(i + 1, keyframes.length, "crop");
   }
   for (const bitmap of sheets.values()) bitmap.close();
   return out;
 }
+
 
 /** The chapter list and description, as an ordered text asset.
  *
@@ -221,47 +268,14 @@ export async function ingestYouTube(
         : "none published"
   );
 
-  // ── the CDN frames: whole images, no cropping ───────────────────────
+  // ── keyframes: full-resolution stills, filmstrip tiles, or both ─────
   //
-  // Reached when the player API refused us, which from a datacentre address is
-  // most of the time. These are complete JPEGs rather than tiles in a sheet, so
-  // the canvas work the storyboard path does is skipped entirely — relay each
-  // one and hand it over. `t_ms: -1` marks the position as unknown; the server
-  // reads that as a sequential axis rather than fabricating a runtime.
-  if (manifest.rung === "cdn_frames" && (manifest.cdn_frames?.length ?? 0) >= 2) {
-    const sources = manifest.cdn_frames!;
-    onStage("filmstrip", "active", `0/${sources.length} frames`);
-    const frames: { t_ms: number; image_b64: string; media_type: string }[] = [];
-    for (const [i, source] of sources.entries()) {
-      try {
-        const blob = await relay(source.url);
-        frames.push({
-          t_ms: -1,
-          image_b64: await blobToBase64(blob),
-          media_type: blob.type && blob.type !== "application/octet-stream" ? blob.type : "image/jpeg",
-        });
-      } catch {
-        // One missing frame is a thinner study, not a failed one.
-      }
-      onStage("filmstrip", "active", `${i + 1}/${sources.length} frames`);
-    }
-    if (frames.length < 2) throw new Error("Could not retrieve enough frames for this video.");
-    onStage("filmstrip", "done", `${frames.length} frames`);
-    onStage("crop", "done", "no cropping needed");
-    return {
-      kind: "video",
-      asset: {
-        kind: "video",
-        frames,
-        transcript_cues: cues,
-        brief: `YouTube: "${manifest.title}"${manifest.author ? ` by ${manifest.author}` : ""}.`,
-      },
-      manifest,
-    };
-  }
-
-  // ── the top rung: real keyframes ────────────────────────────────────
-  if (manifest.rung === "video" && manifest.keyframes.length >= 2) {
+  // One path for both rungs, because `keyframes` already carries the merged
+  // running order and each entry says whether it is a whole image to relay or a
+  // tile to cut out. An earlier version had a second branch here reading a
+  // separate `cdn_frames` list, which meant two places deciding what a frame is
+  // — and the one that ran first was the one that had not been updated.
+  if ((manifest.rung === "video" || manifest.rung === "cdn_frames") && manifest.keyframes.length >= 2) {
     onStage("filmstrip", "active");
     const frames = await cropKeyframes(manifest.keyframes, (done, total, phase) => {
       if (phase === "fetch") {

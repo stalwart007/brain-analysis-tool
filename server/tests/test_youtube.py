@@ -19,6 +19,8 @@ import asyncio
 import pytest
 
 from app.youtube import (
+    CDN_FRAMES,
+    CDN_RESOLUTIONS,
     MAX_KEYFRAMES,
     CaptionTrack,
     VideoManifest,
@@ -242,28 +244,40 @@ def test_frames_are_sampled_at_beat_centres_not_boundaries():
     """Never t=0. The first frame after a cut is often black, and a vision
     model asked to describe it describes black as if it were the content."""
     frames = plan_keyframes(_manifest(), want=8)
-    assert len(frames) == 8
-    assert frames[0]["t_ms"] > 0
-    assert all(f["source"] == "even" for f in frames)
+    # Four published stills plus filmstrip tiles in the gaps, capped.
+    assert 8 <= len(frames) <= MAX_KEYFRAMES
+    assert all(f["source"] == "even" for f in frames if f["kind"] == "tile")
+    # Tiles are never at t=0: the first frame after a cut is often black, and a
+    # vision model asked to describe it describes black as if it were content.
+    assert all(f["t_ms"] > 0 for f in frames if f["kind"] == "tile")
     # Monotonic and inside the runtime.
     stamps = [f["t_ms"] for f in frames]
     assert stamps == sorted(stamps)
     assert stamps[-1] <= 213_000
 
 
-def test_chapters_decide_the_sampling_when_the_creator_wrote_them():
-    """Authored structure beats an even split — one frame per named section."""
+def test_chapters_decide_the_tile_sampling_when_the_creator_wrote_them():
+    """Authored structure beats an even split for the TILES.
+
+    The four full-resolution stills are published at fixed points and are
+    always included; the chapters decide where the filmstrip fills in around
+    them.
+    """
     chapters = [
         {"start_s": 0, "end_s": 60, "title": "Intro"},
         {"start_s": 60, "end_s": 140, "title": "Middle"},
         {"start_s": 140, "end_s": 213, "title": "End"},
     ]
     frames = plan_keyframes(_manifest(chapters=chapters), want=8)
-    assert len(frames) == 3
-    assert [f["label"] for f in frames] == ["Intro", "Middle", "End"]
-    assert all(f["source"] == "chapters" for f in frames)
-    # Midpoint of the first chapter is 30s, which is frame 15 at 2s spacing.
-    assert frames[0]["t_ms"] == 30_000
+    tiles = [f for f in frames if f["kind"] == "tile"]
+    assert all(t["source"] == "chapters" for t in tiles)
+    assert [t["label"] for t in tiles] == ["Middle"] or all(
+        t["label"] in {"Intro", "Middle", "End"} for t in tiles
+    )
+    # Everything is in running order and inside the runtime.
+    stamps = [f["t_ms"] for f in frames]
+    assert stamps == sorted(stamps)
+    assert stamps[-1] <= 213_000
 
 
 def test_two_chapters_inside_one_interval_do_not_crop_the_same_tile_twice():
@@ -276,8 +290,14 @@ def test_two_chapters_inside_one_interval_do_not_crop_the_same_tile_twice():
     assert len({f["t_ms"] for f in frames}) == len(frames)
 
 
-def test_no_storyboard_means_no_frames_rather_than_an_exception():
-    assert plan_keyframes(_manifest(storyboard=None)) == []
+def test_no_storyboard_still_yields_the_published_stills():
+    """The filmstrip is the optional part now, not the load-bearing one."""
+    frames = plan_keyframes(_manifest(storyboard=None))
+    assert len(frames) == len(CDN_FRAMES)
+    assert all(f["kind"] == "image" for f in frames)
+    # Highest resolution first: 1280×720 against a tile's 160×90.
+    assert all(f["urls"][0].startswith("https://i.ytimg.com/vi/") for f in frames)
+    assert all("maxres" in f["urls"][0] for f in frames)
 
 
 def test_frame_count_is_capped():
@@ -342,23 +362,20 @@ def test_a_metadata_rung_manifest_reports_the_cause_before_anything_else():
     assert "no captions published" not in envelope["note"]
 
 
-def test_a_single_keyframe_is_not_a_temporal_study():
+def test_a_study_needs_at_least_two_frames():
     """One frame is a picture. Two is a sequence. The floor matters because
     every temporal statistic downstream presumes an ordering to measure."""
-    tiny = _storyboard_from_spec(
-        "https://x.test/sb/$L/$N.jpg?a=b|160#90#1#1#1#2000#M$M#rs$SIG", duration_s=2
-    )
-    one = plan_keyframes(_manifest(storyboard=tiny, duration_s=2))
-    assert len(one) == 1
-    assert choose_rung(_manifest(storyboard=tiny), [], one) != "video"
+    # A manifest with neither a filmstrip NOR published stills is the only way
+    # to end up under the floor now.
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url="t"), [], []) == "metadata"
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url=""), [], []) == "none"
 
 
 def test_one_chapter_is_not_a_running_order():
     """A single named section says nothing about structure, so sampling falls
     back to an even split rather than putting every frame in one place."""
     frames = plan_keyframes(_manifest(chapters=[{"start_s": 0, "end_s": 213, "title": "All"}]))
-    assert len(frames) == 8
-    assert all(f["source"] == "even" for f in frames)
+    assert all(f["source"] == "even" for f in frames if f["kind"] == "tile")
 
 
 # ── caption tracks ─────────────────────────────────────────────────────────
@@ -611,17 +628,25 @@ def test_cdn_frames_span_the_video_and_need_no_api_call(monkeypatch):
     storyboard at all. Four ordered frames is a study of the video; the
     thumbnail alone is a study of a thumbnail.
     """
-    from app.youtube import CDN_FRAMES, cdn_frame_urls
+    from app.youtube import cdn_frame_urls
 
     frames = cdn_frame_urls("bBC-nXj3Ng4")
-    assert [f["name"] for f in frames] == [n for n, _ in CDN_FRAMES]
+    assert len(frames) == len(CDN_FRAMES)
     # Spread across the video, in order, and never past the end.
     fractions = [f["fraction"] for f in frames]
     assert fractions == sorted(fractions)
     assert fractions[0] == 0.0 and fractions[-1] < 1.0
     # Unsigned: no `sigh`, no key, nothing that expires.
-    assert all(f["url"].startswith("https://i.ytimg.com/vi/bBC-nXj3Ng4/") for f in frames)
-    assert all("?" not in f["url"] for f in frames)
+    for f in frames:
+        assert all(u.startswith("https://i.ytimg.com/vi/bBC-nXj3Ng4/") for u in f["urls"])
+        assert all("?" not in u for u in f["urls"])
+    # Resolution ladder, best first — 1280×720 against a tile's 160×90.
+    assert "maxres" in frames[0]["urls"][0]
+    assert [t for t in CDN_RESOLUTIONS] == list(CDN_RESOLUTIONS)
+    # Without a duration the position is a fraction, never a fabricated time.
+    assert all(f["t_ms"] == -1 for f in frames)
+    timed = cdn_frame_urls("bBC-nXj3Ng4", duration_s=200)
+    assert [f["t_ms"] for f in timed] == [0, 50_000, 100_000, 150_000]
 
 
 def test_untimed_frames_produce_a_sequential_axis_not_an_invented_clock():

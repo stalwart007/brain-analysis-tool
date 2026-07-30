@@ -555,30 +555,61 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
 #: picture of a thumbnail. That is the whole difference between this tier
 #: existing and not.
 CDN_FRAMES: tuple[tuple[str, float], ...] = (
-    ("hqdefault", 0.0),
-    ("hq1", 0.25),
-    ("hq2", 0.5),
-    ("hq3", 0.75),
+    ("default", 0.0),
+    ("1", 0.25),
+    ("2", 0.5),
+    ("3", 0.75),
 )
 
+#: Resolution tiers for those frames, best first, measured with a JPEG header
+#: parse rather than assumed:
+#:
+#:     maxres  1280×720   modern uploads
+#:     sd       640×480
+#:     hq       480×360   the floor; present on a 2005 upload with nothing else
+#:     mq       320×180
+#:
+#: THIS IS THE WHOLE POINT, and it inverts what looked like the quality
+#: ordering. A storyboard tile is 160×90. `maxres` is 1280×720 — SIXTY-FOUR
+#: TIMES the pixels. At 160×90 a vision model cannot read a caption, a price, a
+#: logo or a face; at 720p it reads all of them. So these frames are not a
+#: consolation prize for a blocked video, they are the highest-detail view of it
+#: available anywhere, and the filmstrip's real advantage is only that there are
+#: more of them.
+#:
+#: Tried in order by the CLIENT rather than resolved here: picking the tier
+#: server-side costs up to three extra requests per frame against the host we
+#: are already being rate-limited by, and the browser is going to fetch the
+#: winner through the relay regardless.
+CDN_RESOLUTIONS = ("maxres", "sd", "hq", "mq")
 
-def cdn_frame_urls(video_id: str) -> list[dict]:
-    """The unsigned interior frames, in running order.
 
-    `fraction` rather than a timestamp, deliberately. When this tier is reached
-    InnerTube has refused us, so the runtime is unknown — and a frame labelled
-    `1:23` when nothing measured 1:23 is a fabricated clock. The beats are
-    ORDERED and not timed, which is a sequential axis, and the modality layer
-    already knows what to withhold for one.
+def cdn_frame_urls(video_id: str, duration_s: int = 0) -> list[dict]:
+    """The unsigned interior frames, best resolution first, in running order.
+
+    `fraction` is always exact — these are published at the opening, quarter,
+    half and three-quarter points. `t_ms` is only filled in when the runtime is
+    actually known: reaching this tier usually means the player API refused us,
+    and a frame labelled `1:23` when nothing measured 1:23 is a fabricated
+    clock. `-1` is the explicit unknown, and the modality layer reads it as a
+    sequential axis.
     """
-    return [
-        {
-            "name": name,
-            "fraction": fraction,
-            "url": f"https://i.ytimg.com/vi/{video_id}/{name}.jpg",
-        }
-        for name, fraction in CDN_FRAMES
-    ]
+    frames: list[dict] = []
+    for name, fraction in CDN_FRAMES:
+        frames.append(
+            {
+                "kind": "image",
+                "fraction": fraction,
+                "t_ms": int(duration_s * 1000 * fraction) if duration_s else -1,
+                # Candidates, best first. `default` has no `maxresdefault`
+                # sibling problem — every tier spells it the same way.
+                "urls": [
+                    f"https://i.ytimg.com/vi/{video_id}/{tier}{name}.jpg"
+                    for tier in CDN_RESOLUTIONS
+                ],
+            }
+        )
+    return frames
 
 
 #: YouTube's own oEmbed endpoint. Public, unauthenticated, and — unlike
@@ -723,9 +754,16 @@ def plan_keyframes(
     the difference between "what does this video look like every 20 seconds"
     and "what does each part of this video look like".
     """
+    # The four high-resolution frames go in FIRST, always, whether or not a
+    # filmstrip exists. They are 1280×720 against the filmstrip's 160×90, so a
+    # study built only from tiles was reading a smudge at four of the moments it
+    # could have been reading the actual frame. Cheap, too: no API call, no
+    # signature, no rate limiter.
+    high_res = cdn_frame_urls(manifest.video_id, manifest.duration_s)
+
     board = manifest.storyboard
     if board is None or board.frame_count <= 0:
-        return []
+        return [{**f, "label": "", "source": "cdn"} for f in high_res]
 
     want = max(2, min(want, MAX_KEYFRAMES))
     duration_ms = (manifest.duration_s or 0) * 1000
@@ -762,7 +800,28 @@ def plan_keyframes(
 
     for f in frames:
         f["source"] = source
-    return frames
+        f["kind"] = "tile"
+
+    # Interleave. The filmstrip supplies DENSITY and the CDN frames supply
+    # DETAIL, and taking either alone throws away the other. Tiles that land
+    # near a high-resolution frame are dropped rather than shown beside it —
+    # two beats a second apart describing the same shot at two resolutions is a
+    # duplicated beat, and every beat costs a vision call.
+    merged = list(high_res)
+    span = max(1, (manifest.duration_s or 0) * 1000)
+    near = span * 0.06
+    for tile in frames:
+        if manifest.duration_s and any(
+            abs(tile["t_ms"] - hi["t_ms"]) < near for hi in high_res if hi["t_ms"] >= 0
+        ):
+            continue
+        merged.append(tile)
+
+    # Back into running order, and capped. Unknown timestamps sort first, which
+    # only happens when the duration is unknown — in which case there are no
+    # tiles to interleave anyway.
+    merged.sort(key=lambda f: f["t_ms"] if f["t_ms"] >= 0 else 0)
+    return merged[:MAX_KEYFRAMES]
 
 
 #: The rungs, best first. Each is a REAL study on a genuinely different
@@ -783,8 +842,8 @@ LADDER = {
     "audio": "the published transcript, on its own timings",
     "text": "the creator's own chapter list and description — NOT the video itself",
     "cdn_frames": (
-        "four frames YouTube publishes at the opening, quarter, half and "
-        "three-quarter points — ordered, but with no clock"
+        "the four full-resolution stills YouTube publishes at the opening, "
+        "quarter, half and three-quarter points"
     ),
     "metadata": "the thumbnail and title only — NOT the video itself",
 }
@@ -804,8 +863,11 @@ def choose_rung(manifest: VideoManifest, cues: list[dict], frames: list[dict]) -
     to "does this earn a click" even though it is no answer at all to "what
     does this video do to an audience". Both facts are stated in the receipt.
     """
+    # Any filmstrip tile means density AND detail; only high-resolution images
+    # means the four published frames and nothing between them. Both are video
+    # studies, and the receipt should not claim a filmstrip we never got.
     if len(frames) >= 2:
-        return "video"
+        return "video" if any(f.get("kind") == "tile" for f in frames) else "cdn_frames"
     if len(cues) >= 4:
         return "audio"
     if len(manifest.chapters) >= 2:
@@ -860,11 +922,23 @@ def manifest_envelope(manifest: VideoManifest, cues: list[dict], frames: list[di
             + ", so only its public preview was available"
         )
 
-    if frames and board:
+    tiles = [f for f in frames if f.get("kind") == "tile"]
+    images = [f for f in frames if f.get("kind") == "image"]
+    if images and tiles and board:
+        parts.append(
+            f"{len(frames)} keyframes — {len(images)} at full resolution from "
+            f"YouTube's published stills, plus {len(tiles)} at "
+            f"{board.width}×{board.height} from its scrub-bar filmstrip"
+        )
+    elif images:
+        parts.append(
+            f"{len(images)} keyframes at full resolution — the stills YouTube "
+            "publishes at the opening, quarter, half and three-quarter points"
+        )
+    elif frames and board:
         parts.append(
             f"{len(frames)} keyframes at {board.width}×{board.height} from "
             f"YouTube's own scrub-bar filmstrip"
-            + (" at chapter midpoints" if frames[0].get("source") == "chapters" else "")
         )
     elif board is None and manifest.client != "oembed":
         # Not a failure and worth saying so plainly: YouTube does not generate
