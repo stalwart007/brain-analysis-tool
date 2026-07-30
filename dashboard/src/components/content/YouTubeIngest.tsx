@@ -178,9 +178,15 @@ async function cropKeyframes(
 
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas is unavailable in this browser.");
+  if (!ctx) {
+    // Release before bailing — the bitmaps are already decoded and each 800x450
+    // sheet holds its pixels until closed.
+    for (const bitmap of sheets.values()) bitmap.close();
+    throw new Error("Canvas is unavailable in this browser.");
+  }
 
   const out: { t_ms: number; image_b64: string; media_type: string }[] = [];
+  try {
   for (const [i, frame] of keyframes.entries()) {
     if (frame.kind === "image") {
       // Whole images: nothing to crop, and the resolution ladder is walked
@@ -219,8 +225,13 @@ async function cropKeyframes(
     }
     onProgress(i + 1, keyframes.length, "crop");
   }
-  for (const bitmap of sheets.values()) bitmap.close();
   return out;
+  } finally {
+    // Always. An ImageBitmap is off-heap and is not freed by GC promptly, so a
+    // relay failure part-way through used to strand five decoded spritesheets
+    // for the lifetime of the tab.
+    for (const bitmap of sheets.values()) bitmap.close();
+  }
 }
 
 

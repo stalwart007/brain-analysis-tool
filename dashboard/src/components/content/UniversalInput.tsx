@@ -78,41 +78,86 @@ async function extractKeyframes(
   const video = document.createElement("video");
   video.preload = "auto";
   video.muted = true;
-  video.src = URL.createObjectURL(file);
-  await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error("Could not decode that video in this browser."));
-  });
-  const duration = video.duration;
-  if (!Number.isFinite(duration) || duration <= 0) {
-    URL.revokeObjectURL(video.src);
-    throw new Error("That video reports no duration, so frames cannot be sampled.");
+  const objectUrl = URL.createObjectURL(file);
+  video.src = objectUrl;
+
+  // `finally`, because the revoke used to sit on the success path and one of
+  // the four exits. A decode failure, an unavailable canvas, or any throw
+  // inside the loop leaked the URL — and an object URL pins the WHOLE FILE in
+  // memory, so a failed 27 MB video stayed resident until the tab closed.
+  try {
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        video.onloadedmetadata = () => resolve();
+        video.onerror = () => reject(new Error("Could not decode that video in this browser."));
+      }),
+      30_000,
+      "That video did not start decoding."
+    );
+
+    const duration = video.duration;
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error("That video reports no duration, so frames cannot be sampled.");
+    }
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(1, 640 / (video.videoWidth || 640));
+    canvas.width = Math.max(1, Math.round((video.videoWidth || 640) * scale));
+    canvas.height = Math.max(1, Math.round((video.videoHeight || 360) * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas is unavailable in this browser.");
+
+    const frames: { t_ms: number; image_b64: string; media_type: string }[] = [];
+    for (let i = 0; i < FRAME_COUNT; i++) {
+      // Beat centres, not boundaries: the first frame of a cut is often black
+      // and the last is often a logo card.
+      const t = (duration * (i + 0.5)) / FRAME_COUNT;
+      // BOUNDED. This promise had no reject and no timeout: `onseeked` simply
+      // never fires for a file the decoder cannot seek — a truncated download,
+      // a fragmented MP4 with no index — and the pipeline sat on "extracting
+      // keyframe 3 of 8" forever, with the button disabled and no way back
+      // except reloading the page.
+      await withTimeout(
+        new Promise<void>((resolve, reject) => {
+          video.onseeked = () => resolve();
+          video.onerror = () => reject(new Error("The video failed while seeking."));
+          video.currentTime = t;
+        }),
+        15_000,
+        `Could not seek to ${t.toFixed(1)}s — the file may be truncated or unseekable.`
+      );
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      frames.push({
+        t_ms: Math.round(t * 1000),
+        image_b64: canvas.toDataURL("image/jpeg", 0.7).split(",")[1],
+        media_type: "image/jpeg",
+      });
+      onProgress(i + 1, FRAME_COUNT);
+    }
+    return frames;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+    // Drop the decoder's own buffer too. Without this the <video> element
+    // holds its decoded frames until GC gets round to it, which for a long
+    // clip is hundreds of megabytes.
+    video.removeAttribute("src");
+    video.load();
   }
-  const canvas = document.createElement("canvas");
-  const scale = Math.min(1, 640 / (video.videoWidth || 640));
-  canvas.width = Math.max(1, Math.round((video.videoWidth || 640) * scale));
-  canvas.height = Math.max(1, Math.round((video.videoHeight || 360) * scale));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas is unavailable in this browser.");
-  const frames: { t_ms: number; image_b64: string; media_type: string }[] = [];
-  for (let i = 0; i < FRAME_COUNT; i++) {
-    // Beat centres, not boundaries: the first frame of a cut is often black
-    // and the last is often a logo card.
-    const t = (duration * (i + 0.5)) / FRAME_COUNT;
-    await new Promise<void>((resolve) => {
-      video.onseeked = () => resolve();
-      video.currentTime = t;
-    });
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    frames.push({
-      t_ms: Math.round(t * 1000),
-      image_b64: canvas.toDataURL("image/jpeg", 0.7).split(",")[1],
-      media_type: "image/jpeg",
-    });
-    onProgress(i + 1, FRAME_COUNT);
+}
+
+/** Reject rather than hang. A media event that never fires is indistinguishable
+ *  from a slow one until you put a clock on it. */
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer!);
   }
-  URL.revokeObjectURL(video.src);
-  return frames;
 }
 
 const LINK_STAGES: Stage[] = [

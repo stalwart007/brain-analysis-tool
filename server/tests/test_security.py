@@ -587,3 +587,54 @@ def test_the_compose_endpoint_is_authenticated(monkeypatch):
         json={"stimulus": "an ad"},
     )
     assert r.status_code != 401
+
+
+# ── the media relay is metered ─────────────────────────────────────────────
+
+
+def test_the_media_relay_is_rate_limited(monkeypatch):
+    """The one authenticated endpoint whose cost is BANDWIDTH, not tokens.
+
+    It fetches up to 80 MB from an arbitrary public URL and streams it back, so
+    without a cap a key-holder can turn it into an egress amplifier and the bill
+    lands on the hosting account. Every other endpoint is bounded by twin
+    counts, which MAX_TWINS_PER_RUN already caps; this one was not bounded by
+    anything.
+    """
+    from fastapi.testclient import TestClient
+
+    import app.main as m
+
+    monkeypatch.setenv("COGNISWARM_ALLOW_ANONYMOUS", "1")
+    # A small limit so the test does not depend on wall-clock luck.
+    m._relay_limiter = m._IngestLimiter(limit=3, window_s=60.0)
+
+    with TestClient(m.app) as client:
+        codes = [
+            client.post("/v1/content/media", json={"url": "https://example.test/a.mp4"}).status_code
+            for _ in range(5)
+        ]
+
+    # The first three are ALLOWED past the limiter (they then fail on the
+    # network, which is fine — what matters is that they were not throttled).
+    assert codes.count(429) == 2, f"expected the 4th and 5th to be throttled, got {codes}"
+    assert codes[-1] == 429
+    assert codes[0] != 429
+
+
+def test_the_relay_throttle_names_why_it_differs_from_the_analysis_api(monkeypatch):
+    """A 429 that reads like the generic API limit sends someone to check their
+    twin budget, which is not what they hit."""
+    from fastapi.testclient import TestClient
+
+    import app.main as m
+
+    # limit=1 and then exhaust it. NOT limit=0 — that is the "disabled"
+    # sentinel in `_IngestLimiter.allow`, so a zero would silently test nothing.
+    m._relay_limiter = m._IngestLimiter(limit=1, window_s=60.0)
+    with TestClient(m.app) as client:
+        client.post("/v1/content/media", json={"url": "https://example.test/a.mp4"})
+        r = client.post("/v1/content/media", json={"url": "https://example.test/a.mp4"})
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    assert "media files" in r.json()["detail"]
