@@ -145,6 +145,12 @@ export function AssetInput({
   const [manifest, setManifest] = useState<YouTubeManifest | null>(null);
   const [detected, setDetected] = useState(false);
 
+  // `direct` means the server read the content itself and there is nothing to
+  // warn about; anything else means it settled for less than what was asked
+  // for, and the picker says so rather than only the receipt.
+  const rung = manifest?.rung ?? receipt?.rung;
+  const degradedRung = rung && rung !== "video" && rung !== "direct" ? rung : null;
+
   const textarea = (
     placeholder: string,
     value: string,
@@ -205,7 +211,20 @@ export function AssetInput({
           legitimately be studied two ways — page prose is also just text — and
           because the pasted-prose case has no detectable answer. */}
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="hud-label mr-1 text-muted">{detected ? "DETECTED" : "STUDY AS"}</span>
+        {/* The label carries the warning, not just the receipt below it.
+            When a YouTube link degrades to its thumbnail the picker jumps from
+            Script/copy to Image on its own, and that jump is what the eye is
+            on — reported as "feels weird" by someone watching it happen, with
+            the explanation sitting three lines lower in 9px amber. A picker
+            that moves silently is the problem; one that says why it moved is
+            the product doing the work. */}
+        {detected && degradedRung ? (
+          <span className="hud-label mr-1 text-[#f2ad1f]">
+            DETECTED · {degradedRung === "metadata" ? "PREVIEW ONLY" : `${degradedRung} ONLY`}
+          </span>
+        ) : (
+          <span className="hud-label mr-1 text-muted">{detected ? "DETECTED" : "STUDY AS"}</span>
+        )}
         {KINDS.map((k) => {
           const on = kind === k.id;
           return (
