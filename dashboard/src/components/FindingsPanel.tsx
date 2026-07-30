@@ -23,6 +23,7 @@
  */
 
 import { useState } from "react";
+import Interval from "./Interval";
 import { AnimatePresence, motion } from "framer-motion";
 import type { EvidenceRow, FindingRow, FindingsBlock } from "@/lib/api";
 
@@ -265,11 +266,10 @@ function EvidenceDetail({ row, dense }: { row: EvidenceRow; dense?: boolean }) {
       <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] tabular-nums">
         <span className="text-ink">{row.label}</span>
         <span className="text-accent">{row.display}</span>
-        {row.ci && (
-          <span className="text-muted">
-            95% CI [{row.ci[0]}, {row.ci[1]}]
-          </span>
-        )}
+        {/* The absent case is a FINDING, not a gap. It used to render nothing
+            at all, so a number with no interval was indistinguishable from one
+            whose interval had simply not been plumbed through. */}
+        <Interval ci={row.ci as [number, number] | null | undefined} />
         {row.p_value !== null && <span className="text-muted">p={row.p_value.toPrecision(2)}</span>}
         {row.q_value !== null && <span className="text-muted">q={row.q_value.toPrecision(2)}</span>}
         {row.n !== null && <span className="text-muted">n={row.n}</span>}
