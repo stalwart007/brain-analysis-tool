@@ -17,6 +17,7 @@
  */
 
 import { useState } from "react";
+import Interval from "./Interval";
 import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
 import { useStreamRun } from "@/lib/useStreamRun";
@@ -345,12 +346,10 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
                 ? `Recommended order gains ${result.objective_gain.toFixed(3)} ${result.objective_units} over your submitted order.`
                 : `The ${result.objective_gain.toFixed(3)} gain is inside the noise — the interval straddles zero, so keep your current order.`}
             </p>
-            {result.objective_gain_ci && (
-              <p className="mt-1 font-mono text-[10px] text-muted">
-                95% CI {result.objective_gain_ci[0].toFixed(3)} – {result.objective_gain_ci[1].toFixed(3)}
-                {result.search && ` · ${result.search.heuristic}${result.search.optimal ? "" : " (heuristic, not proven optimal)"}`}
-              </p>
-            )}
+            {/* Absent means the run was too small to bootstrap, not that the field
+                is missing — the difference between "check the payload" and
+                "add walks". */}
+            <Interval ci={result.objective_gain_ci} />
           </div>
 
           <div>
