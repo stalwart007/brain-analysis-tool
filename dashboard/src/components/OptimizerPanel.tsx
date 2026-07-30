@@ -17,7 +17,7 @@
 import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import SimStage from "./sim/SimStage";
@@ -283,6 +283,7 @@ function Lineage({ result }: { result: OptimizerResult }) {
 }
 
 export default function OptimizerPanel({ personaCount }: { personaCount: number }) {
+  const streamRun = useStreamRun();
   const [brief, setBrief] = useState("");
   const [seed, setSeed] = useState("");
   const [pop, setPop] = useState(4);

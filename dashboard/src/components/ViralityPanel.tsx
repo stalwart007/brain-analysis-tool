@@ -11,7 +11,7 @@
 import { useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { CognitiveLoad, GenerationBand, ViralityResult } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useAgentCanvas } from "./sim/useAgentCanvas";
@@ -38,6 +38,7 @@ export default function ViralityPanel({ personaCount }: { personaCount: number }
 }
 
 function ViralityInner({ personaCount }: { personaCount: number }) {
+  const streamRun = useStreamRun();
   const [content, setContent] = useState("");
   const [fanout, setFanout] = useState(6);
   const [twins, setTwins] = useState(3);

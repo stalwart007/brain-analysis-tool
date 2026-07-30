@@ -37,7 +37,7 @@
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { RoomFalsification, RoomMember, RoomResult, RoomTurn } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { ChartCursorProvider, useChartCursor } from "./charts/cursor";
 import FindingsPanel, { ResearchQuestion } from "./FindingsPanel";
 import { adaptMember, adaptRoomResult, withConditioning } from "./room/adapt";
@@ -103,6 +103,7 @@ export default function RoomPanel() {
 }
 
 function RoomInner() {
+  const streamRun = useStreamRun();
   const [brief, setBrief] = useState("");
   const [motionText, setMotionText] = useState("");
   const [question, setQuestion] = useState("");

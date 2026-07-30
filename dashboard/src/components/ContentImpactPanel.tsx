@@ -12,7 +12,7 @@
 import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import BrainMap, { SystemScores } from "./BrainMap";
 import SimStage from "./sim/SimStage";
@@ -114,6 +114,7 @@ export default function ContentImpactPanel(props: { personaCount: number }) {
 
 
 function ContentImpactInner({ personaCount }: { personaCount: number }) {
+  const streamRun = useStreamRun();
   const [kind, setKind] = useState<AssetKind>("text");
   const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
   const [question, setQuestion] = useState("");

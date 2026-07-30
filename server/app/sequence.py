@@ -77,6 +77,7 @@ from typing import AsyncIterator, Optional, Sequence
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import bayesian_ab, bootstrap_ci
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
 from .oai import Refusal, async_client, parse_completion, response_format_for
@@ -901,15 +902,13 @@ async def stream_sequence(
     walkers = [
         persona for _rep in range(request.twins_per_persona) for persona in personas
     ]
-    tasks = [
-        asyncio.create_task(one(persona, order_index))
-        for persona, order_index in zip(walkers, assignment)
-    ]
+    dispatch = as_they_land(
+        one(persona, order_index) for persona, order_index in zip(walkers, assignment)
+    )
 
     walks: list[dict] = []
     failed = 0
-    for coro in asyncio.as_completed(tasks):
-        order_index, order, walk = await coro
+    async for order_index, order, walk in dispatch:
         if walk is None:
             failed += 1
             yield {"type": "agent_failed", "ordering_index": order_index}

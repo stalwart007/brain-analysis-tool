@@ -17,7 +17,8 @@ import {
   InfoDynamics,
   PersonaSeed,
 } from "@/lib/api";
-import { streamRun, StreamEvent } from "@/lib/stream";
+import { StreamEvent } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { keyboardOnlyProps, useChartCursor, useMatrixCursor } from "./charts/cursor";
 import { useAgentCanvas } from "./sim/useAgentCanvas";
 
@@ -48,6 +49,7 @@ export default function CognitionPipeline({
   stored?: CognitionProfile | null; // render a saved profile without streaming
   onDone?: () => void;
 }) {
+  const streamRun = useStreamRun();
   const [status, setStatus] = useState<Record<string, string>>({});
   const [lines, setLines] = useState<ConsoleLine[]>([]);
   const [profile, setProfile] = useState<CognitionProfile | null>(stored ?? null);

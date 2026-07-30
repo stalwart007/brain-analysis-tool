@@ -19,7 +19,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useMatrixCursor } from "./charts/cursor";
@@ -177,6 +177,7 @@ function AdvantageMatrix({ m, labels }: { m: number[][]; labels: string[] }) {
 }
 
 export default function SequencePanel({ personaCount }: { personaCount: number }) {
+  const streamRun = useStreamRun();
   const [text, setText] = useState("");
   const [orderings, setOrderings] = useState(6);
   const [twins, setTwins] = useState(2);

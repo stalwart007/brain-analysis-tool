@@ -26,12 +26,20 @@ export interface StreamEvent {
 export async function streamRun(
   path: string,
   body: unknown,
-  onEvent: (evt: StreamEvent) => void
+  onEvent: (evt: StreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<void> {
+  // WITHOUT `signal` A STUDY CANNOT BE STOPPED. The connection stays open when
+  // the reader navigates away, closes the tab, or presses Run again, so the
+  // backend never sees a disconnect, never cancels its twin tasks, and bills
+  // OpenAI to completion for a result with nowhere to go. Every caller passes
+  // one; the parameter is optional only so a non-React consumer can opt out
+  // deliberately rather than by forgetting.
   const res = await fetch(`/api/cs${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok || !res.body) {
     const detail = await res
@@ -53,7 +61,18 @@ export async function streamRun(
   // run the user had just watched 40 agents land in, with nothing said.
   let terminal = false;
   for (;;) {
-    const { done, value } = await reader.read();
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      // An abort is a DECISION, not a failure. Without this the deliberate
+      // cancellation below surfaces as "the backend may have restarted",
+      // which is the same misdiagnosis-in-a-message this file already fixed
+      // once for the silent-close case.
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      throw e;
+    }
+    const { done, value } = chunk;
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let idx: number;
@@ -77,7 +96,7 @@ export async function streamRun(
       onEvent(evt);
     }
   }
-  if (!terminal) {
+  if (!terminal && !signal?.aborted) {
     onEvent({
       type: "error",
       detail:
