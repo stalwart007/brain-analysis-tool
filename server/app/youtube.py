@@ -52,13 +52,28 @@ from html import unescape
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from .fetching import FetchFailed, UnsafeURL, fetch_json, fetch_text
+from .config import YOUTUBE_PROXY
+from .fetching import (
+    FetchFailed,
+    UnsafeURL,
+    allow_proxy_url,
+    fetch_json,
+    fetch_text,
+    proxied_fetch_json,
+)
 
 #: The public web client key. This is not a secret and never was — it ships in
 #: the JavaScript of every youtube.com page and identifies the API surface, not
 #: the caller. Hardcoding it is what the YouTube apps do.
 _INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 _PLAYER_ENDPOINT = f"https://www.youtube.com/youtubei/v1/player?key={_INNERTUBE_KEY}"
+
+#: The one destination the egress proxy may carry. Registered here, enforced in
+#: `fetching`, and deliberately the only entry: everything else this module
+#: fetches — storyboards, captions, stills — is measured to work fine from a
+#: datacentre address, so proxying it would spend bandwidth to solve a problem
+#: that does not exist.
+allow_proxy_url(_PLAYER_ENDPOINT)
 
 #: Client identities to try, in order, with the User-Agent each one must carry.
 #:
@@ -437,9 +452,18 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
             }
         ).encode()
         try:
-            doc, _final = await fetch_json(
-                _PLAYER_ENDPOINT, body=payload, user_agent=agent
-            )
+            if YOUTUBE_PROXY:
+                # The one call that needs to come from a clean address. Roughly
+                # 200 kB, once an hour per video thanks to the cache — which is
+                # why routing it costs fractions of a cent rather than the
+                # dollars proxying the media would.
+                doc, _final = await proxied_fetch_json(
+                    _PLAYER_ENDPOINT, proxy=YOUTUBE_PROXY, body=payload, user_agent=agent
+                )
+            else:
+                doc, _final = await fetch_json(
+                    _PLAYER_ENDPOINT, body=payload, user_agent=agent
+                )
         except (UnsafeURL, FetchFailed) as exc:
             last_reason = str(exc)
             continue
