@@ -14,6 +14,8 @@ chapters at all was studied at moments chosen by a sentence about something
 else, and nothing in the output said so.
 """
 
+import asyncio
+
 import pytest
 
 from app.youtube import (
@@ -22,9 +24,11 @@ from app.youtube import (
     VideoManifest,
     _parse_json3,
     _parse_timedtext_xml,
+    _is_bot_wall,
     _storyboard_from_spec,
     choose_rung,
     is_youtube_url,
+    manifest_envelope,
     parse_chapters,
     parse_video_id,
     pick_caption_track,
@@ -37,6 +41,11 @@ from app.youtube import (
 #: LEVEL INDEX is positional — so a synthetic or trimmed string would test the
 #: parser against a format of this file's own invention. All three tiers are
 #: kept for that reason: dropping one silently renumbers the rest.
+def asyncio_run(coro):
+    """`asyncio.run` under a name that reads as a helper at the call sites."""
+    return asyncio.run(coro)
+
+
 REAL_SPEC = (
     "https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L$L/$N.jpg?sqp=-oaymwENSDf"
     "|48#27#100#10#10#0#default#rs$AOn4CLDgtWGAnaqZ"
@@ -287,8 +296,44 @@ def test_rung_prefers_picture_then_speech_then_the_creators_own_words():
     assert choose_rung(_manifest(), cues, board_frames) == "video"
     assert choose_rung(_manifest(), cues, []) == "audio"
     assert choose_rung(_manifest(chapters=chapters), [], []) == "text"
-    # Nothing readable at all is refused rather than studied.
-    assert choose_rung(_manifest(storyboard=None), [], []) == "none"
+    # The floor: a thumbnail and nothing else. Not an edge case — measured from
+    # Fly, InnerTube answers "Sign in to confirm you're not a bot" for most
+    # videos, so this is the rung production actually lands on.
+    assert choose_rung(_manifest(storyboard=None), [], []) == "metadata"
+    # Nothing readable at all, not even a still, is refused rather than studied.
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url=""), [], []) == "none"
+
+
+def test_the_bot_wall_is_named_as_a_block_on_us_not_on_the_video():
+    """THE production regression.
+
+    InnerTube refuses datacentre addresses with "Sign in to confirm you're not a
+    bot". That was reported as "Private, age-restricted, members-only and
+    region-blocked videos all look like this" — four permission states, none of
+    which applied, for a video that was public. It sent the reader to check
+    settings they did not need to change, on a condition that clears by itself.
+    """
+    assert _is_bot_wall("Sign in to confirm you’re not a bot") is True
+    assert _is_bot_wall("SIGN IN TO CONFIRM you are not a BOT") is True
+    # A real permission failure must NOT be softened into "just retry".
+    assert _is_bot_wall("This video is private") is False
+    assert _is_bot_wall("") is False
+
+
+def test_a_metadata_rung_manifest_reports_the_cause_before_anything_else():
+    """The receipt leads with why it degraded, because that is the only line
+    that tells the reader whether there is anything to do."""
+    blocked = _manifest(
+        storyboard=None, client="oembed", blocked_reason="Sign in to confirm you’re not a bot"
+    )
+    envelope = manifest_envelope(blocked, [], [])
+    assert envelope["rung"] == "metadata"
+    assert envelope["degraded"] is True
+    assert envelope["note"].startswith("YouTube refused to describe this video")
+    assert "rate-limiting us" in envelope["note"]
+    # The unrelated explanations must not also appear and confuse the cause.
+    assert "too short" not in envelope["note"]
+    assert "no captions published" not in envelope["note"]
 
 
 def test_a_single_keyframe_is_not_a_temporal_study():
@@ -365,3 +410,93 @@ def test_both_xml_caption_dialects_parse_to_the_same_shape():
         {"t_ms": 1500, "text": "Hello"},
         {"t_ms": 4000, "text": "Bye"},
     ]
+
+
+# ── the oEmbed fallback ────────────────────────────────────────────────────
+
+
+def test_innertube_refusal_falls_back_to_the_public_preview(monkeypatch):
+    """THE production fix, exercised without a network.
+
+    Measured from the deployment host: InnerTube answers "Sign in to confirm
+    you're not a bot" for most videos, while oEmbed answers 200 for all of
+    them. Before this fallback existed, that combination produced a 502 for a
+    public video — so the feature worked in development and failed in
+    production, which is the worst shape a failure can take.
+    """
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        if "youtubei" in url:
+            # What the bot wall actually returns: HTTP 200, with the refusal
+            # inside `playabilityStatus`. A status-code check would miss it.
+            return (
+                {
+                    "playabilityStatus": {
+                        "status": "LOGIN_REQUIRED",
+                        "reason": "Sign in to confirm you’re not a bot",
+                    },
+                    "videoDetails": {},
+                },
+                url,
+            )
+        return (
+            {
+                "title": "Me at the zoo",
+                "author_name": "jawed",
+                "thumbnail_url": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg",
+            },
+            url,
+        )
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+    assert manifest.client == "oembed"
+    assert manifest.title == "Me at the zoo"
+    assert manifest.author == "jawed"
+    assert manifest.thumbnail_url.endswith("hqdefault.jpg")
+    # Both InnerTube clients are tried before falling back — giving up after one
+    # would degrade videos that the second client would have served in full.
+    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS)
+    # Duration is NOT invented. Every downstream timestamp derives from it.
+    assert manifest.duration_s == 0
+    assert yt._is_bot_wall(manifest.blocked_reason)
+
+    envelope = yt.manifest_envelope(manifest, [], [])
+    assert envelope["rung"] == "metadata"
+    assert "rate-limiting us" in envelope["note"]
+
+
+def test_a_real_permission_failure_is_not_softened_into_retry_advice(monkeypatch):
+    """A private video and a rate-limited server look similar and are not.
+
+    Telling someone to retry a video they do not have access to is a loop.
+    """
+    import app.youtube as yt
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "ERROR", "reason": "This video is private"}, "videoDetails": {}}, url)
+        return ({"title": "Private thing", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+    note = yt.manifest_envelope(manifest, [], [])["note"]
+    assert "This video is private" in note
+    assert "rate-limiting" not in note
+
+
+def test_everything_failing_still_raises(monkeypatch):
+    """The fallback must not turn a dead link into a confident empty study."""
+    import app.youtube as yt
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        raise yt.FetchFailed("nope")
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    with pytest.raises(yt.YouTubeUnavailable):
+        asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))

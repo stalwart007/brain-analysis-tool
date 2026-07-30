@@ -189,6 +189,28 @@ export default function UniversalInput({
       };
       mark("resolve", "done", new URL(receipt.finalUrl).hostname);
 
+      // ── YouTube on the bottom rung: the server already sent the still ──
+      //
+      // When InnerTube refuses us — which, measured from the production host,
+      // is the COMMON case — the server falls back to the public preview and
+      // answers with a ready `image` asset plus the manifest. There is nothing
+      // for the browser to crop, and handing this to `ingestYouTube` would run
+      // it off the end of the ladder into `chaptersAsText` and submit a text
+      // asset containing one sentence, discarding the thumbnail the server had
+      // already fetched and encoded.
+      if (data.youtube && data.rung === "metadata") {
+        mark("identify", "done", "youtube · preview only");
+        mark("retrieve", "done", `${(receipt.bytes / 1024).toFixed(0)} kB`);
+        mark("prepare", "done", "thumbnail");
+        onResolved({
+          kind: "image",
+          asset: { ...data.asset, kind: "image" },
+          manifest: data.youtube,
+          receipt,
+        });
+        return;
+      }
+
       // ── YouTube: a real timeline, cropped in this browser ───────────
       if (data.youtube) {
         mark("identify", "done", `youtube · ${data.youtube.rung}`);
