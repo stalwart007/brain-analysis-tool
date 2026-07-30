@@ -43,9 +43,9 @@ tomorrow, and a second transport is how an SSRF guard ends up with a hole in it.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from html import unescape
@@ -355,54 +355,75 @@ def _storyboard_from_spec(spec: str, duration_s: int) -> Optional[StoryboardLeve
     )
 
 
-#: When to re-ask, in seconds, after the client list is exhausted by the bot
-#: wall. Measured: the wall is RATE-based, not per-video and not permanent —
-#: the same video that answers `LOGIN_REQUIRED` on one request answers `OK` on
-#: another seconds later, and ANDROID succeeds where every other client fails.
+#: Successful manifests, by video id, with the time they were fetched.
 #:
-#: This matters more than it looks. Without a retry, one throttled moment
-#: permanently downgraded the study from "keyframes and 33 caption tracks" to
-#: "a thumbnail" — and the researcher saw the content-type picker jump to Image
-#: with no idea why. The backoff converts most of those back into real video
-#: studies for the cost of a few seconds on the unlucky requests only.
+#: THE ONLY LEVER THAT ACTUALLY HELPS. The bot wall is not per-video and not
+#: per-request — it is IP REPUTATION, earned by volume. Every extra call makes
+#: the next one likelier to fail, which means the instinctive fixes (retry, try
+#: more clients, back off and try again) all make the problem WORSE, and were
+#: measured doing exactly that: a burst of matrix probing took this host from
+#: "ANDROID answers with a storyboard and 33 caption tracks" to "every client
+#: and every library refuses", including a bare urllib call that had succeeded
+#: minutes earlier.
 #:
-#: Deliberately short and bounded. This is one interactive request a person is
-#: waiting on, not a background job; two extra tries is the point where waiting
-#: longer costs more than the better rung is worth.
-_RETRY_DELAYS = (1.5, 4.0)
+#: So the fix is to ASK LESS. A researcher pasting the same link twice, or
+#: re-running a study, or a second person studying the same video, now costs
+#: zero requests instead of two.
+_MANIFEST_CACHE: dict[str, tuple[float, "VideoManifest"]] = {}
+
+#: An hour. Long enough to cover a working session on one piece of content,
+#: short enough that a video's captions appearing, or its title changing, shows
+#: up the same day. Only SUCCESSES are cached — a refusal is a fact about this
+#: minute's rate limit, not about the video, and caching it would turn a
+#: transient block into a persistent one.
+_CACHE_TTL_S = 3600.0
+
+#: Bounded so a long-lived process cannot grow this without limit. Small
+#: because the access pattern is a handful of videos per session, not a corpus.
+_CACHE_MAX = 256
+
+
+def _cache_get(video_id: str) -> Optional[VideoManifest]:
+    entry = _MANIFEST_CACHE.get(video_id)
+    if entry is None:
+        return None
+    fetched_at, manifest = entry
+    if time.monotonic() - fetched_at > _CACHE_TTL_S:
+        _MANIFEST_CACHE.pop(video_id, None)
+        return None
+    return manifest
+
+
+def _cache_put(video_id: str, manifest: VideoManifest) -> None:
+    if len(_MANIFEST_CACHE) >= _CACHE_MAX:
+        # Oldest out. Insertion-ordered dicts make this exact without a heap,
+        # and the eviction rate here is effectively zero anyway.
+        _MANIFEST_CACHE.pop(next(iter(_MANIFEST_CACHE)), None)
+    _MANIFEST_CACHE[video_id] = (time.monotonic(), manifest)
 
 
 async def fetch_manifest(video_id: str) -> VideoManifest:
-    """Ask InnerTube what this video is, with a backoff on the rate limiter.
+    """Ask InnerTube what this video is, asking as few times as possible.
 
     A per-client failure is not fatal and a per-client REFUSAL is not either:
     the WEB client answers 200 with `playabilityStatus: UNPLAYABLE` from a
-    datacentre address, which is a refusal wearing a success code. Only the
-    exhaustion of every client — and then of the retries, and then of oEmbed —
-    is reported to the caller.
+    datacentre address, which is a refusal wearing a success code.
+
+    ONCE THE BOT WALL APPEARS, THIS STOPS ASKING. That is the opposite of the
+    obvious design and it is what the measurements support: the wall is keyed to
+    the address, so a second client from the same address meets the same wall,
+    and the matrix confirms the ordering is one-way — ANDROID succeeds where IOS
+    fails and never the reverse. Trying the rest would spend requests that make
+    the NEXT researcher's link likelier to fail, to obtain a refusal we can
+    already predict.
     """
+    cached = _cache_get(video_id)
+    if cached is not None:
+        return cached
+
     last_reason = ""
 
-    # The full client list, then ANDROID again after a pause, and again.
-    # ANDROID rather than round-robin because the client matrix run against the
-    # production host is unambiguous: ANDROID answers for videos every other
-    # client refuses. Re-asking the strongest client beats cycling weak ones.
-    schedule: list[tuple[str, dict, str, float]] = [
-        (name, context, agent, 0.0) for name, context, agent in _CLIENTS
-    ]
-    primary = _CLIENTS[0]
-    schedule += [(primary[0], primary[1], primary[2], delay) for delay in _RETRY_DELAYS]
-
-    for name, context, agent, delay in schedule:
-        if delay:
-            # Retry ONLY the rate limiter. A private, deleted or region-blocked
-            # video answers the same way however many times it is asked, so
-            # backing off on those spends five seconds of someone's attention to
-            # arrive at the identical refusal — and the reason string is what
-            # tells the two apart.
-            if not _is_bot_wall(last_reason):
-                break
-            await asyncio.sleep(delay)
+    for name, context, agent in _CLIENTS:
         payload = json.dumps(
             {
                 "videoId": video_id,
@@ -423,6 +444,12 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
         details = (doc.get("videoDetails") or {})
         if status.get("status") not in {"OK", None} or not details.get("title"):
             last_reason = status.get("reason") or status.get("status") or "no video details"
+            if _is_bot_wall(last_reason):
+                # The wall is on the ADDRESS, not the client or the video. The
+                # next client shares the address, so it meets the same wall —
+                # and spending the request makes the next caller's link likelier
+                # to fail. Stop here and take the preview.
+                break
             continue
 
         try:
@@ -460,7 +487,7 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
         except (TypeError, ValueError):
             views = None
 
-        return VideoManifest(
+        manifest = VideoManifest(
             video_id=video_id,
             title=details.get("title") or "(untitled)",
             author=details.get("author") or "",
@@ -478,6 +505,11 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
             storyboard=_storyboard_from_spec(spec, duration_s),
             client=name,
         )
+        # Only successes. A refusal describes this minute's rate limit, not the
+        # video, and caching one would turn a transient block into an hour-long
+        # one for a link that would have worked on the next try.
+        _cache_put(video_id, manifest)
+        return manifest
 
     # ── InnerTube refused. Fall back to oEmbed. ─────────────────────────
     #
@@ -754,8 +786,17 @@ def manifest_envelope(manifest: VideoManifest, cues: list[dict], frames: list[di
         parts.append(
             "YouTube refused to describe this video to our server"
             + (
-                " — it is rate-limiting us, which is temporary and nothing to do "
-                "with the video. Retrying later usually works"
+                # Deliberately does NOT say "try again". The block is on this
+                # server's address and is earned by request VOLUME, so retrying
+                # deepens it — measured: a burst of probing took this host from
+                # "ANDROID answers with a storyboard and 33 caption tracks" to
+                # every client refusing. Telling someone to retry would make
+                # their next link worse and everyone else's too. The reliable
+                # route is the one that does not involve YouTube's API at all.
+                " — it blocks datacentre addresses like ours, which is about "
+                "where we are calling from and not about this video. For the "
+                "full study, download the video and drop the file in above; "
+                "keyframes are read in your browser"
                 if _is_bot_wall(manifest.blocked_reason)
                 else f" ({manifest.blocked_reason})"
             )
