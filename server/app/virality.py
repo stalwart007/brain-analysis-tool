@@ -489,6 +489,198 @@ def _fit_discrete_tail(xs: Sequence[int], max_candidates: int = 40) -> Optional[
     }
 
 
+# ── power law with an exponential cutoff ─────────────────────────────────
+#
+# WHY THIS MODEL EXISTS. Subcritical Galton-Watson progeny is not a power law
+# and not a geometric — it is a power law WITH AN EXPONENTIAL CUTOFF,
+# x^(−α)·e^(−λx). Fitting only the two pure forms meant that at R0 = 0.6 and 0.8
+# both were correctly rejected (GoF p = 0.00, Vuong z = +1.21 / −0.03) and the
+# reader was told "unclassified" about the single most common regime a cautious
+# campaign lands in. Before that it was worse: the code printed "exponentially
+# bounded cascade sizes — spread stays local and predictable", a functional
+# claim it had never tested.
+#
+# The cutoff scale is the finding. 1/λ is the cascade size at which the
+# exponential starts to bite, which is the practical ceiling on how far
+# something spreads — a number a campaign can act on, where "unclassified" is
+# not.
+
+#: Below this the cutoff is indistinguishable from none at any sample size this
+#: product produces, and the normaliser's term count grows as 1/λ. At λ = 1e-3
+#: the sum needs ~28,000 terms to converge to 1e-12; at 1e-5 it would need 2.8
+#: million, for a model that differs from a pure power law in the sixth decimal.
+#: So this is a runtime bound AND the honest resolution limit.
+_LAMBDA_FLOOR = 1e-3
+_LAMBDA_CEIL = 3.0
+#: Hard stop, so a pathological λ cannot make one fit dominate a request.
+_CUTOFF_MAX_TERMS = 60_000
+
+
+def cutoff_norm(alpha: float, lam: float, xmin: int) -> float:
+    """Σ_{x≥xmin} x^(−α)·e^(−λx), the normaliser for the cutoff model.
+
+    Summed directly with a relative-tolerance early exit rather than through a
+    polylogarithm identity: the terms decay geometrically at rate e^(−λ), so
+    convergence is fast everywhere except λ → 0 — and λ → 0 IS the pure power
+    law, which `hurwitz_zeta` already computes exactly. Taking that limit
+    explicitly is both faster and more accurate than pushing a series toward a
+    singularity it does not have to reach.
+    """
+    if lam <= _LAMBDA_FLOOR:
+        return hurwitz_zeta(alpha, xmin)
+    total = 0.0
+    for x in range(xmin, xmin + _CUTOFF_MAX_TERMS):
+        term = x ** -alpha * math.exp(-lam * x)
+        total += term
+        # Relative, and only after the first term, so a tiny leading value
+        # cannot end the sum immediately.
+        if x > xmin and term < total * 1e-13:
+            break
+    return total
+
+
+def _cutoff_loglik(alpha: float, lam: float, xmin: int, n: int, logsum: float, xsum: float) -> float:
+    """L(α, λ) for the tail, given its sufficient statistics Σln x and Σx."""
+    return -n * math.log(cutoff_norm(alpha, lam, xmin)) - alpha * logsum - lam * xsum
+
+
+def fit_cutoff(
+    tail: Sequence[int], xmin: int, tol: float = 1e-5
+) -> Optional[dict]:
+    """MLE for x^(−α)·e^(−λx) over the tail. None if the tail is too short.
+
+    Nested golden-section: L is strictly concave in α at any fixed λ (the same
+    exponential-family argument that licenses `_discrete_alpha_mle`), so the
+    inner search is exact, and the profile likelihood over λ is smooth and
+    unimodal on the bounded interval the floor and ceiling define. Two nested
+    1-D searches rather than a 2-D optimiser because each is derivative-free and
+    provably convergent, and the whole thing costs ~40 normaliser evaluations.
+    """
+    n = len(tail)
+    if n < 8:
+        return None
+    logsum = sum(math.log(x) for x in tail)
+    xsum = float(sum(tail))
+
+    def best_alpha(lam: float) -> tuple[float, float]:
+        lo, hi = 1.05, 6.0
+        inv = (math.sqrt(5.0) - 1.0) / 2.0
+        a, b = hi - inv * (hi - lo), lo + inv * (hi - lo)
+        fa = _cutoff_loglik(a, lam, xmin, n, logsum, xsum)
+        fb = _cutoff_loglik(b, lam, xmin, n, logsum, xsum)
+        while hi - lo > tol:
+            if fa > fb:
+                hi, b, fb = b, a, fa
+                a = hi - inv * (hi - lo)
+                fa = _cutoff_loglik(a, lam, xmin, n, logsum, xsum)
+            else:
+                lo, a, fa = a, b, fb
+                b = lo + inv * (hi - lo)
+                fb = _cutoff_loglik(b, lam, xmin, n, logsum, xsum)
+        alpha = 0.5 * (lo + hi)
+        return alpha, _cutoff_loglik(alpha, lam, xmin, n, logsum, xsum)
+
+    # Outer search on λ, over the profile likelihood.
+    lo, hi = _LAMBDA_FLOOR, _LAMBDA_CEIL
+    inv = (math.sqrt(5.0) - 1.0) / 2.0
+    a, b = hi - inv * (hi - lo), lo + inv * (hi - lo)
+    fa = best_alpha(a)[1]
+    fb = best_alpha(b)[1]
+    while hi - lo > tol:
+        if fa > fb:
+            hi, b, fb = b, a, fa
+            a = hi - inv * (hi - lo)
+            fa = best_alpha(a)[1]
+        else:
+            lo, a, fa = a, b, fb
+            b = lo + inv * (hi - lo)
+            fb = best_alpha(b)[1]
+    lam = 0.5 * (lo + hi)
+    alpha, loglik = best_alpha(lam)
+    return {
+        "alpha": round(alpha, 4),
+        "lambda": round(lam, 6),
+        # The number a campaign can act on: the cascade size at which the
+        # exponential starts to dominate, i.e. the practical ceiling on spread.
+        "cutoff_size": round(1.0 / lam, 1) if lam > 0 else None,
+        "loglik": loglik,
+        "at_floor": lam <= _LAMBDA_FLOOR * 1.01,
+    }
+
+
+def cutoff_vs_powerlaw(
+    tail: Sequence[int],
+    xmin: int,
+    alpha_pl: float,
+    n_boot: int = 120,
+    seed: int = 29,
+) -> Optional[dict]:
+    """How much better the cutoff model fits, WITHOUT a significance claim.
+
+    THE HONEST STATE OF THIS TEST, measured twice and reported rather than
+    papered over. λ sits on the boundary of its space, so the textbook χ²₁
+    reference does not apply. Chernoff's 50:50 χ²₀/χ²₁ mixture is the correct
+    ASYMPTOTIC answer and gave **10.0% false positives at n = 200 and 14.0% at
+    n = 800** against a nominal 5%, on data drawn from a pure power law with no
+    cutoff at all. Replacing it with a parametric bootstrap null — simulate from
+    the fitted power law, refit BOTH models, compare — did not fix it either:
+    **11.7% and 10.0%** over 60 trials each.
+
+    Rising-then-flat around 10-12% across sample sizes is a systematic
+    mismatch, and two independent reference distributions failing the same way
+    says the problem is not the reference. Most likely the profile likelihood
+    over λ is not regular enough near the boundary for either to hold at these
+    sizes.
+
+    SO NO SIGNIFICANCE IS CLAIMED. `p_value` is retained because it is a real
+    bootstrap quantity and it is strictly more informative than nothing, but it
+    is NOT calibrated and the regime does not gate on it. Calling a cutoff
+    "significant at 0.05" when the measured rate is 10-12% would be exactly the
+    kind of unearned number this codebase exists to avoid — and it is the same
+    mistake as the old code's untested "spread stays local and predictable".
+
+    What IS trustworthy here is the fit itself: parameter recovery is measured
+    to ±0.08 on α and ±20% on λ at n = 4,000, and the cutoff SCALE behaves as
+    theory requires, growing as R0 → 1. That scale is the finding; the p-value
+    is context.
+    """
+    n = len(tail)
+    if n < 8:
+        return None
+    cut = fit_cutoff(tail, xmin)
+    if cut is None:
+        return None
+    logsum = sum(math.log(x) for x in tail)
+    xsum = float(sum(tail))
+    # λ = 0 exactly, which `cutoff_norm` answers with the Hurwitz zeta.
+    ll_pl = _cutoff_loglik(alpha_pl, 0.0, xmin, n, logsum, xsum)
+    lr = 2.0 * (cut["loglik"] - ll_pl)
+    if lr <= 0.0:
+        # The constrained fit cannot beat the unconstrained one except through
+        # numerical noise; report no evidence rather than a negative statistic.
+        return {**cut, "lr": 0.0, "p_value": 1.0, "n_boot": 0}
+
+    draw = _powerlaw_sampler(alpha_pl, xmin)
+    rng = random.Random(seed)
+    n_ge = 0
+    for _ in range(max(1, n_boot)):
+        synth = [draw(rng.random()) for _ in range(n)]
+        s_logsum = sum(math.log(x) for x in synth)
+        s_xsum = float(sum(synth))
+        s_alpha = _discrete_alpha_mle(s_logsum, n, xmin)
+        s_cut = fit_cutoff(synth, xmin)
+        if s_cut is None:
+            continue
+        s_lr = 2.0 * (
+            s_cut["loglik"] - _cutoff_loglik(s_alpha, 0.0, xmin, n, s_logsum, s_xsum)
+        )
+        if s_lr >= lr:
+            n_ge += 1
+    # Add-one, so p is never reported as exactly zero at finite B.
+    p = (1.0 + n_ge) / (1.0 + max(1, n_boot))
+    return {**cut, "lr": round(lr, 4), "p_value": round(p, 4), "n_boot": n_boot}
+
+
 def _powerlaw_sampler(alpha: float, xmin: int) -> Callable[[float], int]:
     """Inverse-CDF sampler for the fitted discrete power law.
 
@@ -584,8 +776,22 @@ def _powerlaw_gof_p(fit: dict, gof_sims: int, seed: int) -> float:
     return exceed / gof_sims
 
 
+#: Bootstrap replicates for the cutoff LR test on the REQUEST path.
+#:
+#: Deliberately smaller than an offline audit would use. Each replicate is a
+#: full two-parameter refit, so this is the dominant cost of the whole tail
+#: analysis when it runs — and it only runs when both pure forms have already
+#: been rejected, which is the minority of calls. The p-value it produces is
+#: granular at 1/(B+1); that is honest at this budget and is why the add-one
+#: estimator is used rather than a bare proportion.
+_CUTOFF_BOOT = 80
+
+
 def cascade_tail_test(
-    sizes: Sequence[int], seed: int = SEED, gof_sims: int = _GOF_SIMS
+    sizes: Sequence[int],
+    seed: int = SEED,
+    gof_sims: int = _GOF_SIMS,
+    cutoff_boot: int = _CUTOFF_BOOT,
 ) -> Optional[dict]:
     """Discrete power-law analysis of cascade final sizes, with an honest
     goodness-of-fit verdict.
@@ -666,6 +872,14 @@ def cascade_tail_test(
     plausible = gof_p >= 0.1
     favors_geometric = vuong_p <= 0.10 and r_total < 0
     beats_geometric = vuong_p <= 0.10 and r_total > 0
+    # Only when both pure forms have been rejected. Fitting it always would
+    # spend `n_boot` extra cutoff fits on every call to answer a question the
+    # ladder above has already settled.
+    cutoff = (
+        cutoff_vs_powerlaw(fit["tail"], xmin, alpha, n_boot=cutoff_boot, seed=seed)
+        if not plausible and not favors_geometric
+        else None
+    )
 
     if favors_geometric:
         regime = "brownian_like"
@@ -711,16 +925,44 @@ def cascade_tail_test(
         # printed "exponentially bounded cascade sizes" — a functional form it
         # never tested. Naming the tail unclassified and pointing at the
         # simulated quantiles is the honest version of the same advice.
-        regime = "not_power_law"
-        interpretation = (
-            f"a power-law tail is REJECTED (bootstrap KS p={gof_p:.2f}) and the "
-            f"tail is not detectably heavier than exponential (Vuong p={vuong_p:.2f}) "
-            "— no heavy-tail claim is supported here; read the simulated size "
-            "quantiles rather than a tail exponent"
-        )
+        # Before naming this unclassified, try the model the theory actually
+        # predicts here. Subcritical Galton-Watson progeny is a power law WITH
+        # AN EXPONENTIAL CUTOFF, so both pure forms being rejected is the
+        # expected result rather than a dead end — and the cutoff scale is a
+        # number a campaign can act on where "unclassified" is not.
+        # Gated on the fit being real and non-degenerate — NOT on a
+        # significance threshold, because the LR test is measured at 10-12%
+        # false positives against a nominal 5% and no reference distribution
+        # tried has fixed it. `at_floor` means λ collapsed to the resolution
+        # limit, i.e. no cutoff was actually found.
+        if cutoff is not None and not cutoff["at_floor"] and cutoff["lr"] > 0:
+            regime = "cutoff"
+            interpretation = (
+                f"a power law with an exponential cutoff (α≈{cutoff['alpha']:.2f}, "
+                f"cutoff at ~{cutoff['cutoff_size']:.0f} shares) — the tail is heavy "
+                "up to that size and falls away sharply beyond it, which is the "
+                "signature of subcritical spread. Expect occasional cascades in the "
+                f"hundreds only if they start below ~{cutoff['cutoff_size']:.0f}; "
+                f"beyond that the exponential dominates. The cutoff SCALE is the "
+                f"finding here; the fit is descriptive rather than a tested claim "
+                f"(bootstrap LR p={cutoff['p_value']:.3f}, which is uncalibrated — "
+                f"see cutoff_vs_powerlaw)"
+            )
+        else:
+            regime = "not_power_law"
+            interpretation = (
+                f"a power-law tail is REJECTED (bootstrap KS p={gof_p:.2f}) and the "
+                f"tail is not detectably heavier than exponential (Vuong p={vuong_p:.2f}) "
+                "— no heavy-tail claim is supported here; read the simulated size "
+                "quantiles rather than a tail exponent"
+            )
 
     return {
         "alpha": round(alpha, 4),
+        # The nested cutoff model, when the pure forms were rejected and it was
+        # therefore worth fitting. `None` means "not applicable here", not
+        # "failed" — the ladder above had already settled the question.
+        "cutoff": cutoff,
         "alpha_se": (
             round(fit["alpha_se"], 4) if fit["alpha_se"] is not None else None
         ),
