@@ -638,6 +638,108 @@ async def fetch_json(
     return doc, fetched.final_url
 
 
+#: The ONLY destinations reachable through the egress proxy.
+#:
+#: THIS TUPLE IS THE SECURITY BOUNDARY, so it is a constant and never a
+#: parameter. Everywhere else in this module the SSRF defence rests on
+#: resolving the host ourselves and connecting to the ADDRESS we validated —
+#: and that is exactly what a proxy makes impossible, because the proxy does
+#: the resolution and we never see the address. Routing caller-supplied URLs
+#: through it would hand back every hole this file exists to close: the
+#: metadata service, the private 6PN backend, the lot.
+#:
+#: So the proxy is not a general capability. It carries one hardcoded URL,
+#: matched in full, and `proxied_fetch_json` refuses anything else before it
+#: opens a socket. Adding an entry here is a security decision and should read
+#: as one.
+#: Mutated in place, never rebound. A `global` reassignment here would leave
+#: every `from .fetching import PROXY_ALLOWED_URLS` holding the empty set it
+#: captured at import time — which reads as "the allowlist is empty" to a human
+#: auditing it, while the check inside the function sees the populated one. A
+#: security control whose contents differ depending on how you look at it is
+#: worse than a permissive one.
+PROXY_ALLOWED_URLS: set[str] = set()
+
+
+def allow_proxy_url(url: str) -> None:
+    """Register a constant URL as proxy-reachable. Import-time only.
+
+    Called by `app.youtube` for the InnerTube player endpoint. A function
+    rather than a literal in this file so the destination lives beside the code
+    that knows why it needs one, but the ENFORCEMENT stays here, next to the
+    guard it is an exception to.
+    """
+    # Compared without its query string, because the query is where a
+    # caller-controlled value would hide.
+    base, _, _ = url.partition("?")
+    PROXY_ALLOWED_URLS.add(base)
+
+
+async def proxied_fetch_json(
+    url: str,
+    *,
+    proxy: str,
+    body: Optional[bytes] = None,
+    user_agent: Optional[str] = None,
+    max_bytes: int = 4_000_000,
+) -> tuple[dict, str]:
+    """POST a JSON API through an egress proxy, to a constant destination.
+
+    The IP-pinning defence cannot apply here and is not pretended at. What
+    replaces it is that the destination is not caller-controlled at all: the URL
+    must appear in `PROXY_ALLOWED_URLS`, which no request can influence.
+
+    Redirects are NOT followed. Elsewhere they are walked by hand and
+    revalidated; through a proxy there is nothing to revalidate against, so a
+    redirect is a signal that the destination is not what we allowlisted and is
+    treated as a failure rather than a hop.
+    """
+    import json as _json
+
+    base, _, _ = url.partition("?")
+    if base not in PROXY_ALLOWED_URLS:
+        raise UnsafeURL(
+            f"{base} is not an allowlisted proxy destination. The egress proxy "
+            "carries a fixed set of endpoints and cannot be pointed at a URL "
+            "from a request."
+        )
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": user_agent or USER_AGENT,
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy,
+            follow_redirects=False,
+            timeout=httpx.Timeout(TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT),
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=0),
+            trust_env=False,
+        ) as client:
+            response = await client.request(
+                "POST" if body is not None else "GET", url, content=body, headers=headers
+            )
+    except httpx.HTTPError as exc:
+        raise FetchFailed(f"egress proxy could not reach the endpoint: {type(exc).__name__}") from exc
+
+    if response.is_redirect:
+        raise FetchFailed("the allowlisted endpoint redirected, which is not expected")
+    if response.status_code >= 400:
+        raise FetchFailed(f"endpoint answered {response.status_code} through the proxy")
+    content = response.content[: max_bytes + 1]
+    if len(content) > max_bytes:
+        raise FetchFailed("the endpoint returned more than the cap through the proxy")
+    try:
+        doc = _json.loads(content)
+    except ValueError as exc:
+        raise FetchFailed("the endpoint answered with malformed JSON through the proxy") from exc
+    if not isinstance(doc, dict):
+        raise FetchFailed("the endpoint answered with JSON that is not an object")
+    return doc, url
+
+
 #: A caption track is served as JSON or as one of two XML dialects depending on
 #: the `fmt` asked for, and which one an origin honours is not knowable in
 #: advance — so the accepted set spans all of them and the PARSER decides.

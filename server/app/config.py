@@ -37,6 +37,30 @@ def _default_db_path() -> Path:
 
 DB_PATH = Path(os.environ["COGNISWARM_DB"]) if os.environ.get("COGNISWARM_DB") else _default_db_path()
 
+# Proxy for the ONE outbound call YouTube refuses from a datacentre address.
+#
+# WHY THIS IS WORTH HAVING, and why it costs almost nothing. YouTube's player
+# API answers "Sign in to confirm you're not a bot" to Fly's addresses — and
+# Fly cannot help, because every egress IP it offers (including the $3.60/mo
+# static one) is a datacentre IP on Fly's own AS. A fixed one is arguably worse:
+# it gets flagged permanently instead of occasionally rotating into a clean
+# address.
+#
+# But the thing that needs residential egress is TINY. Measured: URLs issued to
+# a residential address work perfectly when fetched from the datacentre —
+# storyboard 200/22 kB, captions 200/47 kB — so the assets are NOT IP-bound.
+# Only the manifest call itself has to originate from a clean address, and that
+# is a single ~200 kB JSON response per video, cached here for an hour.
+#
+# At residential-proxy rates of roughly $1-4/GB that is about $0.0004 per
+# video: five thousand videos for a few dollars. The alternative — proxying the
+# actual media — would be 27-70 MB a video and a hundred times the cost, for
+# frames we already get free from the image CDN.
+#
+# Unset means no proxy and the existing behaviour, unchanged: the manifest call
+# goes direct, and a refusal degrades down the ladder exactly as it does today.
+YOUTUBE_PROXY = os.environ.get("COGNISWARM_YOUTUBE_PROXY") or None
+
 # Max concurrent twin requests against the OpenAI API.
 SWARM_CONCURRENCY = int(os.environ.get("COGNISWARM_CONCURRENCY", "8"))
 
