@@ -5,8 +5,36 @@ import { useEffect, useState } from "react";
 import {
   type BackendHealth,
   getBackendHealth,
+  reportBackendResult,
   subscribeBackendHealth,
 } from "@/lib/health";
+
+/** Has any mounted chip already asked? Module scope, so navigating between
+ *  pages does not re-probe on every mount — the subscription carries the
+ *  answer forward, and one probe per page load is the whole point. */
+let probed = false;
+
+/**
+ * Resolve "connecting" by actually asking, once.
+ *
+ * The chip used to resolve only as a SIDE EFFECT of real API traffic, so on a
+ * page that loads no data — `/room` until you cast, `/panel` before invites —
+ * it sat at "connecting" for as long as the page was open. That reads as a
+ * broken connection when nothing is wrong, and it is the state a user is most
+ * likely to screenshot and ask about.
+ */
+async function probeOnce() {
+  if (probed) return;
+  probed = true;
+  try {
+    const response = await fetch("/api/backend-health", { cache: "no-store" });
+    reportBackendResult(response.status);
+  } catch {
+    // A transport failure IS the answer, and `null` is how health.ts spells
+    // unreachable.
+    reportBackendResult(null);
+  }
+}
 
 /**
  * The vitals chip, reading the actual backend rather than asserting "online".
@@ -24,7 +52,11 @@ function useBackendHealth(): BackendHealth {
   const [health, setHealth] = useState<BackendHealth>(getBackendHealth);
   useEffect(() => {
     setHealth(getBackendHealth());
-    return subscribeBackendHealth(setHealth);
+    const unsubscribe = subscribeBackendHealth(setHealth);
+    // Only when nothing has answered yet. Real API traffic remains the primary
+    // signal — this exists so a page that makes no calls still knows.
+    if (getBackendHealth().ok === null) void probeOnce();
+    return unsubscribe;
   }, []);
   return health;
 }
