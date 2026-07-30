@@ -35,11 +35,16 @@ def test_swarm_aggregate_detects_a_split_audience():
     agg = aggregate_reactions(split, "stimulus", "low")
     assert agg.mean_intent == pytest.approx(0.5, abs=0.01)  # the misleading average
     # Entropy is normalised against the full four-action vocabulary, so a clean
-    # two-way split is log2/log4 = 0.5 — not 1.0. Normalising by the number of
+    # two-way split is ~log2/log4 = 0.5 — not 1.0. Normalising by the number of
     # *observed* actions would give 1.0 here and make this split
     # indistinguishable from a flat spread across all four actions, which is
     # the opposite finding.
-    assert agg.polarization == pytest.approx(0.5)
+    #
+    # 0.518 rather than 0.500 because plug-in entropy is biased DOWN at these
+    # sample sizes and now carries the Miller-Madow correction. The bias runs
+    # in the dangerous direction for this product — it manufactures consensus
+    # out of small samples — so it is corrected and the corrected value pinned.
+    assert agg.polarization == pytest.approx(0.518, abs=0.001)
     assert agg.bimodality is not None and agg.bimodality > 0.555
     assert agg.consensus == "polarised"
     lo, hi = agg.intent_ci
@@ -120,7 +125,25 @@ def test_objection_falls_back_to_exact_grouping_without_embeddings():
     result = aggregate_objections(objs, "low", "pitch", embeddings=None)
     assert result.clustering_method == "exact"
     assert result.top_objections[0].count == 2
-    assert result.recommend_ci is not None
+
+
+def test_objection_recommend_interval_follows_the_bootstrap_guard():
+    """The interval appears when the sample can support one, and not before.
+
+    This used to be asserted inside the grouping-fallback test above, on three
+    objections — so it was really asserting that `bootstrap_ci` would hand back
+    an interval at n = 3, which is exactly the behaviour that was wrong: at that
+    size the "95% CI" was the sample range, and the range of two draws covers
+    the true mean less than half the time. The guard now refuses, and the
+    contract worth pinning is the transition, not either side alone.
+    """
+    three = [_objection("Too expensive"), _objection("Too expensive"), _objection("No trust")]
+    assert aggregate_objections(three, "low", "pitch", embeddings=None).recommend_ci is None
+
+    many = [_objection("Too expensive") for _ in range(6)] + [
+        _objection("No trust") for _ in range(4)
+    ]
+    assert aggregate_objections(many, "low", "pitch", embeddings=None).recommend_ci is not None
 
 
 def test_objection_ignores_none_responses_as_themes():

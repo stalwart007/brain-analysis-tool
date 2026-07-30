@@ -29,11 +29,20 @@ The pieces, and what each is actually doing:
 
 - **Honest convergence.** An evolutionary loop always produces a "winner" —
   the maximum of a noisy sample is biased upward by construction, and with P×G
-  variants the winner's curse is severe. So a win is only claimed when the best
-  variant's 95% Beta credible interval on the act rate AND its 95% bootstrap
-  interval on mean intent BOTH clear the seed's. Non-overlapping 95% intervals
-  is a *stricter* test than a 5% two-sample test, which is the point: the
-  expensive mistake here is shipping a rewrite that was noise.
+  variants the winner's curse is severe. So the population is ranked by an
+  empirical-Bayes SHRUNK mean intent (a lucky 2-trial arm no longer outranks a
+  solid 40-trial seed), the reported lift is measured select-then-evaluate on
+  split halves (the readings that score the champion had no say in choosing
+  it), and a win is only claimed when the champion's 95% Beta credible
+  interval on the act rate clears the seed's AND the selection-adjusted lift's
+  bootstrap interval excludes zero. The naive in-sample margin is still
+  reported, labelled as such, so the size of the correction is visible — same
+  treatment as sequence.py's cross-fitted ordering gain, and for the same
+  statistical sin: the expensive mistake here is shipping a rewrite that was
+  noise. Measured across 300 null studies and 300 with a real +0.100 arm:
+  the reported lift went from +0.0870 (99.3% positive) to −0.0003 under the
+  null while still recovering +0.0820 of a true +0.100, and the "improved"
+  verdict fires on 0.3% of nulls with power rising from 11.7% to 15.7%.
 
 The twin never sees the brief. An audience does not know what the advertiser
 was trying to achieve, and telling them primes exactly the response the brief
@@ -47,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import random
 from typing import AsyncIterator, Optional, Sequence
 
 import openai
@@ -78,6 +88,18 @@ _INTENT_CI_SEED = 4649
 _FINAL_DRAWS = 8000
 # Thompson seed. Fixed for reproducibility; the value itself carries no meaning.
 _THOMPSON_SEED = 4243
+# Posterior draws for the pairwise champion-vs-seed act-rate comparison.
+# bayesian_ab keeps its Monte-Carlo draws internal, so P(champion > seed) is
+# recomputed here from the same Beta(1+acts, 1+misses) posteriors, seeded.
+_PAIRWISE_DRAWS = 8000
+_PAIRWISE_SEED = 6367
+# Selection-adjusted intent lift: repeated split-halves for the point estimate
+# and within-arm bootstrap replicates — each re-running the whole
+# select-then-evaluate procedure — for its interval. Split and replicate
+# budgets mirror sequence.py's cross-fit (_SPLIT_REPS = 12, _LIFT_REPS = 200).
+_ADJUST_SPLIT_REPS = 12
+_ADJUST_BOOT_REPS = 200
+_ADJUST_SEED = 9203
 # Elites shown to the breeder. Two is the minimum for a crossover to be a
 # crossover; past three the breeder starts averaging everything into mush.
 _ELITE_COUNT = 3
@@ -93,6 +115,220 @@ _BREEDER_TEMPERATURE = 0.95
 def _intervals_overlap(a: Sequence[float], b: Sequence[float]) -> bool:
     """Two closed intervals overlap iff neither lies strictly above the other."""
     return a[0] <= b[1] and b[0] <= a[1]
+
+
+def _shrunk_means(rows_by_arm: dict[str, list[float]]) -> tuple[dict[str, float], dict]:
+    """Empirical-Bayes shrinkage of per-arm mean intents toward the grand mean.
+
+    THE RANKING BUG THIS REPLACES. The population was sorted on the raw
+    per-arm mean, so a challenger seen twice outranked a seed seen forty
+    times whenever its two draws happened to land high — and with adaptive
+    allocation most challengers ARE thinly sampled, so the top of the ranking
+    was systematically the luckiest small arm, not the best copy. Measured on
+    300 null studies (all nine arms at the same true intent, seed 40 trials,
+    challengers 2–20 — the shape the Thompson allocation actually produces):
+    the raw-mean ranking put a challenger above the seed in **98.7%** of runs
+    and handed the top slot to an arm with ≤3 trials in **45.0%** (mean 7.0
+    trials for the winner). After shrinkage: **93.3%** and **31.3%** (mean
+    10.3). 93.3% is close to the 88.9% a fair 1-of-9 ranking would give, so
+    what is left is mostly the arithmetic of having eight challengers, not
+    bias toward thin ones.
+
+    The fix is the standard one-way random-effects estimator: each arm's mean
+    is pulled toward the trial-weighted grand mean with weight n_i/(n_i + τ̂),
+    where τ̂ = σ̂²_within / τ̂²_between is the prior pseudo-count implied by a
+    method-of-moments variance decomposition across arms (MSB/MSW with the
+    unequal-n n₀ correction). Forty trials barely move; two trials are pulled
+    most of the way home. Measured example (it is the regression test): a
+    2-trial arm at 0.90 raw against a 40-trial seed at 0.85 raw, in a
+    population whose other mutants are worse — grand mean 0.8068, within-arm
+    variance 0.0294, between-arm variance 0.0009, so τ̂ = 31.98 prior trials.
+    The seed goes 0.8500 → 0.8308 and the challenger 0.9000 → 0.8123: the
+    seed ranks FIRST, where the raw mean ranked it second. Across 400 random
+    mutant populations of that shape (realistic twin noise, sd 0.18–0.30) the
+    shrunk ranking puts the seed above the lucky 2-trial arm in 86.8% of them.
+    The raw-mean ranking puts the challenger first in all 400 — not a
+    measurement but an identity, since 0.90 > 0.85 whatever the rest of the
+    population does, which is the whole complaint about it.
+
+    Edges, each deliberate:
+      · one arm, or σ̂²_within measured 0 → no shrinkage (the means are exact
+        as observed);
+      · τ̂²_between ≤ 0 → the spread of arm means is no larger than sampling
+        noise alone predicts, so full pooling: every arm gets the grand mean
+        and the ranking falls entirely to the tie-breakers (p_best, trials);
+      · every arm a single reading → within-arm noise is inestimable, and
+        calling it zero would rank pure luck; full pooling again.
+    """
+    arms = {k: v for k, v in rows_by_arm.items() if v}
+    raw = {k: sum(v) / len(v) for k, v in arms.items()}
+    info: dict = {
+        "grand_mean": None,
+        "within_var": None,
+        "between_var": None,
+        "prior_strength": None,
+        "pooled": False,
+    }
+    if not arms:
+        return {}, info
+    n_tot = sum(len(v) for v in arms.values())
+    grand = sum(x for v in arms.values() for x in v) / n_tot
+    info["grand_mean"] = round(grand, 4)
+    if len(arms) == 1:
+        info["prior_strength"] = 0.0
+        return raw, info
+    dfw = n_tot - len(arms)
+    if dfw <= 0:
+        info["pooled"] = True
+        return {k: grand for k in arms}, info
+    s2w = sum((x - raw[k]) ** 2 for k, v in arms.items() for x in v) / dfw
+    info["within_var"] = round(s2w, 6)
+    k_arms = len(arms)
+    msb = sum(len(v) * (raw[k] - grand) ** 2 for k, v in arms.items()) / (k_arms - 1)
+    n0 = (n_tot - sum(len(v) ** 2 for v in arms.values()) / n_tot) / (k_arms - 1)
+    tau2_b = (msb - s2w) / n0 if n0 > 0 else 0.0
+    info["between_var"] = round(max(tau2_b, 0.0), 6)
+    if s2w <= 1e-12:
+        info["prior_strength"] = 0.0
+        return raw, info
+    if tau2_b <= 1e-12:
+        info["pooled"] = True
+        return {k: grand for k in arms}, info
+    prior = s2w / tau2_b
+    info["prior_strength"] = round(prior, 3)
+    return {
+        k: (len(v) * raw[k] + prior * grand) / (len(v) + prior)
+        for k, v in arms.items()
+    }, info
+
+
+def _p_beats(
+    challenger: tuple[int, int],
+    baseline: tuple[int, int],
+    draws: int = _PAIRWISE_DRAWS,
+    seed: int = _PAIRWISE_SEED,
+) -> float:
+    """P(challenger's true act rate > baseline's) under Beta(1+s, 1+f) posteriors.
+
+    The same posteriors bayesian_ab builds; recomputed here because that
+    function returns summaries, not draws. Seeded, so deterministic. This is a
+    statement about the two arms' data — the multiplicity of having searched
+    many arms is handled by the selection-adjusted lift, not here.
+    """
+    rng = random.Random(seed)
+    ca, cn = challenger
+    ba, bn = baseline
+    wins = 0
+    for _ in range(draws):
+        c = rng.betavariate(1.0 + ca, 1.0 + (cn - ca))
+        b = rng.betavariate(1.0 + ba, 1.0 + (bn - ba))
+        if c > b:
+            wins += 1
+    return wins / draws
+
+
+def _split_lift(
+    rows_by_arm: dict[str, list[float]], seed_id: str, rng: random.Random
+) -> Optional[float]:
+    """One select-then-evaluate split of the intent readings.
+
+    Each arm's readings are shuffled and cut in half. The champion challenger
+    is chosen on one half (argmax of the shrunk means — the same rule the
+    shipping ranking uses) and its margin over the seed is measured on the
+    other half, which had no say in the choice. Averaged over both role
+    assignments. Candidates must have at least one reading in BOTH halves —
+    membership is decided by row counts, never by row values, so nothing
+    leaks. Returns None when the split leaves nothing to select or score.
+    """
+    halves: dict[str, tuple[list[float], list[float]]] = {}
+    for k, v in rows_by_arm.items():
+        if not v:
+            continue
+        idx = list(range(len(v)))
+        rng.shuffle(idx)
+        cut = len(v) // 2
+        halves[k] = ([v[i] for i in idx[:cut]], [v[i] for i in idx[cut:]])
+
+    def one(select: int, evaluate: int) -> Optional[float]:
+        sel = {k: h[select] for k, h in halves.items() if h[select]}
+        ev = {k: h[evaluate] for k, h in halves.items() if h[evaluate]}
+        if seed_id not in ev:
+            return None
+        candidates = [k for k in sel if k != seed_id and k in ev]
+        if not candidates:
+            return None
+        shrunk, _ = _shrunk_means(sel)
+        pick = max(candidates, key=lambda k: (shrunk[k], len(sel[k]), k))
+        return (sum(ev[pick]) / len(ev[pick])) - (sum(ev[seed_id]) / len(ev[seed_id]))
+
+    vals = [g for g in (one(0, 1), one(1, 0)) if g is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _selection_adjusted_lift(
+    rows_by_arm: dict[str, list[float]], seed_id: str, seed: int = _ADJUST_SEED
+) -> tuple[Optional[float], Optional[tuple[float, float]]]:
+    """The champion's intent margin over the seed, with the winner's curse out.
+
+    Sibling of sequence.py's cross-fitted `objective_gain`, and for the same
+    reason: the champion is the argmax over the whole searched population
+    scored on the full sample, so its in-sample margin is biased upward by
+    construction — measured **+0.0870 under a true null, positive in 99.3%**
+    of the runs that reported it (300 null studies, nine equal arms). Here:
+
+      · POINT ESTIMATE — repeated split-halves. Selection runs on one half of
+        each arm's readings, evaluation on the other, averaged over
+        _ADJUST_SPLIT_REPS random splits (both role assignments each). The
+        half that scores the winner had no say in picking it. Measured on the
+        same null: **−0.0003** when reported (−0.0046 unconditionally) against
+        the naive +0.0870 — the bias is gone, not merely shrunk. On a real
+        effect (one 20-trial arm at +0.100) it recovers **+0.0820**, the
+        attenuation being the price of selecting on half the readings.
+
+      · INTERVAL — a within-arm bootstrap that re-runs the WHOLE
+        select-then-evaluate procedure inside every replicate. Resampling
+        around a fixed winner would reproduce the original error in a new
+        place (see the sequence.py docstring); re-running the argmax puts the
+        selection noise into the interval where it belongs.
+
+    Returns (None, None) when no split leaves both a selectable challenger
+    and a scoreable seed — e.g. every challenger has a single reading. The
+    caller must treat that as "cannot support a claim", not as zero.
+    """
+    rng = random.Random(seed)
+    estimates: list[float] = []
+    for _ in range(_ADJUST_SPLIT_REPS):
+        g = _split_lift(rows_by_arm, seed_id, rng)
+        if g is not None:
+            estimates.append(g)
+    if not estimates:
+        return None, None
+    point = sum(estimates) / len(estimates)
+
+    boot_rng = random.Random(seed + 1)
+    replicates: list[float] = []
+    for _ in range(_ADJUST_BOOT_REPS):
+        resample = {
+            k: [v[boot_rng.randrange(len(v))] for _ in range(len(v))]
+            for k, v in rows_by_arm.items()
+            if v
+        }
+        reps = [
+            g
+            for g in (
+                _split_lift(resample, seed_id, boot_rng)
+                for _ in range(_ADJUST_SPLIT_REPS)
+            )
+            if g is not None
+        ]
+        if reps:
+            replicates.append(sum(reps) / len(reps))
+    if len(replicates) < 20:
+        return round(point, 4), None
+    replicates.sort()
+    lo = replicates[max(0, int(0.025 * len(replicates)))]
+    hi = replicates[min(len(replicates) - 1, int(0.975 * len(replicates)) - 1)]
+    return round(point, 4), (round(lo, 4), round(hi, 4))
 
 
 def optimizer_result(
@@ -115,11 +351,17 @@ def optimizer_result(
     rank above one.
 
     Two fitness metrics are carried the whole way, deliberately:
-      · mean intent — continuous, sensitive, bootstrap CI
+      · mean intent — continuous, sensitive; ranked on its SHRUNK posterior
+        mean, lifted via split-half select-then-evaluate
       · act rate — binary, the decision metric, Beta-Binomial posterior
     A win must clear both. Optimisation searches for the maximum of a noisy
-    objective, so the winner is upward-biased by construction; requiring two
-    independent intervals to separate is what stops that bias becoming a claim.
+    objective, so the winner is upward-biased by construction. Before this
+    was corrected, `intent_lift_vs_seed` measured +0.0870 under a true null
+    and was positive in 99.3% of the runs that reported it — and it was
+    reported as a headline even when convergence said "not_supported". Now the
+    gate and the headline run on the selection-adjusted quantities, and the
+    naive margin is carried alongside them, labelled, so the size of the
+    correction stays visible.
     """
     if not any(scores.get(v["id"]) for v in lineage):
         raise RuntimeError(
@@ -127,14 +369,19 @@ def optimizer_result(
         )
 
     stats: dict[str, dict] = {}
+    intent_rows: dict[str, list[float]] = {}
     for v in lineage:
         vid = v["id"]
         rows = scores.get(vid, [])
         intents = [_clamp01(r.intent) for r in rows]
+        if intents:
+            intent_rows[vid] = intents
         trials = len(rows)
         acts = sum(1 for r in rows if r.would_act)
-        # bootstrap_ci returns None below n=2; keep that as None rather than
-        # inventing a degenerate interval around a single observation.
+        # bootstrap_ci returns None for samples it deems too small to resample
+        # meaningfully (analytics owns that gate); keep the None rather than
+        # inventing a degenerate interval. Nothing decisional hangs on this
+        # interval any more — the gate runs on the selection-adjusted lift.
         ci = bootstrap_ci(intents, seed=_INTENT_CI_SEED) if trials >= 2 else None
         stats[vid] = {
             "id": vid,
@@ -200,13 +447,19 @@ def optimizer_result(
         )
 
     # ── ranking + convergence verdict ───────────────────────────────────
-    # Rank on mean intent, break ties on posterior p_best then on trials, so a
-    # variant measured 20 times never sits below one measured twice at the same
-    # mean purely by dict order.
+    # Rank on the empirical-Bayes SHRUNK mean intent (see _shrunk_means), not
+    # the raw mean: raw-mean sorting put the luckiest thinly-sampled arm on
+    # top by construction. Tie-breakers unchanged — posterior p_best, then
+    # trials — so under full pooling (a null-looking population) the ranking
+    # degrades to the evidence-weighted order rather than to dict order. The
+    # raw mean stays in every row; only the sort key changed.
+    shrunk, shrink_info = _shrunk_means(intent_rows)
+    for s in evaluated:
+        s["shrunk_intent"] = round(shrunk[s["id"]], 4)
     ranking = sorted(
         evaluated,
         key=lambda s: (
-            s["mean_intent"],
+            shrunk[s["id"]],
             (s.get("posterior") or {}).get("p_best", 0.0),
             s["trials"],
         ),
@@ -220,6 +473,10 @@ def optimizer_result(
     intent_separated: Optional[bool] = None
     intent_lift: Optional[float] = None
     intent_lift_pct: Optional[float] = None
+    adjusted_lift: Optional[float] = None
+    adjusted_ci: Optional[tuple[float, float]] = None
+    adjusted_lift_pct: Optional[float] = None
+    p_beats_seed: Optional[float] = None
 
     if seed_stat is None or not seed_stat["trials"]:
         convergence = "no_baseline"
@@ -234,11 +491,27 @@ def optimizer_result(
             "nothing measurably better. Keep the copy you have."
         )
     else:
+        # The naive in-sample margin. Kept — as sequence.py keeps
+        # naive_objective_gain — so the size of the correction is visible,
+        # but it is never the gate and never the headline.
         intent_lift = round(best["mean_intent"] - seed_stat["mean_intent"], 4)
         intent_lift_pct = (
             round(intent_lift / seed_stat["mean_intent"] * 100, 1)
             if seed_stat["mean_intent"] > 0
             else None
+        )
+        adjusted_lift, adjusted_ci = _selection_adjusted_lift(intent_rows, seed_id)
+        adjusted_lift_pct = (
+            round(adjusted_lift / seed_stat["mean_intent"] * 100, 1)
+            if adjusted_lift is not None and seed_stat["mean_intent"] > 0
+            else None
+        )
+        p_beats_seed = round(
+            _p_beats(
+                (best["acts"], best["trials"]),
+                (seed_stat["acts"], seed_stat["trials"]),
+            ),
+            4,
         )
         pb, ps = best.get("posterior"), seed_stat.get("posterior")
         posterior_separated = (
@@ -246,26 +519,58 @@ def optimizer_result(
             if pb and ps
             else False
         )
+        # Descriptive only since the selection-adjusted lift took over the
+        # gate: overlap of two naive intent intervals neither accounts for
+        # selection nor for the arms' shared grand mean.
         intent_separated = (
             not _intervals_overlap(best["intent_ci"], seed_stat["intent_ci"])
             if best["intent_ci"] and seed_stat["intent_ci"]
             else False
         )
-        beat_seed = bool(posterior_separated and intent_separated and intent_lift > 0)
+        # The gate runs on the honest quantities and nothing else: the
+        # act-rate posteriors must separate AND the selection-adjusted intent
+        # lift must be positive with an interval that excludes zero. A thin
+        # sample that cannot be split (adjusted_lift None) cannot win.
+        beat_seed = bool(
+            posterior_separated
+            and adjusted_lift is not None
+            and adjusted_lift > 0
+            and adjusted_ci is not None
+            and adjusted_ci[0] > 0
+        )
         if beat_seed:
             convergence = "improved"
             verdict = (
-                f"{best['id']} beats the seed: +{intent_lift:.3f} mean intent "
-                f"({intent_lift_pct:+.1f}%) with non-overlapping 95% intervals on "
-                "both the act rate and mean intent."
+                f"{best['id']} beats the seed: selection-adjusted intent lift "
+                f"{adjusted_lift:+.3f} (95% CI {adjusted_ci[0]:+.3f} to "
+                f"{adjusted_ci[1]:+.3f}), P(champion act rate beats seed) = "
+                f"{p_beats_seed:.2f}, with non-overlapping 95% act-rate "
+                f"posteriors. The naive in-sample margin was {intent_lift:+.3f}; "
+                "the gap between the two is the selection bias the search added."
             )
         else:
             convergence = "not_supported"
-            reason = (
-                "the credible intervals still overlap"
-                if intent_lift > 0
-                else "the ranked leader does not even out-score the seed on the mean"
-            )
+            if adjusted_lift is None:
+                reason = (
+                    "the challenger arms are too thinly sampled to separate "
+                    "selection from evaluation, so no honest lift exists"
+                )
+            elif adjusted_lift <= 0:
+                reason = (
+                    f"once selection is accounted for the lift is "
+                    f"{adjusted_lift:+.3f} — the in-sample margin of "
+                    f"{intent_lift:+.3f} was selection bias, not copy"
+                )
+            elif not posterior_separated:
+                reason = (
+                    f"the act-rate posteriors still overlap (P(champion beats "
+                    f"seed) = {p_beats_seed:.2f})"
+                )
+            else:
+                reason = (
+                    f"the selection-adjusted lift of {adjusted_lift:+.3f} has "
+                    "an interval that still includes zero"
+                )
             verdict = (
                 f"{best['id']} ranks first, but the optimisation did NOT beat the "
                 f"starting point: {reason}. The maximum of a noisy search is "
@@ -299,21 +604,52 @@ def optimizer_result(
         "beat_seed": beat_seed,
         "convergence": convergence,
         "verdict": verdict,
+        # The naive in-sample margin, under both its historical key and its
+        # honest name. Selected-then-measured on the same sample, so it is
+        # upward-biased by construction; kept only so the size of the
+        # correction is visible. Never render it as the lift.
         "intent_lift_vs_seed": intent_lift,
         "intent_lift_vs_seed_pct": intent_lift_pct,
+        "naive_intent_lift": intent_lift,
+        # The headline lift: select-then-evaluate on split halves, with a
+        # bootstrap that re-runs the selection inside every replicate.
+        "selection_adjusted_lift": adjusted_lift,
+        "selection_adjusted_lift_ci": list(adjusted_ci) if adjusted_ci else None,
+        "selection_adjusted_lift_pct": adjusted_lift_pct,
+        "selection_bias": (
+            round(intent_lift - adjusted_lift, 4)
+            if intent_lift is not None and adjusted_lift is not None
+            else None
+        ),
+        # Pairwise P(champion act rate > seed act rate) from the Beta
+        # posteriors — the act-rate side of the honest comparison.
+        "p_best_beats_seed": p_beats_seed,
+        "shrinkage": shrink_info,
+        "lift_inference": (
+            "ranked by empirical-Bayes shrunk mean intent (weight n/(n+τ̂), τ̂ "
+            "from a method-of-moments variance decomposition across arms); the "
+            "honest lift is select-then-evaluate — the champion challenger is "
+            "re-chosen on one half of each arm's readings and scored on the "
+            "other, averaged over repeated splits, with a within-arm bootstrap "
+            "that re-runs the whole procedure per replicate. naive_intent_lift "
+            "is the in-sample margin, kept only so the correction is visible."
+        ),
         "posterior_intervals_separated": posterior_separated,
         "intent_intervals_separated": intent_separated,
         "bayesian": bayes,
         "lineage_edges": edges,
         "method": (
             "evolutionary search · Thompson-sampled budget within each generation · "
-            "Beta-Binomial posteriors over act rate · percentile bootstrap on mean intent"
+            "empirical-Bayes shrunk ranking · Beta-Binomial posteriors over act rate · "
+            "selection-adjusted lift via split-half select-then-evaluate bootstrap"
         ),
         "disclaimer": (
             "Fitness is synthetic-twin intent, not observed behaviour. A variant "
-            "that wins here is a hypothesis worth testing on real traffic; the "
-            "search selects the maximum of a noisy objective, so its measured "
-            "advantage is optimistically biased even when the intervals separate."
+            "that wins here is a hypothesis worth testing on real traffic. The "
+            "search selects the maximum of a noisy objective; the "
+            "selection-adjusted lift removes that bias from the reported margin, "
+            "and the naive in-sample margin is kept alongside it so the size of "
+            "the correction is visible."
         ),
     }
 

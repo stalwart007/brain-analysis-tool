@@ -28,7 +28,7 @@ from .analytics import (
     bootstrap_ci,
     consensus_label,
     kaplan_meier,
-    kmeans_auto,
+    kmeans_segments,
     shannon_entropy_normalised,
     thompson_allocate,
 )
@@ -217,13 +217,16 @@ def aggregate_reactions(
     # drawn from the identical resample index sequence and moved in lockstep.
     engagement_ci = bootstrap_ci(engagements, seed=8191)
 
-    # Segment discovery: k-means++ over the (intent, engagement) plane, with k
-    # chosen by silhouette and a practical-spread gate. None ⇒ genuinely
-    # homogeneous audience, which is itself a finding.
+    # Segment discovery over the (intent, engagement) plane. k is chosen by the
+    # GAP STATISTIC against a uniform reference — k = 1 is admissible, so
+    # "this audience is homogeneous" is an answer the selector can actually
+    # give. It could not before: silhouette is undefined at k = 1, so the old
+    # selector was structurally obliged to find at least two groups and
+    # invented them on pure noise 86-90% of the time.
     segments = None
-    clustering = kmeans_auto([(r.intent_score, r.engagement) for r in reactions])
+    clustering = kmeans_segments([(r.intent_score, r.engagement) for r in reactions])
     if clustering is not None:
-        labels, k, sil = clustering
+        labels, k, sil = clustering["labels"], clustering["k"], clustering["silhouette"]
         segments = []
         for c in sorted(set(labels)):
             members = [reactions[i] for i in range(len(reactions)) if labels[i] == c]
@@ -246,7 +249,19 @@ def aggregate_reactions(
                 }
             )
         segments.sort(key=lambda s: s["size"], reverse=True)
-        segments = {"k": k, "silhouette": round(sil, 3), "groups": segments}
+        # The evidence travels with the partition. A researcher reading two
+        # coloured groups cannot otherwise tell a decisive split from one that
+        # barely cleared the null, and both render identically.
+        segments = {
+            "k": k,
+            "silhouette": round(sil, 3),
+            "groups": segments,
+            "gap": clustering["gap"],
+            "gap_se": clustering["gap_se"],
+            "gap_vs_k1": clustering["gap_vs_k1"],
+            "centroid_spread": clustering["centroid_spread"],
+            "method": clustering["method"],
+        }
 
     return SwarmAggregate(
         run_id="",  # assigned by storage on insert

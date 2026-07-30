@@ -19,6 +19,8 @@ import SimStage from "./sim/SimStage";
 import { ChartCursorProvider, useChartCursor } from "./charts/cursor";
 import ChartFrame from "./charts/ChartFrame";
 import TensorSim from "./sim/TensorSim";
+import TensorExplorer from "./TensorExplorer";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { AssetInput, assetReady, KINDS, type AssetKind, type ContentAsset } from "./AssetInput";
 
 interface RetentionStep {
@@ -47,7 +49,12 @@ interface ContentResult {
   } | null;
   twin_count: number;
   curves: Record<string, number[]>;
-  curve_cis: Record<string, ([number, number] | null)[]>;
+  /** SIMULTANEOUS (sup-t) bands — valid to read across the whole curve. */
+  curve_cis: Record<string, ([number, number] | null)[] | null>;
+  /** Per-beat percentile intervals, valid only for a single pre-registered beat. */
+  curve_pointwise_cis?: Record<string, ([number, number] | null)[] | null>;
+  band_method?: string;
+  findings?: FindingsBlock | null;
   isc: { overall: number; grip: string; leave_one_out: (number | null)[]; method: string } | null;
   change_points: number[] | null;
   memory: {
@@ -100,6 +107,7 @@ export default function ContentImpactPanel(props: { personaCount: number }) {
 function ContentImpactInner({ personaCount }: { personaCount: number }) {
   const [kind, setKind] = useState<AssetKind>("text");
   const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
+  const [question, setQuestion] = useState("");
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");
   const [busy, setBusy] = useState(false);
@@ -126,16 +134,6 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
   // Twins are a different axis from beats — a separate domain, so hovering a
   // twin never lights up "beat 3" somewhere else and imply a link that does
   // not exist.
-  const looCursor = useChartCursor(
-    "twins",
-    result?.isc?.leave_one_out.length ?? 0,
-    "Per-twin leave-one-out synchrony",
-    (i) => {
-      const r = result?.isc?.leave_one_out[i];
-      return `twin ${i + 1} left out, synchrony ${r == null ? "unresolvable" : r.toFixed(2)}`;
-    }
-  );
-
   async function run() {
     setBusy(true); setError(null); setResult(null);
     setTraces([]); setSegments([]); beatCursor.clear(); setPasses([]); setExpected(0);
@@ -147,6 +145,7 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
           asset: { ...asset, kind },
           twins_per_persona: twins,
           cognitive_load: load,
+          research_question: question,
         },
         (evt) => {
           if (evt.type === "stage") {
@@ -219,6 +218,23 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
       </div>
 
       <AssetInput kind={kind} asset={asset} onChange={setAsset} disabled={busy} />
+
+      {/* The one field that changes what the REPORT is about rather than what
+          the run measures. Placed after the asset because the useful questions
+          are the ones you think of once you are looking at the thing. */}
+      <div className="mt-4">
+        <ResearchQuestion
+          value={question}
+          onChange={setQuestion}
+          disabled={busy}
+          examples={[
+            "e.g. where do we lose people, and why there?",
+            "does the opening earn the next 10 seconds?",
+            "is the offer the weakest beat?",
+            "does this read as threatening to a first-time buyer?",
+          ]}
+        />
+      </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-3">
         {kind === "text" && (
@@ -294,6 +310,12 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
 
       {result && (
         <div className="mt-5 space-y-5">
+          {/* THE ANSWER LEADS. The template verdict below is a one-line
+              summary of the statistics; this is what the study means for what
+              was actually asked, with every claim wired to the measurement
+              that licenses it. */}
+          <FindingsPanel findings={result.findings} />
+
           <p className="verdict rounded-xl border border-accent/25 bg-accent/5 px-3 py-2 text-ink-2">
             <span className="hud-label mr-2">VERDICT</span>{result.verdict}
           </p>
@@ -329,6 +351,19 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
             </div>
           )}
 
+          {/* The whole tensor, not one ninth of it. Reading DOWN a column —
+              everything that happened at one beat — is the view that was
+              impossible before, and it is usually what explains a weak beat:
+              attention falls AND cognitive effort spikes means confusing, not
+              boring, and those want opposite fixes. */}
+          <TensorExplorer
+            curves={result.curves}
+            bands={result.curve_cis}
+            segments={result.segments}
+            cursor={beatCursor}
+            twinCurves={traces}
+          />
+
           <div className="grid gap-5 lg:grid-cols-2">
             {/* brain atlas with beat scrubber */}
             <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
@@ -362,69 +397,7 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
 
             <div className="space-y-4">
               {/* ISC */}
-              {result.isc && (
-                <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
-                  <div className="flex items-baseline justify-between">
-                    <span className="hud-label">ATTENTION SYNCHRONY (ISC)</span>
-                    {/* Colour follows the backend's `grip`, which is now gated on a
-                        permutation test. Re-deriving it here from raw r cuts was a
-                        third threshold ladder that could contradict the label
-                        printed beside it. */}
-                    <span className={`font-display text-xl font-semibold ${result.isc.grip === "locked-in" ? "text-good" : result.isc.grip === "engaged" ? "text-accent" : "text-critical"}`}>
-                      {result.isc.overall.toFixed(2)} · {result.isc.grip}
-                    </span>
-                  </div>
-                  {/* Leave-one-out ISC: each bar is the synchrony of the group
-                      WITHOUT that twin, so a conspicuously tall bar marks the
-                      twin who was dragging agreement down. That is the whole
-                      diagnostic, and it was previously a `title` away. */}
-                  <div
-                    {...looCursor.surfaceProps}
-                    className="mt-2 flex h-6 items-end gap-0.5 focus-visible:ring-1 focus-visible:ring-accent/60"
-                  >
-                    {result.isc.leave_one_out.map((r, i) => (
-                      <div key={i}
-                        className="flex-1 rounded-t-sm bg-accent transition-opacity"
-                        style={{
-                          height: `${Math.max(6, ((r ?? 0) + 1) * 50)}%`,
-                          opacity:
-                            looCursor.index === null
-                              ? 0.35 + ((r ?? 0) + 1) * 0.3
-                              : looCursor.isMarked(i)
-                                ? 1
-                                : 0.18,
-                          outline: looCursor.isPinned(i) ? "1px solid rgb(var(--region-rgb))" : undefined,
-                        }}
-                      />
-                    ))}
-                  </div>
-                  <p className="mt-1 min-h-3 font-mono text-[9px] text-muted">
-                    {looCursor.index !== null ? (
-                      <span className="text-ink-2">
-                        twin {looCursor.index + 1} left out · r ={" "}
-                        <span className="text-accent">
-                          {result.isc.leave_one_out[looCursor.index] == null
-                            ? "unresolvable"
-                            : result.isc.leave_one_out[looCursor.index]!.toFixed(3)}
-                        </span>
-                        <span className="text-muted">
-                          {" "}
-                          {(result.isc.leave_one_out[looCursor.index] ?? 0) > result.isc.overall
-                            ? "· synchrony rises without them — this twin dissents"
-                            : "· synchrony falls without them — this twin was with the group"}
-                        </span>
-                        {looCursor.pinned !== null && (
-                          <button onClick={looCursor.clear} className="ml-2 text-accent transition hover:text-ink">
-                            pinned ✕
-                          </button>
-                        )}
-                      </span>
-                    ) : (
-                      <>{result.isc.method} · per-twin leave-one-out synchrony</>
-                    )}
-                  </p>
-                </div>
-              )}
+              {result.isc && <IscSynchrony isc={result.isc} />}
 
               {/* memory — the peak-index DISTRIBUTION, not a softmax.
                   Peak-end is a within-subject phenomenon, so this is where
@@ -546,6 +519,112 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
 
 /* ── attention field: ghost curve per twin + mean + CI + change points ── */
 
+/** Attention synchrony, with its per-twin leave-one-out strip.
+ *
+ * Extracted from the panel body so the cursor it needs lives with the only
+ * subtree that ever used it, and so the readout's reserved height is
+ * measurable in isolation rather than only behind a completed study.
+ */
+export function IscSynchrony({
+  isc,
+}: {
+  isc: { overall: number; grip: string; leave_one_out: (number | null)[]; method: string };
+}) {
+  const looCursor = useChartCursor(
+    "twins",
+    isc.leave_one_out.length,
+    "Per-twin leave-one-out synchrony",
+    (i) => {
+      const r = isc.leave_one_out[i];
+      return `twin ${i + 1} left out, synchrony ${r == null ? "unresolvable" : r.toFixed(2)}`;
+    }
+  );
+
+  return (
+    <div className="rounded-xl border border-hairline bg-surface-2/60 p-3">
+      <div className="flex items-baseline justify-between">
+        <span className="hud-label">ATTENTION SYNCHRONY (ISC)</span>
+        {/* Colour follows the backend's `grip`, which is now gated on a
+            permutation test. Re-deriving it here from raw r cuts was a
+            third threshold ladder that could contradict the label
+            printed beside it. */}
+        <span
+          className={`font-display text-xl font-semibold tabular-nums ${
+            isc.grip === "locked-in"
+              ? "text-good"
+              : isc.grip === "engaged"
+                ? "text-accent"
+                : "text-critical"
+          }`}
+        >
+          {isc.overall.toFixed(2)} · {isc.grip}
+        </span>
+      </div>
+      {/* Leave-one-out ISC: each bar is the synchrony of the group WITHOUT that
+          twin, so a conspicuously tall bar marks the twin who was dragging
+          agreement down. That is the whole diagnostic, and it was previously a
+          `title` away. */}
+      <div
+        {...looCursor.surfaceProps}
+        className="mt-2 flex h-6 items-end gap-0.5 focus-visible:ring-1 focus-visible:ring-accent/60"
+      >
+        {isc.leave_one_out.map((r, i) => (
+          <div
+            key={i}
+            className="flex-1 rounded-t-sm bg-accent transition-opacity"
+            style={{
+              height: `${Math.max(6, ((r ?? 0) + 1) * 50)}%`,
+              opacity:
+                looCursor.index === null
+                  ? 0.35 + ((r ?? 0) + 1) * 0.3
+                  : looCursor.isMarked(i)
+                    ? 1
+                    : 0.18,
+              outline: looCursor.isPinned(i) ? "1px solid rgb(var(--region-rgb))" : undefined,
+            }}
+          />
+        ))}
+      </div>
+      {/* Reserved height. `min-h-3` was 12px — a single line's worth of guard
+          for three chained clauses that wrap to two or three lines inside this
+          `lg:grid-cols-2` column, so sweeping the leave-one-out strip pushed the
+          memory distribution and every panel below it down and back. The idle
+          branch carries `isc.method`, a server-authored string, so BOTH states
+          are variable-length and both are clamped. */}
+      <p className="mt-1 min-h-[2.6rem] font-mono text-[9px] leading-relaxed tabular-nums text-muted">
+        {looCursor.index !== null ? (
+          <span className="line-clamp-3 text-ink-2">
+            twin {looCursor.index + 1} left out · r ={" "}
+            <span className="text-accent">
+              {isc.leave_one_out[looCursor.index] == null
+                ? "unresolvable"
+                : isc.leave_one_out[looCursor.index]!.toFixed(3)}
+            </span>
+            <span className="text-muted">
+              {" "}
+              {(isc.leave_one_out[looCursor.index] ?? 0) > isc.overall
+                ? "· synchrony rises without them — this twin dissents"
+                : "· synchrony falls without them — this twin was with the group"}
+            </span>
+            {looCursor.pinned !== null && (
+              <button
+                onClick={looCursor.clear}
+                className="ml-2 text-accent transition hover:text-ink"
+              >
+                pinned ✕
+              </button>
+            )}
+          </span>
+        ) : (
+          <span className="line-clamp-3">
+            {isc.method} · per-twin leave-one-out synchrony
+          </span>
+        )}
+      </p>
+    </div>
+  );
+}
+
 function AttentionField({
   traces, result, segments,
 }: {
@@ -572,7 +651,18 @@ function AttentionField({
     "beats",
     n,
     "Audience attention across beats",
-    (i) => `beat ${i + 1}: mean attention ${(mean[i] ?? 0).toFixed(2)}`
+    (i) => `beat ${i + 1}: mean attention ${(mean[i] ?? 0).toFixed(2)}`,
+    // Both options were missing, and each was its own drift.
+    //
+    // `x(i) = padX + (i/(n-1))·(W − 2·padX)` puts beat i at an exact vertex, so
+    // this is a line chart over POINTS, not bands: the default band mapping
+    // hit-tested the midpoints between beats and drew a crosshair whose edges
+    // land where no datum is. And with no inset the pointer was mapped across
+    // the whole element, ignoring the 34/720 gutter at each end — so the error
+    // grew toward the edges, which is exactly where a reader hunts for the
+    // first and last beat. `mapping` and `inset` are per-consumer, not
+    // per-domain, so this does not disturb the other charts sharing "beats".
+    { inset: [padX / W, padX / W], mapping: "point" }
   );
   const [muted, setMuted] = useState<Set<string>>(new Set());
 

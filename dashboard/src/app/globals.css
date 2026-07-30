@@ -946,6 +946,26 @@ a.bg-accent:active::after {
 /* arriving content resolves out of depth-of-field, as if focus is regained */
 .cortex-content {
   animation: arrive 0.6s cubic-bezier(0.21, 0.9, 0.27, 1) both;
+  /* Contain the decorative overflow so a route change cannot grow the page.
+     `.tissue-flash` is `position: fixed; inset: 0`, which would be viewport-
+     sized anywhere else — but this element carries `.warp`, and a TRANSFORMED
+     ANCESTOR becomes the containing block for its fixed descendants. So the
+     flash is sized to this box, and `breach`'s opening `scale(1.5)` then blew it
+     50% wider than the viewport: measured 1110px of document against a 744px
+     client width, i.e. a horizontal scrollbar appearing and vanishing on every
+     navigation. A scrollbar that comes and goes reflows everything beneath it,
+     which is the worst kind of layout shift because it is page-wide and lasts
+     less than a second.
+
+     `clip` rather than `hidden` on purpose: `hidden` would establish a scroll
+     container here, breaking sticky positioning and scroll anchoring inside the
+     content, whereas `clip` only clips. Pairing `clip` on one axis with
+     `visible` on the other is legal (`hidden`/`auto` would force the other axis
+     to `auto`), so vertical scrolling is untouched. Wide content is already
+     required to scroll inside its own container, so clipping at this boundary
+     enforces that rule rather than hiding anything that should be reachable. */
+  overflow-x: clip;
+  overflow-y: visible;
 }
 @keyframes arrive {
   from {
@@ -983,52 +1003,470 @@ a.bg-accent:active::after {
   }
 }
 
-/* each probe site grows a coloured vein in its region's hue on approach */
-.probe {
-  min-width: 8.5rem;
+/* masthead row: wordmark, atlas key, sign-out. Deliberately separate from the
+   montage below, so the sector grid always spans the full viewport and its
+   column count can never be squeezed by the chrome beside it. */
+.rail-top {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.3rem 1rem;
+  background: rgb(11 12 14 / 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
-.probe-vein {
+
+.rail-signout {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-muted);
+  transition: color 0.2s ease;
+}
+.rail-signout:hover {
+  color: var(--color-critical);
+}
+
+/* THE ATLAS KEY — the affordance the old rail was missing entirely.
+   It states the sector COUNT, so the interface admits up front how many
+   destinations exist, and names its own shortcut so the shortcut is
+   discoverable rather than folklore. Only colours move on hover; the border
+   width and padding never change, so nothing reflows under the pointer. */
+.atlas-key {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--color-hairline);
+  padding: 0.25rem 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-ink-2);
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+.atlas-key:hover {
+  color: var(--color-bone);
+  border-color: rgb(var(--region-rgb) / 0.55);
+  background: rgb(var(--region-rgb) / 0.08);
+}
+.atlas-key-count {
+  min-width: 1.1em;
+  padding: 0 0.25em;
+  text-align: center;
+  background: rgb(var(--region-rgb) / 0.22);
+  color: var(--color-bone);
+}
+.atlas-key kbd {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  padding: 0 0.25em;
+  border: 1px solid var(--color-hairline);
+  color: var(--color-muted);
+}
+@media (max-width: 420px) {
+  /* the shortcut hint is the first thing to go — there is no keyboard here */
+  .atlas-key kbd {
+    display: none;
+  }
+}
+
+/* ── THE MONTAGE ──────────────────────────────────────────────────────────
+   Eight equal cells that REFLOW rather than overflow: eight across on a
+   desktop, four across on anything narrower. The old rail was a single
+   `overflow-x-auto` row of intrinsically-sized items whose content measured
+   1269px against a 479px viewport, with the scrollbar suppressed — five
+   destinations existed only if you thought to drag sideways. A grid cannot do
+   that: the columns divide whatever width there is, so every sector is on
+   screen at every size, and the count is a fact of the layout rather than
+   something that happens to hold at one window width. */
+.sector-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--color-hairline);
+  background: rgb(11 12 14 / 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.sector-cell {
+  display: flex;
+  min-width: 0;
+  border-top: 1px solid var(--color-hairline);
+  border-right: 1px solid var(--color-hairline);
+}
+/* the first row of four has the masthead's rule above it already */
+.sector-cell:nth-child(-n + 4) {
+  border-top-color: transparent;
+}
+@media (min-width: 1180px) {
+  .sector-grid {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+  /* one row, so nothing needs a rule above it */
+  .sector-cell {
+    border-top-color: transparent;
+  }
+}
+
+.sector {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 0.35rem 0.6rem 0.4rem;
+  /* holds the 44px touch target at every breakpoint without needing padding
+     that would make the sticky rail taller than it has to be */
+  min-height: 44px;
+  overflow: hidden;
+  color: var(--color-ink-2);
+  transition:
+    background 0.18s ease,
+    color 0.18s ease;
+}
+.sector:hover {
+  background: rgb(255 255 255 / 0.05);
+  color: var(--color-ink);
+}
+
+/* The vein: this sector's lobe colour, ALWAYS drawn. Keeping it permanently
+   visible is what turns the row into an anatomical index — eight lobes you can
+   read as colour at a glance — instead of eight identical tabs. It brightens
+   on approach and, on the active sector, breathes on the shared physiological
+   clock rather than a timer of its own. */
+.sector-vein {
   position: absolute;
   left: 0;
+  right: 0;
   bottom: 0;
   height: 2px;
-  width: 100%;
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform 0.42s cubic-bezier(0.2, 0.85, 0.25, 1);
+  background: rgb(var(--sector-rgb));
+  opacity: 0.38;
+  transition:
+    opacity 0.25s ease,
+    height 0.25s ease;
 }
-.probe:hover .probe-vein,
-.probe[aria-current="page"] .probe-vein {
-  transform: scaleX(1);
+.sector:hover .sector-vein,
+.sector:focus-visible .sector-vein {
+  opacity: 0.9;
+  height: 3px;
 }
-/* a faint scan sweeps a probe on hover — the site being interrogated */
-.probe::after {
-  content: "";
+
+/* lobe on the left, code (and the state cue) pushed right */
+.sector-top {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4em;
+  min-width: 0;
+}
+.sector-lobe {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  /* Brighter than --color-muted, which measured 3.76:1 here — under the 4.5:1
+     floor at 8.5px. The lobe name is not decoration in this rail: it is how the
+     anatomy reads at a glance, so it has to be legible. ~6.5:1 on the rail. */
+  color: rgb(150 145 145);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sector-label {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: -0.02em;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sector-code {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  line-height: 1;
+  letter-spacing: 0.2em;
+  /* tertiary, but still held above 4.5:1 — ~4.7:1 on the rail */
+  color: rgb(125 121 121);
+}
+
+/* THE ACTIVE SECTOR, marked three independent ways: an inverted fill
+   (luminance, so it survives greyscale), the word "here" (text, so it survives
+   colour blindness and forced-colours modes), and aria-current (so it survives
+   not looking at all). Never colour alone. */
+.sector[data-active="1"] {
+  background: var(--color-bone);
+  color: var(--color-void);
+}
+/* On the inverted cell these are void-over-bone; 0.62 composites to ~5:1,
+   where the previous 0.58/0.55 landed at 4.45 and 4.03. */
+.sector[data-active="1"] .sector-lobe,
+.sector[data-active="1"] .sector-code {
+  color: rgb(11 12 14 / 0.62);
+}
+.sector[data-active="1"] .sector-vein {
+  opacity: 1;
+  height: 3px;
+  box-shadow: 0 0 calc(4px + var(--pulse) * 9px) rgb(var(--sector-rgb) / 0.85);
+}
+.sector-here {
+  flex: none;
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  padding: 0.15em 0.3em;
+  background: var(--color-void);
+  color: var(--color-bone);
+}
+
+/* ── THE ATLAS ────────────────────────────────────────────────────────────
+   The overview panel, and the quick switcher, and the place the long
+   anatomical names live now that the montage cells are narrow. Every sector
+   states what it is FOR in plain language, because "White Room" and "Studies"
+   tell a new user nothing. */
+.atlas-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.atlas-scrim {
   position: absolute;
   inset: 0;
-  pointer-events: none;
-  background: linear-gradient(
-    100deg,
-    transparent 40%,
-    rgba(223, 217, 217, 0.09) 50%,
-    transparent 60%
-  );
-  background-size: 260% 100%;
-  background-position: 130% 0;
-  opacity: 0;
-  transition: opacity 0.2s;
+  width: 100%;
+  background: rgb(6 7 9 / 0.8);
+  backdrop-filter: blur(7px);
+  -webkit-backdrop-filter: blur(7px);
+  animation: atlas-fade 0.18s ease both;
+  cursor: default;
 }
-.probe:hover::after {
-  opacity: 1;
-  animation: probe-scan 0.75s ease-out;
+.atlas-sheet {
+  position: absolute;
+  left: 50%;
+  top: 3rem;
+  transform: translateX(-50%);
+  width: min(960px, calc(100vw - 1.5rem));
+  max-height: min(90vh, 52rem);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-hairline);
+  background: rgb(11 12 14 / 0.97);
+  box-shadow: 0 40px 120px -40px rgb(0 0 0 / 0.9);
+  animation: atlas-rise 0.22s cubic-bezier(0.2, 0.85, 0.25, 1) both;
 }
-@keyframes probe-scan {
+.atlas-scrim[data-still="1"],
+.atlas-sheet[data-still="1"] {
+  animation: none;
+}
+@keyframes atlas-fade {
   from {
-    background-position: 130% 0;
+    opacity: 0;
   }
   to {
-    background-position: -30% 0;
+    opacity: 1;
   }
+}
+@keyframes atlas-rise {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%);
+  }
+}
+
+.atlas-head {
+  flex: none;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--color-hairline);
+}
+.atlas-filter {
+  width: 100%;
+  margin-top: 0.55rem;
+  background: rgb(0 0 0 / 0.32);
+  border: 1px solid var(--color-hairline);
+  padding: 0.45rem 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--color-ink);
+  outline: none;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.25s ease;
+}
+.atlas-filter::placeholder {
+  color: rgb(111 108 108 / 0.85);
+}
+.atlas-filter:focus {
+  border-color: rgb(var(--region-rgb) / 0.55);
+  box-shadow: inset 2px 0 0 0 rgb(var(--region-rgb));
+}
+
+.atlas-body {
+  overflow-y: auto;
+  padding: 0.25rem 1rem 0.75rem;
+}
+/* The lobe name sits in a left gutter rather than on a header row above its
+   cards. Six stacked header rows cost ~150px of the panel, which was the
+   difference between all eight sectors fitting at once and the atlas needing to
+   be scrolled — and an index that scrolls is a weaker answer to "what is in
+   this product" than one you take in whole. It also reads more like an atlas:
+   lobe on the left, its structures listed against it. */
+.atlas-group {
+  margin-top: 0.55rem;
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 0 0.85rem;
+  align-items: start;
+}
+.atlas-group ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+}
+.atlas-lobe {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding-top: 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--color-ink-2);
+  overflow-wrap: anywhere;
+}
+/* the rule that ran to the edge of the old header row has no room in a gutter */
+.atlas-lobe > span:last-child {
+  display: none;
+}
+@media (max-width: 719px) {
+  /* no gutter to spare on a phone — the lobe goes back above its cards */
+  .atlas-group {
+    grid-template-columns: 1fr;
+  }
+  .atlas-lobe {
+    padding-top: 0;
+    margin-bottom: 0.35rem;
+  }
+  .atlas-lobe > span:last-child {
+    display: block;
+  }
+}
+.atlas-swatch {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  background: rgb(var(--sector-rgb));
+  box-shadow: 0 0 7px rgb(var(--sector-rgb) / 0.75);
+}
+
+.atlas-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  height: 100%;
+  padding: 0.5rem 0.6rem 0.5rem 0.75rem;
+  border: 1px solid var(--color-hairline);
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease;
+}
+.atlas-item-vein {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: rgb(var(--sector-rgb));
+  opacity: 0.45;
+  transition: opacity 0.18s ease;
+}
+.atlas-item:hover,
+.atlas-item[data-cursor="1"] {
+  background: rgb(var(--sector-rgb) / 0.09);
+  border-color: rgb(var(--sector-rgb) / 0.45);
+}
+.atlas-item:hover .atlas-item-vein,
+.atlas-item[data-cursor="1"] .atlas-item-vein {
+  opacity: 1;
+}
+.atlas-item[data-active="1"] {
+  border-color: rgb(223 217 217 / 0.42);
+}
+.atlas-item-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.atlas-code {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.2em;
+  color: var(--color-muted);
+}
+.atlas-here {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 0.1em 0.35em;
+  background: var(--color-bone);
+  color: var(--color-void);
+}
+/* the line that does the actual work of making a destination legible */
+.atlas-purpose {
+  font-family: var(--font-body);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-ink-2);
+  text-wrap: pretty;
+}
+.atlas-anatomy {
+  margin-top: auto;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: rgb(var(--sector-rgb) / 0.85);
+}
+
+.atlas-foot {
+  flex: none;
+  display: flex;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--color-hairline);
 }
 
 /* depth meter: the marker travels from surface to interior */
@@ -1072,11 +1510,6 @@ a.bg-accent:active::after {
 /* ── responsive behaviour ─────────────────────────────────────────────── */
 
 @media (max-width: 900px) {
-  .probe {
-    min-width: 6.6rem;
-    padding-left: 0.75rem;
-    padding-right: 0.75rem;
-  }
   .cortex-stage {
     opacity: 0.78;
   }
@@ -1091,15 +1524,38 @@ a.bg-accent:active::after {
   }
 }
 @media (max-width: 640px) {
-  /* the anatomy label is the first thing to go; codes carry the meaning */
-  .probe > span:first-of-type {
-    display: none;
-  }
-  .probe {
-    min-width: 5.4rem;
-  }
   .depth-strip {
     display: none;
+  }
+}
+
+/* Phone. The cells are ~90px across at 375, so the type steps down and the
+   four-letter code steps out — but the NAME never does, and neither does any
+   sector. What a destination is called is the whole point of showing it; a grid
+   of eight cryptic codes would be the same discovery failure in a new shape.
+   Measured: "Research Panel" sets to 73px at 10px, inside a 79px content box. */
+@media (max-width: 479px) {
+  .sector {
+    padding: 0.4rem 0.35rem 0.45rem;
+    gap: 2px;
+  }
+  /* 9.5px, not 10px: the display face is 700 weight, and bold "RESEARCH PANEL"
+     overran a 93px cell at 10px and ellipsised to "RESEARCH PAN…". Measured at
+     9.5px with this tracking it sets to ~74px inside an 82px content box. */
+  .sector-label {
+    font-size: 9.5px;
+    letter-spacing: -0.02em;
+  }
+  .sector-lobe {
+    font-size: 7px;
+    letter-spacing: 0.08em;
+  }
+  /* the code goes; "here" stays, so the active state keeps a text cue */
+  .sector-code {
+    display: none;
+  }
+  .sector-here {
+    font-size: 7px;
   }
 }
 

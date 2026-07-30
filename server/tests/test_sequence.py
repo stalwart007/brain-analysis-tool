@@ -224,8 +224,21 @@ def test_result_reports_ordering_lift_uncertainty_and_coverage():
     assert out["twin_count"] == 12
     assert sorted(out["recommended_ordering"]) == [0, 1, 2]
     assert out["objective"] >= out["submitted_objective"]  # best-of candidates
-    assert out["objective_gain"] >= 0
+    # `naive_objective_gain` is the in-sample margin, so it is non-negative by
+    # construction — `recommended` is the argmax and `submitted` is one of the
+    # candidates it beat.
+    assert out["naive_objective_gain"] >= 0
+    # `objective_gain` is CROSS-FITTED and therefore may be negative: the half
+    # that scores the winner had no say in picking it, so an ordering selected
+    # on noise scores no better than the baseline on fresh data, and often
+    # worse. That sign freedom is exactly what makes it an honest estimate —
+    # an estimator that cannot come out negative under the null is biased.
+    assert out["objective_gain"] is not None
     assert len(out["objective_gain_ci"]) == 2
+    assert 0.0 < out["gain_p_value"] <= 1.0
+    assert out["selection_bias"] == pytest.approx(
+        out["naive_objective_gain"] - out["objective_gain"], abs=1e-9
+    )
     assert out["exploration"] == {
         "orderings_designed": 4,
         "orderings_walked": 3,
@@ -269,7 +282,13 @@ def test_single_message_is_degenerate_but_does_not_crash():
     walks = [_walk([0], [0.6]), _walk([0], [0.4])]
     out = sequence_result(walks, ["only one"], "low", orderings_designed=1)
     assert out["recommended_ordering"] == [0]
-    assert out["objective"] == 0.0 and out["objective_gain"] == 0.0
+    assert out["objective"] == 0.0
+    # None, not 0.0: two walks cannot be split into a selection half and an
+    # evaluation half, so there is no honest gain to report. Zero would claim a
+    # measurement was taken and came out even, which is a different statement
+    # from "this study is too small to measure it".
+    assert out["objective_gain"] is None
+    assert out["objective_gain_ci"] is None
     assert out["gain_supported"] is False
     assert out["exploration"]["sample_space"] == 1
     assert out["exploration"]["explored_fraction"] == 1.0
@@ -484,3 +503,96 @@ def test_assignment_is_deterministic_under_the_design_seed():
 
     assert assign_orderings(6, 3, 6) == assign_orderings(6, 3, 6)
     assert assign_orderings(0, 3, 6) == [] and assign_orderings(6, 3, 0) == []
+
+
+# ── post-selection inference ─────────────────────────────────────────────
+
+
+def _null_study(seed: int, n_personas: int = 6, reps: int = 4) -> dict:
+    """A study with NO order effect whatsoever.
+
+    Intent is a random walk whose increments do not depend on which message was
+    delivered — only the walk's own noise. Any "gain" found here is the search
+    fitting noise, so `gain_supported` firing is by definition a false positive.
+    """
+    import random
+
+    from app.sequence import assign_orderings, sample_orderings, sequence_result
+
+    rng = random.Random(seed)
+    pool = sample_orderings(4, 8)
+    walks = []
+    for slot in assign_orderings(n_personas, reps, len(pool)):
+        order = pool[slot]
+        steps, intent = [], 0.0
+        for _pos in range(len(order)):
+            intent = max(0.0, min(1.0, intent + rng.gauss(0.12, 0.18)))
+            steps.append({"intent": intent, "fatigue": 0.2, "disengaged": False})
+        walks.append({"ordering": list(order), "steps": steps})
+    return sequence_result(walks, [f"m{i}" for i in range(4)], "low", len(pool))
+
+
+def test_gain_is_not_supported_under_a_true_null():
+    """The regression the cross-fitting exists for.
+
+    `recommended` is the argmax over ~40 candidates scored on the full sample.
+    Reporting its margin on the data that selected it is the winner's curse,
+    and the old bootstrap held `recommended` FIXED while resampling everything
+    else — so it measured the uncertainty of scoring a pre-chosen ordering and
+    never the uncertainty of the choosing. Measured on studies with no order
+    effect at all, `gain_supported` fired 20.7% of the time against a nominal
+    2.5%, mean "gain" +0.75, P(gain > 0) = 98.7%.
+
+    With selection and evaluation on disjoint halves and a permutation null
+    over the whole procedure, the measured rate is 2%. The bar here is 12% —
+    loose enough not to flake on 25 trials, tight enough that reverting the
+    fix fails it.
+    """
+    trials = 25
+    fired = sum(bool(_null_study(1000 + s)["gain_supported"]) for s in range(trials))
+    assert fired / trials < 0.12, f"{fired}/{trials} false positives under the null"
+
+
+def test_naive_gain_is_positive_under_the_null_but_honest_gain_is_not():
+    """Both halves of the correction, in one place.
+
+    The in-sample margin is positive almost always even with nothing to find —
+    that is the bias, and it is why `naive_objective_gain` must never be
+    rendered as the gain. The cross-fitted estimate has no such floor and
+    comes out either side of zero, which is what an unbiased estimate of a true
+    zero looks like.
+    """
+    results = [_null_study(2000 + s) for s in range(20)]
+    naive_positive = sum(r["naive_objective_gain"] > 0 for r in results)
+    honest_positive = sum((r["objective_gain"] or 0) > 0 for r in results)
+    assert naive_positive >= 18  # the selection bias, still visible
+    assert 3 <= honest_positive <= 17  # centred on zero, not pinned above it
+
+
+def test_real_order_effect_is_still_detected():
+    """Conservative is not the same as blind.
+
+    Message 3 pays off only when delivered first, so the submitted ordering
+    [0,1,2,3] is genuinely the wrong one and there is a real gain to find.
+    """
+    import random
+
+    from app.sequence import assign_orderings, sample_orderings, sequence_result
+
+    def study(seed: int) -> dict:
+        rng = random.Random(seed)
+        pool = sample_orderings(4, 8)
+        walks = []
+        for slot in assign_orderings(10, 6, len(pool)):
+            order = pool[slot]
+            steps, intent = [], 0.0
+            for pos, msg in enumerate(order):
+                bump = 0.5 if (msg == 3 and pos == 0) else 0.0
+                intent = max(0.0, min(1.0, intent + rng.gauss(0.10 + bump, 0.15)))
+                steps.append({"intent": intent, "fatigue": 0.2, "disengaged": False})
+            walks.append({"ordering": list(order), "steps": steps})
+        return sequence_result(walks, [f"m{i}" for i in range(4)], "low", len(pool))
+
+    results = [study(3000 + s) for s in range(12)]
+    assert all(r["recommended_ordering"][0] == 3 for r in results)
+    assert sum(bool(r["gain_supported"]) for r in results) >= 10

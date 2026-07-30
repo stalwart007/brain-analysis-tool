@@ -26,49 +26,175 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
-  useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 
 type DomainState = { hovered: number | null; pinned: number | null };
 
-interface CursorApi {
+const EMPTY: DomainState = { hovered: null, pinned: null };
+
+/**
+ * PER-DOMAIN SUBSCRIPTION, not one state object.
+ *
+ * This used to be a single `useState<Record<string, DomainState>>` with the
+ * context value memoised on `[state]`. Every hover therefore produced a new
+ * context identity, so hovering ANY chart re-rendered EVERY cursor consumer on
+ * the page. On the white room that is the round table, the influence network,
+ * the trajectory, the conformity chart, the camps, the counterfactual strip and
+ * the transcript — all of them, for a hover that concerned one of them.
+ *
+ * Measured on the room bench: 40 pointer moves over the trajectory chart, whose
+ * axis is ROUNDS, committed 5 re-renders each of the five MEMBER-indexed panels
+ * that cannot be affected by a round at all.
+ *
+ * So the store is external and mutable, the context carries it by a reference
+ * that never changes, and each chart subscribes to its own domain through
+ * `useSyncExternalStore`. A hover now re-renders the domain that changed and
+ * nothing else. lib/journey.tsx carries a note about the identical bug being
+ * fixed there for scroll progress; this was the remaining instance.
+ */
+interface CursorStore {
   get(domain: string): DomainState;
+  subscribe(domain: string, fn: () => void): () => void;
   setHovered(domain: string, i: number | null): void;
   togglePin(domain: string, i: number): void;
   clear(domain: string): void;
 }
 
-const Ctx = createContext<CursorApi | null>(null);
+function createCursorStore(): CursorStore {
+  const state = new Map<string, DomainState>();
+  const subs = new Map<string, Set<() => void>>();
 
-const EMPTY: DomainState = { hovered: null, pinned: null };
+  /** Writes only on a real change, so `get` stays referentially stable and
+   *  `useSyncExternalStore` does not loop. This is also the old
+   *  "no re-render on a repeated hover" guard, now covering both fields. */
+  const write = (d: string, next: DomainState) => {
+    const cur = state.get(d) ?? EMPTY;
+    if (cur.hovered === next.hovered && cur.pinned === next.pinned) return;
+    state.set(d, next);
+    subs.get(d)?.forEach((fn) => fn());
+  };
+
+  return {
+    get: (d) => state.get(d) ?? EMPTY,
+    subscribe: (d, fn) => {
+      let set = subs.get(d);
+      if (!set) {
+        set = new Set();
+        subs.set(d, set);
+      }
+      set.add(fn);
+      return () => {
+        set?.delete(fn);
+        if (set && set.size === 0) subs.delete(d);
+      };
+    },
+    setHovered: (d, i) => write(d, { ...(state.get(d) ?? EMPTY), hovered: i }),
+    togglePin: (d, i) => {
+      const cur = state.get(d) ?? EMPTY;
+      write(d, { ...cur, pinned: cur.pinned === i ? null : i });
+    },
+    clear: (d) => write(d, EMPTY),
+  };
+}
+
+const Ctx = createContext<CursorStore | null>(null);
 
 /** Wrap a panel (or a page) so every chart inside shares its cursor per domain. */
 export function ChartCursorProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<Record<string, DomainState>>({});
+  const store = useRef<CursorStore | null>(null);
+  if (!store.current) store.current = createCursorStore();
+  // The value never changes identity, so the provider never re-renders a
+  // consumer by itself — only a domain's own subscribers wake up.
+  return <Ctx.Provider value={store.current}>{children}</Ctx.Provider>;
+}
 
-  const api = useMemo<CursorApi>(
-    () => ({
-      get: (d) => state[d] ?? EMPTY,
-      setHovered: (d, i) =>
-        setState((s) => {
-          const cur = s[d] ?? EMPTY;
-          if (cur.hovered === i) return s; // identity-stable: no re-render on repeat
-          return { ...s, [d]: { ...cur, hovered: i } };
-        }),
-      togglePin: (d, i) =>
-        setState((s) => {
-          const cur = s[d] ?? EMPTY;
-          return { ...s, [d]: { ...cur, pinned: cur.pinned === i ? null : i } };
-        }),
-      clear: (d) => setState((s) => ({ ...s, [d]: EMPTY })),
-    }),
-    [state]
+/**
+ * One domain's state, and the store to write it through.
+ *
+ * Usable outside a provider — a chart should never crash because someone
+ * rendered it somewhere unwrapped; it gets a private store and simply stops
+ * linking to its neighbours.
+ */
+function useDomain(domain: string): [DomainState, CursorStore] {
+  const ctx = useContext(Ctx);
+  const own = useRef<CursorStore | null>(null);
+  if (!ctx && !own.current) own.current = createCursorStore();
+  const store = ctx ?? (own.current as CursorStore);
+
+  const subscribe = useCallback(
+    (fn: () => void) => store.subscribe(domain, fn),
+    [store, domain]
+  );
+  const snapshot = useCallback(() => store.get(domain), [store, domain]);
+  const state = useSyncExternalStore(subscribe, snapshot, snapshot);
+  return [state, store];
+}
+
+/**
+ * A pointer surface's bounding rect, measured AT MOST ONCE PER FRAME.
+ *
+ * `getBoundingClientRect()` on every pointer move forces the browser to settle
+ * layout on every event, and a high-rate mouse delivers several events per
+ * frame. So the measurement is held for the rest of the frame and dropped on
+ * the next one.
+ *
+ * One frame, and not longer, is the deliberate part. The rect cannot simply be
+ * invalidated on resize/scroll, because this element sits inside `<main
+ * className="warp">` (globals.css `.warp`), whose `skewY`/`scaleY` is rewritten
+ * EVERY FRAME from `--scroll-warp` by Craft.tsx's ScrollWarp — including a decay
+ * tail that keeps moving after the last scroll event. `getBoundingClientRect` is
+ * transform-aware, a ResizeObserver is not, and no scroll event fires during the
+ * tail. A rect cached across frames therefore drifts under a live transform,
+ * which in `useMatrixCursor` — the one caller that reads `top`/`height` — means
+ * silently selecting the wrong ROW.
+ *
+ * A per-frame lifetime also covers the case where the surface MOVES without
+ * resizing: pinning adds the "pinned N ✕" button to the header above it, and a
+ * legend row appears the moment a chart gains a second series.
+ */
+export function useRectCache() {
+  const node = useRef<HTMLElement | SVGElement | null>(null);
+  const rect = useRef<DOMRect | null>(null);
+  const raf = useRef(0);
+
+  const invalidate = useCallback(() => {
+    rect.current = null;
+  }, []);
+
+  const attach = useCallback((el: HTMLElement | SVGElement | null) => {
+    node.current = el;
+    rect.current = null;
+  }, []);
+
+  const read = useCallback((): DOMRect | null => {
+    const el = node.current;
+    if (!el) return null;
+    if (!rect.current) {
+      rect.current = el.getBoundingClientRect();
+      if (typeof requestAnimationFrame !== "undefined" && !raf.current) {
+        raf.current = requestAnimationFrame(() => {
+          raf.current = 0;
+          rect.current = null;
+        });
+      }
+    }
+    return rect.current;
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (raf.current) cancelAnimationFrame(raf.current);
+    },
+    []
   );
 
-  return <Ctx.Provider value={api}>{children}</Ctx.Provider>;
+  // Stable identity, or the `surfaceProps` memos that depend on it never hit.
+  return useMemo(() => ({ attach, read, invalidate }), [attach, read, invalidate]);
 }
 
 export interface ChartCursor {
@@ -146,29 +272,17 @@ export function useMatrixCursor(
   describe?: (row: number, col: number) => string,
   opts?: { inset?: { left: number; top: number } }
 ): MatrixCursor {
-  const api = useContext(Ctx);
-  const local = useState<DomainState>(EMPTY);
-  const surfaceRef = useRef<HTMLElement | SVGElement | null>(null);
+  const [state, store] = useDomain(domain);
+  const surface = useRectCache();
   const insetL = opts?.inset?.left ?? 0;
   const insetT = opts?.inset?.top ?? 0;
 
-  const state = api ? api.get(domain) : local[0];
   const setFlat = useCallback(
-    (i: number | null) =>
-      api ? api.setHovered(domain, i) : local[1]((s) => ({ ...s, hovered: i })),
-    [api, domain, local]
+    (i: number | null) => store.setHovered(domain, i),
+    [store, domain]
   );
-  const pinFlat = useCallback(
-    (i: number) =>
-      api
-        ? api.togglePin(domain, i)
-        : local[1]((s) => ({ ...s, pinned: s.pinned === i ? null : i })),
-    [api, domain, local]
-  );
-  const clear = useCallback(
-    () => (api ? api.clear(domain) : local[1](EMPTY)),
-    [api, domain, local]
-  );
+  const pinFlat = useCallback((i: number) => store.togglePin(domain, i), [store, domain]);
+  const clear = useCallback(() => store.clear(domain), [store, domain]);
 
   const decode = (flat: number | null) =>
     flat === null || cols < 1 || flat < 0
@@ -181,9 +295,8 @@ export function useMatrixCursor(
 
   const cellAt = useCallback(
     (clientX: number, clientY: number) => {
-      const el = surfaceRef.current;
-      if (!el || rows < 1 || cols < 1) return null;
-      const r = el.getBoundingClientRect();
+      const r = surface.read();
+      if (!r || rows < 1 || cols < 1) return null;
       const w = r.width * (1 - insetL);
       const h = r.height * (1 - insetT);
       if (w <= 0 || h <= 0) return null;
@@ -192,19 +305,20 @@ export function useMatrixCursor(
       if (col < 0 || col >= cols || row < 0 || row >= rows) return null;
       return { row, col };
     },
-    [rows, cols, insetL, insetT]
+    [surface, rows, cols, insetL, insetT]
   );
 
   const surfaceProps = useMemo(
     () => ({
-      ref: (el: HTMLElement | SVGElement | null) => {
-        surfaceRef.current = el;
-      },
+      ref: surface.attach,
       onPointerMove: (e: React.PointerEvent) => {
         const c = cellAt(e.clientX, e.clientY);
         setFlat(c ? c.row * cols + c.col : null);
       },
-      onPointerLeave: () => setFlat(null),
+      onPointerLeave: () => {
+        surface.invalidate();
+        setFlat(null);
+      },
       onPointerDown: (e: React.PointerEvent) => {
         const c = cellAt(e.clientX, e.clientY);
         if (c) pinFlat(c.row * cols + c.col);
@@ -243,7 +357,7 @@ export function useMatrixCursor(
           : `${label}. Use arrow keys to inspect cells, Enter to pin.`,
       style: { touchAction: "none" as const, outline: "none" as const },
     }),
-    [cellAt, setFlat, pinFlat, clear, cell, rows, cols, label, describe, state.pinned]
+    [surface, cellAt, setFlat, pinFlat, clear, cell, rows, cols, label, describe, state.pinned]
   );
 
   return {
@@ -316,38 +430,23 @@ export function useChartCursor(
   const insetL = opts?.inset?.[0] ?? 0;
   const insetR = opts?.inset?.[1] ?? 0;
   const mapping = opts?.mapping ?? "band";
-  const api = useContext(Ctx);
-  const local = useState<DomainState>(EMPTY);
-  const surfaceRef = useRef<HTMLElement | SVGElement | null>(null);
+  const [state, store] = useDomain(domain);
+  const surface = useRectCache();
 
-  // Usable outside a provider — a chart should never crash because someone
-  // rendered it somewhere unwrapped; it just stops linking to its neighbours.
-  const state = api ? api.get(domain) : local[0];
   const setHovered = useCallback(
-    (i: number | null) =>
-      api ? api.setHovered(domain, i) : local[1]((s) => ({ ...s, hovered: i })),
-    [api, domain, local]
+    (i: number | null) => store.setHovered(domain, i),
+    [store, domain]
   );
-  const togglePin = useCallback(
-    (i: number) =>
-      api
-        ? api.togglePin(domain, i)
-        : local[1]((s) => ({ ...s, pinned: s.pinned === i ? null : i })),
-    [api, domain, local]
-  );
-  const clear = useCallback(
-    () => (api ? api.clear(domain) : local[1](EMPTY)),
-    [api, domain, local]
-  );
+  const togglePin = useCallback((i: number) => store.togglePin(domain, i), [store, domain]);
+  const clear = useCallback(() => store.clear(domain), [store, domain]);
 
   const index = state.hovered ?? state.pinned;
 
   /** Pointer x → index, over the PLOT box rather than the element box. */
   const indexAt = useCallback(
     (clientX: number) => {
-      const el = surfaceRef.current;
-      if (!el || length < 1) return null;
-      const r = el.getBoundingClientRect();
+      const r = surface.read();
+      if (!r || length < 1) return null;
       const plot = r.width * (1 - insetL - insetR);
       if (plot <= 0) return null;
       const t = (clientX - r.left - r.width * insetL) / plot;
@@ -358,16 +457,17 @@ export function useChartCursor(
       }
       return Math.max(0, Math.min(length - 1, Math.floor(t * length)));
     },
-    [length, insetL, insetR, mapping]
+    [surface, length, insetL, insetR, mapping]
   );
 
   const surfaceProps = useMemo(
     () => ({
-      ref: (el: HTMLElement | SVGElement | null) => {
-        surfaceRef.current = el;
-      },
+      ref: surface.attach,
       onPointerMove: (e: React.PointerEvent) => setHovered(indexAt(e.clientX)),
-      onPointerLeave: () => setHovered(null),
+      onPointerLeave: () => {
+        surface.invalidate();
+        setHovered(null);
+      },
       onPointerDown: (e: React.PointerEvent) => {
         const i = indexAt(e.clientX);
         if (i !== null) togglePin(i);
@@ -407,7 +507,7 @@ export function useChartCursor(
         : `${label}. Use arrow keys to inspect, Enter to pin.`,
       style: { touchAction: "none" as const, outline: "none" as const },
     }),
-    [indexAt, setHovered, togglePin, clear, index, length, label, describe, state.pinned]
+    [surface, indexAt, setHovered, togglePin, clear, index, length, label, describe, state.pinned]
   );
 
   return {

@@ -14,8 +14,8 @@
  * because nobody waits a second with a mouse held still.
  */
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { ChartCursor } from "./cursor";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useRectCache, type ChartCursor } from "./cursor";
 
 export interface ChartSeries {
   key: string;
@@ -55,8 +55,24 @@ export default function ChartFrame({
   height?: number | "auto";
   children: ReactNode;
 }) {
-  const hostRef = useRef<HTMLDivElement>(null);
-  const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
+  /* ── the tooltip: content in React, POSITION not ────────────────────────
+     The position changes on every pixel of pointer travel; the content only
+     changes when the cursor lands on a new index. Holding the position in
+     state re-rendered this whole chart subtree per mouse pixel — on the white
+     room that is a 741-line table and a 597-line network — so the position is
+     written straight onto the node as a transform and never enters React at
+     all. `over` is the only pointer state left, and it flips twice per hover
+     rather than once per pixel.
+
+     Measured on the room bench: 40 moves across one chart went from 40 commits
+     of that chart to 5, one per band actually entered. */
+  const host = useRectCache();
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const pos = useRef<{ x: number; y: number } | null>(null);
+  /** the tooltip's own width, re-measured only when its CONTENT changes —
+   *  needed to flip it away from the right edge without measuring per pixel */
+  const tipW = useRef(0);
+  const [over, setOver] = useState(false);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -64,6 +80,34 @@ export default function ChartFrame({
     const t = setTimeout(() => setCopied(false), 1400);
     return () => clearTimeout(t);
   }, [copied]);
+
+  const placeTip = useCallback(() => {
+    const tip = tipRef.current;
+    const p = pos.current;
+    const r = host.read();
+    if (!tip || !p || !r) return;
+    // Same placement as before: 14px to the right of the pointer, flipped to
+    // 14px left of it past 60% of the width so it never leaves the panel.
+    //
+    // Both ends are clamped. The old version anchored the flipped case with
+    // `right:`, which could not overflow the left edge by construction; a
+    // transform can, and in a half-width `lg:grid-cols-2` column with a wide
+    // tooltip it would. The clamp is what replaces that guarantee.
+    const flip = p.x > r.width * 0.6;
+    const want = flip ? p.x - 14 - tipW.current : p.x + 14;
+    const x = Math.max(0, Math.min(want, Math.max(0, r.width - tipW.current)));
+    const y = Math.max(0, p.y - 8);
+    tip.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0)`;
+  }, [host]);
+
+  // Runs after the tooltip mounts or its content changes — the one place its
+  // width is read, and before paint so it is never seen mispositioned.
+  useLayoutEffect(() => {
+    const tip = tipRef.current;
+    if (!tip) return;
+    tipW.current = tip.offsetWidth;
+    placeTip();
+  });
 
   const i = cursor.index;
   const visible = series.filter((s) => !hidden?.has(s.key));
@@ -83,7 +127,7 @@ export default function ChartFrame({
   }
 
   return (
-    <div className="relative" ref={hostRef}>
+    <div className="relative" ref={host.attach}>
       <div className="mb-1 flex items-baseline justify-between gap-2">
         <span className="hud-label text-muted">{title}</span>
         <div className="flex items-center gap-2">
@@ -136,12 +180,19 @@ export default function ChartFrame({
         {...cursor.surfaceProps}
         onPointerMove={(e) => {
           cursor.surfaceProps.onPointerMove(e);
-          const r = hostRef.current?.getBoundingClientRect();
-          if (r) setPointer({ x: e.clientX - r.left, y: e.clientY - r.top });
+          // Cached rect, so pointer travel never forces a synchronous layout.
+          const r = host.read();
+          if (r) {
+            pos.current = { x: e.clientX - r.left, y: e.clientY - r.top };
+            placeTip();
+          }
+          if (!over) setOver(true);
         }}
         onPointerLeave={() => {
           cursor.surfaceProps.onPointerLeave();
-          setPointer(null);
+          pos.current = null;
+          host.invalidate();
+          setOver(false);
         }}
         className="relative focus-visible:ring-1 focus-visible:ring-accent/60"
         style={{
@@ -203,18 +254,17 @@ export default function ChartFrame({
       )}
 
       {/* Tooltip. Instant, styled, and flipped near the right edge so it never
-          leaves the panel. */}
-      {i !== null && pointer && (
+          leaves the panel. Anchored at the host's origin and moved by a
+          transform — a compositor-only property, so following the pointer never
+          costs a layout, let alone a React render. */}
+      {i !== null && over && (
         <div
+          ref={tipRef}
           role="tooltip"
-          className="pointer-events-none absolute z-30 min-w-32 rounded-lg border border-hairline bg-page/95 px-2.5 py-1.5 shadow-lg backdrop-blur-sm"
-          style={{
-            left: pointer.x > (hostRef.current?.clientWidth ?? 0) * 0.6 ? undefined : pointer.x + 14,
-            right: pointer.x > (hostRef.current?.clientWidth ?? 0) * 0.6
-              ? (hostRef.current?.clientWidth ?? 0) - pointer.x + 14
-              : undefined,
-            top: Math.max(0, pointer.y - 8),
-          }}
+          /* max-w-full: anchored at left-0 the box would otherwise shrink-to-fit
+             against the WHOLE panel width, so a wide readout that used to wrap
+             now stays on one line and pushes past the edge. */
+          className="pointer-events-none absolute left-0 top-0 z-30 min-w-32 max-w-full rounded-lg border border-hairline bg-page/95 px-2.5 py-1.5 shadow-lg backdrop-blur-sm"
         >
           <div className="font-mono text-[10px] text-ink">
             {categories[i] ?? `#${i + 1}`}

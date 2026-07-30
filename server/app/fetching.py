@@ -42,7 +42,7 @@ import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -70,8 +70,52 @@ MAX_BYTES = 8_000_000
 #: apex → www → https chain and short enough to bound the work.
 MAX_REDIRECTS = 3
 
-#: A study reads prose. An octet-stream is either a download or a trap.
-ALLOWED_CONTENT_PREFIXES = ("text/html", "application/xhtml", "text/plain")
+#: What each kind of study asset is served as, and how much of it we will take.
+#:
+#: The caps differ by an order of magnitude because the downstream cost does.
+#: An image goes to a vision model as base64, which inflates it by a third and
+#: is billed; a video is never decoded here at all, only relayed to the browser
+#: that will decode it, so it can be larger. The ceiling is enforced on bytes
+#: ACTUALLY READ rather than on Content-Length, because Content-Length is a
+#: claim by a server we have no reason to trust.
+ASSET_KINDS: dict[str, tuple[tuple[str, ...], int]] = {
+    "page": (("text/html", "application/xhtml", "text/plain"), MAX_BYTES),
+    "image": (("image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"), 12_000_000),
+    "document": (("application/pdf",), 25_000_000),
+    "video": (("video/",), 80_000_000),
+    # `application/ogg` is the registered type for an .ogg container and is what
+    # Wikimedia and a good deal of podcast hosting actually serve; matching only
+    # `audio/` refused real audio files as "not something this platform can
+    # study", which is a confusing thing to be told about an audio file.
+    "audio": (("audio/", "application/ogg"), 60_000_000),
+}
+
+#: Every prefix any kind accepts. An octet-stream matches nothing and is
+#: refused: it is either a download or a trap, and guessing its type from the
+#: file extension is how a "video" turns out to be a script.
+ALLOWED_CONTENT_PREFIXES: tuple[str, ...] = tuple(
+    prefix for prefixes, _cap in ASSET_KINDS.values() for prefix in prefixes
+)
+
+#: Largest cap across all kinds — the bound the transport enforces when the
+#: caller has not narrowed to one kind, since the type is only known after the
+#: response headers arrive.
+MAX_ANY_BYTES = max(cap for _prefixes, cap in ASSET_KINDS.values())
+
+
+def kind_for_content_type(ctype: str) -> Optional[str]:
+    """Which study modality a MIME type belongs to, or None.
+
+    Content type decides, never the URL's extension. `…/promo.mp4` served as
+    `text/html` is a page that will be analysed as a page, and `…/x?id=9`
+    served as `image/png` is an image — the bytes are what the study consumes,
+    so the bytes' declared type is what routes them.
+    """
+    ctype = (ctype or "").split(";")[0].strip().lower()
+    for kind, (prefixes, _cap) in ASSET_KINDS.items():
+        if ctype.startswith(prefixes):
+            return kind
+    return None
 
 #: Presented as a browser because many sites serve a challenge page or a
 #: stripped response to unknown agents, and a challenge page would be analysed
@@ -81,6 +125,24 @@ USER_AGENT = (
     "Mozilla/5.0 (compatible; CogniSwarmBot/1.0; +https://cogniswarm-app.fly.dev) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+#: The same identity without the browser costume, tried once when the costume
+#: is what got us refused.
+#:
+#: Both directions of this are real and they pull opposite ways. Plenty of
+#: marketing sites serve a challenge page or a stripped shell to anything that
+#: does not look like a browser, which is why `USER_AGENT` exists. But some
+#: origins — w3.org behind Cloudflare, measured — refuse a Chrome string coming
+#: from a datacentre IP precisely BECAUSE it is transparently not Chrome, and
+#: that refusal arrives as a 403 that reads exactly like "this page requires a
+#: login". No single string wins on both, so a refusal is retried once with
+#: the honest one before the failure is reported.
+BOT_USER_AGENT = "CogniSwarmBot/1.0 (+https://cogniswarm-app.fly.dev)"
+
+#: Statuses worth one retry under the other identity. Deliberately not 404 or
+#: 5xx: those are about the resource or the origin, and re-asking as someone
+#: else cannot change them.
+_UA_RETRY_STATUSES = frozenset({400, 401, 403, 406, 418, 429})
 
 
 class UnsafeURL(ValueError):
@@ -95,14 +157,34 @@ class FetchFailed(RuntimeError):
 class Fetched:
     """What a successful fetch yields."""
 
-    #: Raw markup, ready for the `page` modality adapter.
-    html: str
+    #: Exactly what came off the wire. Text modalities decode it; image, video,
+    #: audio and PDF need it intact, and decoding-then-re-encoding a JPEG to
+    #: satisfy a `str`-typed field is how binary assets get silently corrupted.
+    content: bytes
     #: Where we ended up, which is not always where we were pointed.
     final_url: str
     #: Redirect chain actually walked, for display.
     hops: tuple[str, ...]
     content_type: str
     bytes_read: int
+    #: Which study modality this content belongs to, decided by content type.
+    kind: Optional[str] = None
+    #: What the response said it was encoded as. Carried rather than assumed:
+    #: decoding a Latin-1 or Shift-JIS page as UTF-8 replaces every non-ASCII
+    #: character with U+FFFD, and the beats a study then runs on are the page's
+    #: copy with its punctuation and accents shot through with question marks.
+    encoding: Optional[str] = None
+
+    @property
+    def html(self) -> str:
+        """Decoded text, for the `page` adapter.
+
+        A property rather than a second stored field so there is exactly one
+        copy of the payload in memory — these run to tens of megabytes for
+        video, and holding both a bytes and a str view doubles that for no
+        reason.
+        """
+        return self.content.decode(self.encoding or "utf-8", errors="replace")
 
 
 def _reject_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> Optional[str]:
@@ -147,6 +229,49 @@ def _reject_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> Optional[st
     if not ip.is_global:
         return "non-routable address"
     return None
+
+
+def _status_hint(status: int) -> str:
+    """What a failing status actually means, rather than one guess for all of them.
+
+    Every 4xx and 5xx used to produce the same sentence — "The page may require a
+    login, or may be blocking automated access." That is right for 401 and 403
+    and wrong for everything else, and the most common failure by far is a plain
+    404 from a URL with a typo in it. Telling someone their mistyped link is
+    behind a login wall sends them to check credentials, change networks, or
+    file a bug, when the fix is to look at the address. This is the same defect
+    the audit backlog records for the `Accept` header — a message that blamed
+    "blocking automated access" for a refusal we had caused ourselves, and sent
+    the reader to fix nothing.
+
+    Anything unrecognised falls through to a neutral statement rather than a
+    speculative one: an unexplained status is better reported as unexplained.
+    """
+    if status == 404:
+        # Deliberately does not mention authentication even to rule it out:
+        # naming a theory in order to deny it still plants it, and this is the
+        # status where the reader most needs to be looking at the address.
+        return "That address does not exist on this host — check the URL for a typo."
+    if status == 410:
+        return "That address used to exist and has been removed."
+    if status in (401, 407):
+        return "That resource requires authentication, so it cannot be fetched from a link alone."
+    if status == 403:
+        return (
+            "The host refused the request. It may be blocking automated access, "
+            "or the resource may be private."
+        )
+    if status == 429:
+        return "The host is rate-limiting us. Waiting and retrying usually works."
+    if status in (405, 501):
+        return "The host does not allow this kind of request for that address."
+    if status == 451:
+        return "The host is refusing for legal reasons."
+    if 500 <= status < 600:
+        return "That is a fault on the host's side, not with the link — retrying may work."
+    if 400 <= status < 500:
+        return "The host rejected the request as malformed or unacceptable."
+    return "The host did not return a usable response."
 
 
 async def _resolve(host: str, port: int) -> list[tuple[int, str]]:
@@ -205,7 +330,42 @@ def _validate(url: str) -> tuple[str, str, int, str]:
 
 
 async def fetch_page(url: str) -> Fetched:
-    """Fetch `url` safely, following and revalidating up to MAX_REDIRECTS hops."""
+    """Fetch `url` as a web page. Refuses anything that is not markup."""
+    fetched = await fetch_url(url, kinds=("page",))
+    return fetched
+
+
+async def fetch_url(
+    url: str, kinds: Sequence[str] = tuple(ASSET_KINDS), max_bytes: Optional[int] = None
+) -> Fetched:
+    """Fetch `url` safely, following and revalidating up to MAX_REDIRECTS hops.
+
+    `kinds` narrows what will be accepted. Every caller states it, because
+    "whatever comes back" is how a study ends up analysing a 404 page: a URL
+    that was meant to be a video and answers with HTML should fail as the wrong
+    kind of thing rather than quietly become a page study of an error message.
+
+    The SSRF defence is unchanged and is the reason this stayed a single
+    function when it grew from HTML to five modalities. Scheme and port
+    allowlist, resolve every address ourselves, connect to the address we
+    validated rather than to the name, revalidate on every redirect, forward no
+    credentials, cap time and bytes — all of it applies identically whether the
+    payload turns out to be a landing page or an MP4. Adding a second fetch
+    path for media would have doubled the number of places that have to get
+    that right, which is precisely how one of them ends up not.
+    """
+    allowed_prefixes = tuple(
+        p for k in kinds for p in ASSET_KINDS.get(k, ((), 0))[0]
+    )
+    if not allowed_prefixes:
+        raise UnsafeURL(f"no fetchable content kinds requested (got {list(kinds)!r})")
+    cap = max_bytes or max(ASSET_KINDS[k][1] for k in kinds if k in ASSET_KINDS)
+    # Wildcard families (`video/`, `audio/`) become `video/*` so the header is
+    # a legal media range; concrete types pass through unchanged.
+    accept = ", ".join(
+        dict.fromkeys(p + "*" if p.endswith("/") else p for p in allowed_prefixes)
+    )
+
     hops: list[str] = []
     current = url
 
@@ -228,8 +388,8 @@ async def fetch_page(url: str) -> Fetched:
             literal = f"[{addr}]" if family == socket.AF_INET6 else addr
             pinned = urlparse(normalised)._replace(netloc=f"{literal}:{port}")
 
-            try:
-                response = await client.get(
+            async def _get(agent: str):
+                return await client.get(
                     urlunparse(pinned),
                     headers={
                         # The origin still needs to know which vhost we want,
@@ -238,12 +398,30 @@ async def fetch_page(url: str) -> Fetched:
                         # validation, so pinning the IP does not silently
                         # downgrade us to an unverified connection.
                         "Host": host if port in (80, 443) else f"{host}:{port}",
-                        "User-Agent": USER_AGENT,
-                        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9",
+                        "User-Agent": agent,
+                        # Derived from what the caller will actually accept, not
+                        # hardcoded. This header said `text/html,…` while the
+                        # fetcher had grown to five modalities, and a correctly
+                        # behaved origin honours it: Wikimedia answered 400 and
+                        # w3.org 403 for an image and a PDF, which read as
+                        # "blocking automated access" and were nothing of the
+                        # kind — we asked for HTML and were served the refusal
+                        # we requested.
+                        "Accept": accept,
                         "Accept-Language": "en-US,en;q=0.9",
                     },
                     extensions={"sni_hostname": host},
                 )
+
+            try:
+                response = await _get(USER_AGENT)
+                # One retry without the browser costume. Some origins refuse a
+                # Chrome string from a datacentre IP precisely because it is
+                # transparently not Chrome, and the refusal is indistinguishable
+                # from a login wall in the message we would otherwise show.
+                if response.status_code in _UA_RETRY_STATUSES:
+                    await response.aclose()
+                    response = await _get(BOT_USER_AGENT)
             except httpx.HTTPError as exc:
                 raise FetchFailed(f"could not reach {host}: {type(exc).__name__}") from exc
 
@@ -260,17 +438,22 @@ async def fetch_page(url: str) -> Fetched:
 
             if response.status_code >= 400:
                 await response.aclose()
-                raise FetchFailed(
-                    f"{host} answered {response.status_code}. "
-                    "The page may require a login, or may be blocking automated access."
-                )
+                raise FetchFailed(f"{host} answered {response.status_code}. {_status_hint(response.status_code)}")
 
             ctype = response.headers.get("content-type", "").split(";")[0].strip().lower()
-            if ctype and not ctype.startswith(ALLOWED_CONTENT_PREFIXES):
+            if ctype and not ctype.startswith(allowed_prefixes):
                 await response.aclose()
+                served = kind_for_content_type(ctype)
+                if served:
+                    raise FetchFailed(
+                        f"that URL serves {ctype}, which is a {served}, but this "
+                        f"study is expecting {' or '.join(kinds)}. Switch the "
+                        "content type and paste the link again."
+                    )
                 raise FetchFailed(
-                    f"that URL serves {ctype}, not a web page. "
-                    "For images or video, upload the file instead."
+                    f"that URL serves {ctype}, which is not something this "
+                    "platform can study. Supported: web pages, images, video, "
+                    "audio and PDFs."
                 )
 
             # Streamed with a running total: Content-Length is a claim by the
@@ -279,20 +462,23 @@ async def fetch_page(url: str) -> Fetched:
             total = 0
             async for chunk in response.aiter_bytes():
                 total += len(chunk)
-                if total > MAX_BYTES:
+                if total > cap:
                     await response.aclose()
-                    raise FetchFailed("that page is larger than 2 MB — too big to study")
+                    raise FetchFailed(
+                        f"that file is larger than {cap // 1_000_000} MB, which is "
+                        "the ceiling for this content type — too big to study."
+                    )
                 chunks.append(chunk)
             await response.aclose()
 
-            raw = b"".join(chunks)
-            html = raw.decode(response.encoding or "utf-8", errors="replace")
             return Fetched(
-                html=html,
+                content=b"".join(chunks),
                 final_url=normalised,
                 hops=tuple(hops),
                 content_type=ctype or "text/html",
                 bytes_read=total,
+                kind=kind_for_content_type(ctype) or "page",
+                encoding=response.encoding,
             )
 
     raise FetchFailed(

@@ -18,6 +18,7 @@ import dynamic from "next/dynamic";
 import { CognitiveLoad, PriceSensitivityResult } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
 import SimStage from "./sim/SimStage";
 import { ElasticityPanel } from "./StatReadouts";
@@ -30,6 +31,7 @@ export default function PricePanel({ personaCount }: { personaCount: number }) {
   const [pricesText, setPricesText] = useState("19, 29, 49, 79, 99");
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");
+  const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PriceSensitivityResult | null>(null);
@@ -52,7 +54,7 @@ export default function PricePanel({ personaCount }: { personaCount: number }) {
     try {
       await streamRun(
         "/studies/price/stream",
-        { product, prices, twins_per_persona: twins, cognitive_load: load },
+        { product, prices, twins_per_persona: twins, cognitive_load: load, research_question: question },
         (evt) => {
           if (evt.type === "start") setTotal(evt.total as number);
           else if (evt.type === "agent") {
@@ -135,6 +137,13 @@ export default function PricePanel({ personaCount }: { personaCount: number }) {
         />
       </label>
 
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. can we raise price without losing the buyers who convert?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <span className="text-xs text-muted tabular-nums">{prices.length} prices</span>
         <label className="flex items-center gap-2 text-xs text-muted">
@@ -169,6 +178,7 @@ export default function PricePanel({ personaCount }: { personaCount: number }) {
             exit={{ opacity: 0 }}
             className="mt-6"
           >
+          <FindingsPanel findings={result.findings} />
             <p className="mb-4 text-sm">
               Revenue-maximizing price:{" "}
               <span className="font-display text-lg font-semibold text-accent">

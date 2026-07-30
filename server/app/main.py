@@ -17,6 +17,7 @@ Dev pages: GET / (legacy mini-dashboard), GET /demo (instrumented demo site)
 """
 
 import asyncio
+import base64
 import hmac
 import logging
 import os
@@ -41,8 +42,22 @@ from fastapi.staticfiles import StaticFiles
 from . import jobs, storage
 from .config import MAX_TWINS_PER_RUN, REPO_ROOT
 from .audience import compose_audience, infer_audience, provenance_note
-from .fetching import FetchFailed, UnsafeURL, fetch_page
-from .modality import UnsupportedAsset, preview_page, visible_text_length
+from .boardroom import (
+    cast_diversity,
+    cast_provenance,
+    cast_room,
+    room_call_estimate,
+    stream_deliberation,
+)
+from .fetching import FetchFailed, UnsafeURL, fetch_url
+from .findings import build_findings
+from .modality import (
+    UnsupportedAsset,
+    is_player_url,
+    pages_from_pdf,
+    preview_page,
+    visible_text_length,
+)
 from .oai import Refusal
 from .persona import seed_persona
 from .cognition import full_cognitive_profile, iter_cognitive_profile
@@ -69,6 +84,7 @@ from .schemas import (
     PageFetchRequest,
     ObjectionRequest,
     PriceSensitivityRequest,
+    RoomRequest,
     SequenceRequest,
     ViralityRequest,
 )
@@ -509,7 +525,9 @@ def template_path(path: str) -> str:
 #: specificity so a request carrying several fields yields the most
 #: representative one. Read off the request rather than switched on per
 #: endpoint, so a study added later inherits audience inference for free.
-_STIMULUS_FIELDS = ("scenario", "content", "pitch", "brief", "seed_variant", "product")
+_STIMULUS_FIELDS = (
+    "scenario", "content", "pitch", "brief", "seed_variant", "product", "motion"
+)
 
 
 def stimulus_of(request) -> str:
@@ -546,6 +564,14 @@ def estimate_twin_calls(personas: int, request) -> int:
     optimizer. Read off the request rather than hardcoded per endpoint so a new
     study cannot quietly skip the ceiling by not being listed here.
     """
+    # The white room is the one study that does NOT fan out over the persona
+    # window: it seats a fixed cast, every member speaks once per round, and the
+    # whole schedule is replicated. `personas` is not its multiplier, so the
+    # generic path below would score a 972-call room as one call per persona and
+    # wave it past the ceiling. The cost model lives next to the engine that
+    # spends it — see boardroom.room_call_estimate.
+    if isinstance(request, RoomRequest):
+        return room_call_estimate(request)
     calls = personas * getattr(request, "twins_per_persona", 1)
     for attr in ("variants", "prices", "steps", "messages"):
         fan = getattr(request, attr, None)
@@ -557,17 +583,33 @@ def estimate_twin_calls(personas: int, request) -> int:
     return calls
 
 
-def _enforce_budget(personas: list[PersonaSeed], request) -> None:
+def _enforce_budget(
+    personas: list[PersonaSeed], request, how_to_reduce: Optional[str] = None
+) -> None:
+    """413 when a request would dispatch more model calls than the ceiling.
+
+    `how_to_reduce` replaces the persona-window advice for studies that do not
+    have one. The white room's cost comes from seats, rounds and replicates, and
+    telling its caller to "select fewer sessions (0 personas are currently in
+    scope)" would send them to a control that has no effect on the number in the
+    same sentence.
+    """
     calls = estimate_twin_calls(len(personas), request)
     if calls > MAX_TWINS_PER_RUN:
         raise HTTPException(
             status_code=413,
             detail=(
                 f"This request would dispatch {calls:,} twin calls, over the "
-                f"{MAX_TWINS_PER_RUN:,} per-run ceiling. Reduce twins_per_persona, "
-                f"narrow the comparison, or select fewer sessions "
-                f"({len(personas)} personas are currently in scope). "
-                "Raise COGNISWARM_MAX_TWINS_PER_RUN to change the ceiling."
+                f"{MAX_TWINS_PER_RUN:,} per-run ceiling. "
+                + (
+                    how_to_reduce
+                    or (
+                        "Reduce twins_per_persona, narrow the comparison, or "
+                        "select fewer sessions "
+                        f"({len(personas)} personas are currently in scope). "
+                    )
+                )
+                + "Raise COGNISWARM_MAX_TWINS_PER_RUN to change the ceiling."
             ),
         )
 
@@ -711,18 +753,44 @@ async def swarm_run(caller: CallerDep, request: SwarmRunRequest) -> dict:
 
 
 def _sse(generator, request_model, kind: str, caller: Caller) -> StreamingResponse:
-    """Wrap a simulation's async event generator as an SSE response, persisting
-    the run when the terminal 'done' event passes through.
+    """Wrap a simulation's async event generator as an SSE response: run the
+    findings synthesis over the terminal result, persist, and emit.
 
     `caller` is required rather than optional: every streaming study persists a
     run through here, so a default would silently write unowned rows that no
     scoped tenant can ever read back.
+
+    THE FINDINGS PASS LIVES HERE, once, rather than inside each of the nine
+    study modules. Every stream endpoint already funnels its terminal event
+    through this function, so this is the single seam where "the study
+    finished" becomes "the study has been interpreted" — and putting it in one
+    place is what makes it impossible for a study added later to quietly ship
+    without the synthesis, the FDR control, or the citation validation.
+
+    It runs BEFORE persistence so the stored run carries its findings and the
+    history view does not have to recompute them, and it is streamed as its own
+    `findings` stage first so the UI can show that the last (and slowest) step
+    is analysis rather than a hang.
     """
 
     async def gen():
         try:
             async for evt in generator:
                 if evt.get("type") == "done":
+                    yield f"data: {json.dumps({'type': 'stage', 'stage': 'findings', 'detail': 'harvesting evidence, controlling for multiplicity, synthesising'})}\n\n"
+                    # Never fatal. A completed study is worth returning even if
+                    # the interpretation on top of it failed — `build_findings`
+                    # already returns its own error field rather than raising,
+                    # and this guard covers the unexpected remainder.
+                    try:
+                        evt["result"]["findings"] = await build_findings(
+                            kind,
+                            evt["result"],
+                            question=getattr(request_model, "research_question", ""),
+                            stimulus=stimulus_of(request_model),
+                        )
+                    except Exception:  # noqa: BLE001 - never lose a finished run
+                        log.exception("findings synthesis failed for kind=%s", kind)
                     run_id = storage.insert_swarm_run(
                         request_model.model_dump(),
                         evt["result"],
@@ -1050,30 +1118,158 @@ async def audience_compose(caller: CallerDep, request: AudienceComposeRequest) -
     }
 
 
+# ------------------------------------------------------------------ white room
+
+
+def _room_guard(request: RoomRequest) -> None:
+    """What a room needs before it is worth paying for.
+
+    Both checks are 400s at the door rather than errors inside the stream. An
+    SSE generator can only report a problem as an `error` frame after the
+    headers are sent, which the client cannot distinguish from a run that failed
+    halfway — and these are both properties of the request, knowable before a
+    single call is dispatched.
+    """
+    if request.members:
+        if len(request.members) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"A room needs at least three characters; {len(request.members)} "
+                    "were supplied. With fewer there is no deliberation to measure — "
+                    "one member has nobody to hear and two is a negotiation."
+                ),
+            )
+        names = [m.name.strip().casefold() for m in request.members]
+        if len(set(names)) != len(names):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Member names must be unique. Names are how statements are "
+                    "attributed at the table and what `conceded_to` refers to, so "
+                    "two members with one name make every concession ambiguous."
+                ),
+            )
+
+
+@app.post("/v1/room/cast")
+async def room_cast(caller: CallerDep, request: RoomRequest) -> dict:
+    """Instantiate the characters, and return them for approval before a run.
+
+    Deliberately a separate call from `/v1/room/stream`, for the reason
+    `/v1/content/fetch` is separate from running a study: the researcher sees
+    what was actually built — the voices, the stakes, the declared dispositions
+    — BEFORE spending the fan-out on it. A room that turned out to be five
+    variations on one person is worse than a refusal, because it produces
+    numbers.
+
+    Takes the full `RoomRequest` so the dashboard can post one body to both
+    endpoints; only `motion`, `cast_brief` and `seats` are read here. The
+    returned members go back in `request.members` to run the cast that was
+    approved rather than a fresh one cast per run.
+
+    Two labels ride along and neither is decoration. `provenance` says whether
+    these characters came from the researcher's brief or were inferred from the
+    motion, because nobody in this room is observed and the result must not be
+    read as though somebody were. `diversity` says whether the cast can disagree
+    at all — surfaced, never refused, since a room that cannot disagree is a
+    legitimate thing to study as long as nobody mistakes its consensus for one.
+    """
+    try:
+        members = await cast_room(request.motion, request.cast_brief, request.seats)
+    except (openai.OpenAIError, Refusal, RuntimeError, ValueError) as exc:
+        raise _llm_errors(exc) from exc
+    return {
+        "members": [m.model_dump() for m in members],
+        "provenance": cast_provenance(request.cast_brief, members),
+        "diversity": cast_diversity(members),
+        # What running this cast would cost, and against what — so the approval
+        # step is also the budget step, before the 413 can surprise anyone.
+        "estimated_calls": room_call_estimate(request),
+        "call_ceiling": MAX_TWINS_PER_RUN,
+    }
+
+
+@app.post("/v1/room/stream")
+async def room_stream(caller: CallerDep, request: RoomRequest) -> StreamingResponse:
+    """Put the motion to the room and stream the table live.
+
+    No `_load_personas` call, and that absence is the design rather than an
+    omission: a room is a cast of characters, not a sample of an audience. There
+    is no persona window to draw from, nothing here is derived from telemetry,
+    and blending the two would produce an aggregate over people who were
+    measured and people who were invented with no way to tell which half moved
+    it — the exact confusion `audience.provenance_note` exists to prevent.
+
+    The private half of every turn is withheld from the live stream and appears
+    only in the terminal result; `boardroom.stream_deliberation` documents why.
+    """
+    _room_guard(request)
+    _enforce_budget(
+        [],
+        request,
+        how_to_reduce=(
+            f"A room costs seats × (1 + rounds) × (replicates + placebo_replicates) "
+            f"= {len(request.members) or request.seats} × (1 + {request.rounds}) × "
+            f"({request.replicates} + {request.placebo_replicates}). Seat fewer "
+            "members, run fewer rounds, or run fewer replicates — but keep at "
+            "least one placebo replicate, because without it a convergence "
+            "cannot be told from the model being agreeable. "
+        ),
+    )
+    return _sse(stream_deliberation(request), request, "room", caller)
+
+
 # ------------------------------------------------------------------ page fetch
 
 
 @app.post("/v1/content/fetch")
 async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
-    """Turn a pasted URL into markup the `page` modality can study.
+    """Turn a pasted URL into whatever kind of study asset it actually is.
 
-    Deliberately a SEPARATE step from running the study rather than a `url`
-    field on the asset. Three reasons, in order of how much they matter:
+    This used to accept only landing pages: anything whose content type was not
+    HTML was refused with "upload the file instead", so a link to an ad image,
+    a hosted MP4, a podcast episode or a PDF deck — most of the things a
+    researcher has a URL for — could not be studied from a link at all. The
+    modality layer downstream has always handled all five; only the front door
+    was narrow.
+
+    ROUTING IS BY CONTENT TYPE, NEVER BY EXTENSION. `…/promo.mp4` served as
+    `text/html` is a player page and gets studied as one; `…/x?id=9` served as
+    `image/png` is an image. The bytes are what the study consumes, so the
+    bytes' declared type is what decides.
+
+    Still a SEPARATE step from running the study rather than a `url` field on
+    the asset. Three reasons, in order of how much they matter:
 
     1. The researcher sees what was actually retrieved — the final URL after
-       redirects and how many sections were found — BEFORE spending twin calls
-       on it. A study that silently ran against a cookie wall is worse than one
-       that refused, because it produces numbers.
+       redirects, the kind, the sections or pages found — BEFORE spending twin
+       calls on it. A study that silently ran against a cookie wall is worse
+       than one that refused, because it produces numbers.
     2. `ContentAsset` keeps its no-URL guarantee, so no other endpoint can grow
        a server-side fetch without coming through here.
     3. The failure modes are completely different. "That host is not reachable"
        and "the model refused" want different messages, and folding them into
        one call means reporting a network problem as an analysis problem.
-
-    Returns the HTML for the client to submit back as a normal `page` asset.
     """
+    # Player pages are caught BEFORE the fetch, because the fetch would succeed.
+    # youtube.com/watch answers 200 with an HTML shell, and its extractable
+    # prose is the video title and the comment policy — a page study of that
+    # returns a complete appraisal tensor about something nobody watched.
+    player = is_player_url(request.url)
+    if player:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{player} serves a player page, not the media — fetching it "
+                "would return the page furniture around the video rather than "
+                "the video. Download the file and upload it, or paste a direct "
+                "link to the media file itself."
+            ),
+        )
+
     try:
-        fetched = await fetch_page(request.url)
+        fetched = await fetch_url(request.url)
     except UnsafeURL as exc:
         # 400, not 403: the caller is authenticated and permitted, the URL is
         # the thing that is wrong, and they can fix it by pasting another one.
@@ -1082,6 +1278,88 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
         # 502: we are reporting someone else's failure, not our own.
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    envelope = {
+        "kind": fetched.kind,
+        "final_url": fetched.final_url,
+        "hops": list(fetched.hops),
+        "bytes": fetched.bytes_read,
+        "content_type": fetched.content_type,
+    }
+
+    # ── image: straight to the vision path ──────────────────────────────
+    if fetched.kind == "image":
+        return {
+            **envelope,
+            "asset": {
+                "kind": "image",
+                "image_b64": base64.b64encode(fetched.content).decode("ascii"),
+                "media_type": fetched.content_type,
+            },
+            "note": (
+                "The image will be read for its visual hierarchy — what the eye "
+                "lands on, in order. Time-dependent statistics are withheld: the "
+                "regions of a static image are present simultaneously."
+            ),
+        }
+
+    # ── video / audio: relayed to the BROWSER, decoded there ────────────
+    #
+    # The server never decodes this. Running a media decoder over bytes an
+    # arbitrary URL supplied is a large and historically hostile attack
+    # surface, and the browser already has a decoder plus a sandbox around it.
+    # So the fetch proves the URL is safe and reachable, and the actual bytes
+    # go to the client through the relay below, which re-validates. The
+    # boundary the upload path already respected now holds for links too.
+    if fetched.kind in {"video", "audio"}:
+        return {
+            **envelope,
+            "asset": {"kind": fetched.kind},
+            "media_relay": "/content/media",
+            "note": (
+                f"{fetched.bytes_read / 1_000_000:.1f} MB of {fetched.content_type}. "
+                + (
+                    "Keyframes are extracted in your browser — the file is never "
+                    "decoded on the server."
+                    if fetched.kind == "video"
+                    else "Paste a transcript below; timings turn it into a timeline."
+                )
+            ),
+        }
+
+    # ── PDF: pages are beats, already segmented by the document ─────────
+    if fetched.kind == "document":
+        try:
+            pages, total = pages_from_pdf(fetched.content)
+        except UnsupportedAsset as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        usable = [p for p in pages if len(p) >= 40]
+        if len(usable) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"that PDF has {total} page(s) but fewer than two carry "
+                    "readable text — it is probably scanned images with no text "
+                    "layer. Export the slides as images and study them that way."
+                ),
+            )
+        return {
+            **envelope,
+            "asset": {"kind": "document", "pages": usable},
+            "pages": usable,
+            "page_count": total,
+            "truncated": total > len(pages),
+            "note": (
+                f"{len(usable)} readable page(s) of {total}"
+                + (
+                    f" — only the first {len(pages)} were read, so this studies "
+                    "the opening of the document rather than all of it."
+                    if total > len(pages)
+                    else ""
+                )
+            ),
+        }
+
+    # ── page: unchanged, and still the subtlest of the five ─────────────
     try:
         sections = preview_page(ContentAsset.model_construct(kind="page", text=fetched.html))
     except UnsupportedAsset as exc:
@@ -1121,12 +1399,72 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
     # the study will actually consume, and the researcher can edit it.
     body = "\n".join(f"<p>{html_escape(s)}</p>" for s in sections)
     return {
+        **envelope,
         "text": body,
-        "final_url": fetched.final_url,
-        "hops": list(fetched.hops),
-        "bytes": fetched.bytes_read,
+        "asset": {"kind": "page", "text": body},
         "sections": sections,
+        "note": (
+            f"{len(sections)} sections in DOM order — the order a scroller meets "
+            "them. Hidden elements and unopened menus are excluded."
+        ),
     }
+
+
+@app.post("/v1/content/media")
+async def content_media(caller: CallerDep, request: PageFetchRequest) -> StreamingResponse:
+    """Relay video/audio bytes to the browser, which decodes them.
+
+    THE PROBLEM THIS SOLVES. Keyframe extraction already happens client-side —
+    deliberately, because decoding caller-supplied media server-side means
+    running a decoder on untrusted input and would put ffmpeg in a container
+    that has no native dependencies at all. But a browser cannot fetch a video
+    from another origin: cross-origin reads are blocked, and no amount of
+    wanting changes that. So a hosted MP4 could be studied by uploading the
+    file and not by pasting its link, which is the wrong way round for the case
+    where the researcher does not have the file.
+
+    This closes it without moving the decoder. The bytes pass THROUGH the
+    server, which validates the URL exactly as every other fetch does and never
+    interprets what it is carrying, and the browser at the far end does the
+    decoding it was always going to do.
+
+    NOT AN OPEN PROXY, in the four ways that matter: it is behind the same API
+    key as everything else, it re-runs the full SSRF validation rather than
+    trusting that `/content/fetch` already did (the two calls are separate
+    requests and a name can be re-pointed between them), it accepts only
+    video and audio content types, and it caps bytes. The response is forced to
+    `application/octet-stream` with a nosniff header so nothing relayed through
+    here can be interpreted as script by the browser that receives it.
+    """
+    if is_player_url(request.url):
+        raise HTTPException(
+            status_code=422, detail="That is a player page, not a media file."
+        )
+    try:
+        fetched = await fetch_url(request.url, kinds=("video", "audio"))
+    except UnsafeURL as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FetchFailed as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    def body():
+        yield fetched.content
+
+    return StreamingResponse(
+        body(),
+        # Deliberately NOT the upstream content type. The browser asked for
+        # bytes to hand to a decoder, and labelling a relayed payload with a
+        # type a browser will act on is how a relay becomes a delivery
+        # mechanism for someone else's content on our origin.
+        media_type="application/octet-stream",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment",
+            "X-Upstream-Content-Type": fetched.content_type,
+            "X-Upstream-Final-Url": fetched.final_url,
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ------------------------------------------------------------------ jobs (Phase 3)

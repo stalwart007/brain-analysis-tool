@@ -172,6 +172,80 @@ function Interval({ ci }: { ci?: [number, number] | null }) {
   );
 }
 
+/**
+ * The reliability diagram: where along the range the predictor drifts.
+ *
+ * A slope is one number for the whole range, so it cannot distinguish "wrong
+ * everywhere by the same amount" from "fine in the middle, collapses at the
+ * top" — and those call for opposite responses. The isotonic (PAV) fit is the
+ * shape of the error as a function of what was predicted, which is the question
+ * a calibration panel is actually being asked.
+ *
+ * The identity line is the reference: on it, predicted equals observed. The
+ * curve sagging BELOW means over-prediction in that band, above means under.
+ * Deviation is filled against the diagonal rather than left for the eye to
+ * measure, because the gap IS the miscalibration term reported beside it.
+ */
+function ReliabilityDiagram({ knots }: { knots: [number, number][] }) {
+  if (knots.length < 2) return null;
+  const S = 100;
+  const x = (v: number) => v * S;
+  const y = (v: number) => S - v * S;
+  const pts = knots.map(([p, a]) => `${x(p)},${y(a)}`).join(" ");
+  // Closing the isotonic path back along the diagonal makes the enclosed area
+  // the total miscalibration — the fill is the quantity, not a decoration.
+  const area =
+    `${x(knots[0][0])},${y(knots[0][0])} ` +
+    knots.map(([p, a]) => `${x(p)},${y(a)}`).join(" ") +
+    ` ${x(knots[knots.length - 1][0])},${y(knots[knots.length - 1][0])}`;
+
+  return (
+    <svg viewBox={`-2 -2 ${S + 4} ${S + 4}`} className="h-28 w-28 shrink-0" aria-hidden>
+      <rect x={0} y={0} width={S} height={S} fill="rgb(var(--region-rgb) / 0.04)" />
+      <line x1={0} y1={S} x2={S} y2={0} stroke="rgba(223,217,217,0.28)" strokeWidth={0.8} strokeDasharray="3 2" />
+      <polygon points={area} fill="rgb(var(--region-rgb) / 0.18)" />
+      <polyline points={pts} fill="none" stroke="rgb(var(--region-rgb))" strokeWidth={1.6} />
+      {knots.map(([p, a], i) => (
+        <circle key={i} cx={x(p)} cy={y(a)} r={1.6} fill="rgb(var(--region-rgb))" />
+      ))}
+    </svg>
+  );
+}
+
+/**
+ * CORP decomposition as one bar.
+ *
+ * Brier = miscalibration − discrimination + uncertainty, and the two terms
+ * answer different questions: MCB is how wrong the predictions are, DSC is how
+ * much signal they carry at all. A predictor can be perfectly calibrated and
+ * still worthless (predict the base rate every time: MCB ≈ 0, DSC ≈ 0), which
+ * is the failure a single score hides and the reason both are drawn.
+ */
+function CorpBar({ d }: { d: { miscalibration: number; discrimination: number; uncertainty: number } }) {
+  const total = Math.max(d.miscalibration + d.discrimination, 1e-9);
+  const parts = [
+    { k: "MCB", v: d.miscalibration, c: "var(--color-critical)", t: "miscalibration — how far off the predictions are" },
+    { k: "DSC", v: d.discrimination, c: "var(--color-good)", t: "discrimination — how much the predictions separate outcomes" },
+  ];
+  return (
+    <div className="mt-1">
+      <div className="flex h-1.5 w-full overflow-hidden">
+        {parts.map((p) => (
+          <span
+            key={p.k}
+            title={p.t}
+            style={{ width: `${(p.v / total) * 100}%`, background: p.c }}
+          />
+        ))}
+      </div>
+      <div className="mt-0.5 font-mono text-[9px] text-muted">
+        MCB {d.miscalibration.toFixed(3)} · DSC {d.discrimination.toFixed(3)} · UNC{" "}
+        {d.uncertainty.toFixed(3)}
+      </div>
+    </div>
+  );
+}
+
 function MetricColumn({ label, m }: { label: string; m: MetricCalibration | null }) {
   if (!m) {
     return (
@@ -191,24 +265,56 @@ function MetricColumn({ label, m }: { label: string; m: MetricCalibration | null
         {m.mae.toFixed(3)}
         <span className="ml-1 text-xs font-normal text-muted">MAE</span>
       </div>
-      <div className="mt-1 space-y-0.5 font-mono text-[10px] leading-relaxed text-ink-2">
-        <div>
-          mae<Interval ci={m.mae_ci} />
+      <div className="mt-1 flex items-start gap-3">
+        <div className="min-w-0 flex-1 space-y-0.5 font-mono text-[10px] leading-relaxed text-ink-2">
+          <div>
+            mae<Interval ci={m.mae_ci} />
+          </div>
+          <div>
+            bias {m.bias > 0 ? "+" : ""}
+            {m.bias.toFixed(3)}
+            <Interval ci={m.bias_ci} />
+          </div>
+          <div>
+            {/* The pair the docstring says is load-bearing: slope near 1 means
+                the predictor tracks reality, slope near 0 means it is compressed
+                toward its own mean regardless of how good the MAE looks. */}
+            slope {m.slope != null ? m.slope.toFixed(2) : "n/a"}
+            <Interval ci={m.slope_ci} />
+          </div>
+          {/* The gate, shown because the verdict above depends on it. The point
+              estimate needs an assumption about which axis is noisier; this
+              range holds without one, so it is the honest width. */}
+          {m.slope_bracket_ci && (
+            <div
+              className="text-muted"
+              title="Slopes consistent with the data under any assumption about which axis carries more measurement error. The verdict is asserted only when this whole range sits on one side of 1."
+            >
+              identified [{m.slope_bracket_ci[0].toFixed(2)},{" "}
+              {m.slope_bracket_ci[1].toFixed(2)}]
+              {m.slope_bracket_ci[0] <= 1 && m.slope_bracket_ci[1] >= 1 && (
+                <span className="text-good"> · spans 1</span>
+              )}
+            </div>
+          )}
+          <div>
+            r {m.r != null ? m.r.toFixed(2) : "n/a"}
+            <Interval ci={m.r_ci} />
+          </div>
+          <div>
+            {m.rmse != null && `rmse ${m.rmse.toFixed(3)}`}
+            {m.slope_r2 != null && ` · R² ${m.slope_r2.toFixed(2)}`}
+          </div>
+          {m.brier_decomposition && <CorpBar d={m.brier_decomposition} />}
         </div>
-        <div>
-          bias {m.bias > 0 ? "+" : ""}
-          {m.bias.toFixed(3)}
-          <Interval ci={m.bias_ci} />
-        </div>
-        <div>
-          {/* The pair the docstring says is load-bearing: slope near 1 means
-              the predictor tracks reality, slope near 0 means it is compressed
-              toward its own mean regardless of how good the MAE looks. */}
-          slope {m.slope != null ? m.slope.toFixed(2) : "n/a"}
-          {m.slope_r2 != null && ` (R² ${m.slope_r2.toFixed(2)})`}
-          {m.r != null && ` · r ${m.r.toFixed(2)}`}
-          {m.rmse != null && ` · rmse ${m.rmse.toFixed(3)}`}
-        </div>
+        {m.reliability_curve && m.reliability_curve.length > 1 && (
+          <div>
+            <ReliabilityDiagram knots={m.reliability_curve} />
+            <p className="mt-0.5 w-28 font-mono text-[8px] leading-tight text-muted">
+              observed vs predicted · dashed = perfect
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );

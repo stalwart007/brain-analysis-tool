@@ -64,6 +64,15 @@ export interface Sector {
   anatomy: string;
   /** why this route lives in this region */
   rationale: string;
+  /**
+   * What the sector is FOR, in one line of plain language.
+   *
+   * `anatomy` and `rationale` explain why the route lives in this lobe — they
+   * are answers to a question you only ask once you already know what the page
+   * does. "White Room" and "Studies" mean nothing cold, so every destination
+   * also states its job in the user's terms. The atlas leads with this.
+   */
+  purpose: string;
   station: Station;
 }
 
@@ -76,6 +85,7 @@ export const SECTORS: Sector[] = [
     region: "prefrontal",
     anatomy: "whole cortex",
     rationale: "the intact brain — telemetry in, simulated minds out",
+    purpose: "Profile real telemetry into segments, then fan one stimulus across the swarm",
     // a fixed, art-directed 3/4 view: the brain sits right of the masthead
     // and rotates in place rather than the camera orbiting around it
     station: { cam: [3.4, 0.6, 2.6], look: [-1.1, -0.5, 0], inside: 0 },
@@ -87,6 +97,7 @@ export const SECTORS: Sector[] = [
     region: "prefrontal",
     anatomy: "dorsolateral prefrontal cortex",
     rationale: "where choices between alternatives are weighed",
+    purpose: "A/B up to eight variants, ranked with posteriors and a stopping rule",
     station: { cam: [0.05, 0.12, 0.15], look: [0.1, 0.16, 1.15], inside: 1 },
   },
   {
@@ -96,6 +107,7 @@ export const SECTORS: Sector[] = [
     region: "orbitofrontal",
     anatomy: "orbitofrontal cortex",
     rationale: "subjective value — what a thing is worth to you",
+    purpose: "Price curves, objection themes and viral spread for a single asset",
     station: { cam: [0, 0.05, 0.25], look: [0.18, -0.42, 0.95], inside: 1 },
   },
   {
@@ -105,6 +117,7 @@ export const SECTORS: Sector[] = [
     region: "brainstem",
     anatomy: "brainstem",
     rationale: "autonomic processes that run without attention",
+    purpose: "Queue large unattended swarms through the Batch API at half the cost",
     station: { cam: [0.15, 0.15, 0.35], look: [0, -0.95, -0.25], inside: 1 },
   },
   {
@@ -114,6 +127,7 @@ export const SECTORS: Sector[] = [
     region: "hippocampus",
     anatomy: "hippocampal formation",
     rationale: "consolidation — the record of who consented, and when",
+    purpose: "The consented, compensated respondent pool — invite, disclose, revoke",
     station: { cam: [-0.05, 0.4, 0.55], look: [0.42, -0.22, -0.05], inside: 1 },
   },
   {
@@ -126,6 +140,7 @@ export const SECTORS: Sector[] = [
     region: "prefrontal",
     anatomy: "rostral prefrontal cortex",
     rationale: "generating candidate futures and selecting between them",
+    purpose: "Evolve stronger copy over generations, and order a sequence optimally",
     station: { cam: [0.02, 0.2, 0.1], look: [0.05, 0.1, 1.2], inside: 1 },
   },
   {
@@ -135,7 +150,26 @@ export const SECTORS: Sector[] = [
     region: "occipital",
     anatomy: "occipito-temporal stream",
     rationale: "where seen and heard content becomes meaning",
+    purpose: "Score an image, video or audio asset through the swarm's minds",
     station: { cam: [0, 0.1, 0.1], look: [0.05, -0.05, -1.2], inside: 1 },
+  },
+  {
+    // The TPJ is the canonical theory-of-mind region: it represents what
+    // ANOTHER mind believes as separate from what you believe. A table of
+    // characters reading each other — and stating one position while holding
+    // a different one — is that computation, which is why the deliberation
+    // study lives here rather than in the prefrontal decision sectors.
+    href: "/room",
+    label: "White Room",
+    code: "ROOM",
+    region: "temporal",
+    anatomy: "temporoparietal junction",
+    rationale:
+      "theory of mind — representing what someone else believes, which is what a room of people reading each other is doing",
+    purpose: "Seat characters at a table and make them argue a motion out loud",
+    // laterally out through the right temporal lobe, at the posterior end
+    // where the temporal and parietal cortices meet
+    station: { cam: [0.12, 0.18, 0.14], look: [1.22, -0.06, -0.34], inside: 1 },
   },
 ];
 

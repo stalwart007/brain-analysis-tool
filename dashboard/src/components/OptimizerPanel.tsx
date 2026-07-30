@@ -19,6 +19,7 @@ import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import SimStage from "./sim/SimStage";
 import { keyboardOnlyProps, useChartCursor } from "./charts/cursor";
 
@@ -32,6 +33,11 @@ interface PopVariant {
   trials: number;
   acts: number;
   mean_intent: number;
+  /** Empirical-Bayes shrunk mean — the RANKING quantity. A two-trial arm's raw
+   *  mean is mostly noise, so ordering on it puts luck at the top: under a true
+   *  null the raw ordering crowned a challenger 98.7% of the time. Absent on
+   *  runs recorded before shrinkage existed, hence optional. */
+  shrunk_intent?: number;
   act_rate: number;
 }
 
@@ -43,6 +49,7 @@ interface GenStat {
 }
 
 interface OptimizerResult {
+  findings?: FindingsBlock | null;
   twin_count: number;
   failed_evaluations: number;
   generations_planned: number;
@@ -53,12 +60,27 @@ interface OptimizerResult {
   best_text: string;
   convergence: string;
   verdict: string;
+  /** The in-sample margin: the champion's lead measured on the very sample that
+   *  crowned it. Kept for continuity and shown only as the thing the honest
+   *  number is corrected AGAINST — never on its own. */
   intent_lift_vs_seed: number | null;
   intent_lift_vs_seed_pct: number | null;
+  /** The reportable lift: selection re-run inside each split, evaluated on the
+   *  held-out half. Under a true null the naive number reads +0.087 and is
+   *  positive in 99.3% of runs; this one reads −0.0003. */
+  selection_adjusted_lift?: number | null;
+  selection_adjusted_lift_ci?: [number, number] | null;
+  selection_adjusted_lift_pct?: number | null;
+  selection_bias?: number | null;
+  p_best_beats_seed?: number | null;
   lineage_edges: [string, string][];
   method: string;
   disclaimer: string;
 }
+
+/** Rank on the shrunk mean where the run provides one, falling back to the raw
+ *  mean for runs recorded before shrinkage existed. */
+const rankValue = (v: PopVariant) => v.shrunk_intent ?? v.mean_intent;
 
 /* Convergence is the honest part: a search's winner is upward-biased by
    construction, so "improved" is only claimed when the intervals separate. */
@@ -203,11 +225,26 @@ function Lineage({ result }: { result: OptimizerResult }) {
     </svg>
 
     {/* The variant text itself. A dot on a tree cannot tell you what the copy
-        SAYS, which is the one thing a copy optimiser is asked. */}
-    <div className="mt-1.5 min-h-14 rounded-lg border border-hairline/60 bg-black/20 px-2.5 py-1.5">
+        SAYS, which is the one thing a copy optimiser is asked.
+
+        THE HEIGHT IS RESERVED, NOT GROWN, and this was the worst offender in
+        the codebase: `min-h-14` reserved 56px for a block whose focused state
+        renders a whole copy variant — routinely 3-5 wrapped lines at 11px —
+        plus an optional rationale. Every hover over the lineage tree therefore
+        shoved the convergence verdict, the champion, the population list and
+        everything below it down the page, and snapped it all back the moment
+        the pointer left. The variant text is clamped to three lines for the
+        same reason: an unbounded block of prose inside a fixed strip is a row
+        whose height is a function of the data. Three rather than two because
+        reading the copy is the point of this panel; the full text is always
+        available in the population list below. */}
+    <div className="mt-1.5 min-h-[6.25rem] rounded-lg border border-hairline/60 bg-black/20 px-2.5 py-1.5">
       {active ? (
         <>
-          <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[9px] text-muted">
+          {/* tabular figures across the whole header: intent, trials and act
+              rate all change as the cursor moves between nodes, and
+              proportional digits shift every clause that follows them. */}
+          <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[9px] tabular-nums text-muted">
             <span className="text-ink-2">gen {active.generation}</span>
             <span>· {active.operation}</span>
             <span>
@@ -225,10 +262,15 @@ function Lineage({ result }: { result: OptimizerResult }) {
               </button>
             )}
           </div>
-          <p className="mt-1 text-[11px] leading-snug text-ink-2">{active.text}</p>
-          {active.rationale && (
-            <p className="mt-0.5 text-[10px] leading-snug text-muted">{active.rationale}</p>
-          )}
+          <p className="mt-1 line-clamp-3 text-[11px] leading-snug text-ink-2">{active.text}</p>
+          {/* Unconditional. An OPTIONAL row is a row whose presence moves the
+              page: this line existed for mutated variants and not for the seed,
+              so crossing between two nodes jumped everything below it by its
+              own height. Saying the seed had no rationale is also the more
+              honest reading than silently omitting the row. */}
+          <p className="mt-0.5 line-clamp-1 text-[10px] leading-snug text-muted">
+            {active.rationale || "no rationale recorded — this is the seed variant"}
+          </p>
         </>
       ) : (
         <p className="font-mono text-[10px] text-muted">
@@ -247,6 +289,7 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
   const [gens, setGens] = useState(2);
   const [twins, setTwins] = useState(2);
   const [load, setLoad] = useState<CognitiveLoad>("low");
+  const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<OptimizerResult | null>(null);
@@ -271,7 +314,7 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
           population_size: pop,
           generations: gens,
           twins_per_persona: twins,
-          cognitive_load: load,
+          cognitive_load: load, research_question: question,
         },
         (evt) => {
           // The server sends `index`, not `generation` (optimizer.py emits
@@ -363,6 +406,13 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
         className="mt-2 min-h-20 w-full resize-y rounded-xl border border-hairline bg-surface-2 p-3.5 text-sm outline-none placeholder:text-muted focus:border-accent/60"
       />
 
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. did the optimiser find a real win, or fit noise?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted">
         <label className="flex items-center gap-2">
           Population
@@ -402,13 +452,35 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
 
       {result && (
         <div className="mt-5 space-y-4">
+        <FindingsPanel findings={result.findings} />
           <div className={`border p-3 ${VERDICT_TONE[result.convergence] ?? VERDICT_TONE.no_baseline}`}>
             <div className="hud-label">Convergence · {result.convergence.replace(/_/g, " ")}</div>
             <p className="verdict mt-1">{result.verdict}</p>
-            {result.intent_lift_vs_seed_pct != null && (
-              <p className="mt-1 font-mono text-[10px] opacity-80">
-                {result.intent_lift_vs_seed_pct > 0 ? "+" : ""}
-                {result.intent_lift_vs_seed_pct.toFixed(1)}% mean intent vs seed
+            {/* The lift is shown ONLY when the run supports one. A search's
+                winner is upward-biased by construction, so the in-sample margin
+                is positive in ~99% of runs even when every variant is identical
+                — quoting it under "not supported" is quoting the bias. */}
+            {result.convergence !== "not_supported" &&
+              result.selection_adjusted_lift != null && (
+                <p className="mt-1 font-mono text-[10px] opacity-80">
+                  {result.selection_adjusted_lift > 0 ? "+" : ""}
+                  {result.selection_adjusted_lift.toFixed(3)} mean intent vs seed
+                  {result.selection_adjusted_lift_ci && (
+                    <> · 95% CI [{result.selection_adjusted_lift_ci[0].toFixed(3)},{" "}
+                    {result.selection_adjusted_lift_ci[1].toFixed(3)}]</>
+                  )}
+                  {result.p_best_beats_seed != null && (
+                    <> · P(beats seed) {result.p_best_beats_seed.toFixed(2)}</>
+                  )}
+                </p>
+              )}
+            {/* The correction itself, as a receipt: how much of the apparent
+                win was the search fitting noise. Mirrors SequencePanel. */}
+            {result.selection_bias != null && result.intent_lift_vs_seed != null && (
+              <p className="mt-0.5 font-mono text-[9px] opacity-60">
+                in-sample margin {result.intent_lift_vs_seed > 0 ? "+" : ""}
+                {result.intent_lift_vs_seed.toFixed(3)} · winner&apos;s curse removed{" "}
+                {result.selection_bias.toFixed(3)}
               </p>
             )}
           </div>
@@ -422,23 +494,38 @@ export default function OptimizerPanel({ personaCount }: { personaCount: number 
 
           <div>
             <div className="hud-label mb-2">Population</div>
+            {/* Ordered by the SHRUNK mean, matching the server's ranking. Sorting
+                on the raw mean here re-created the exact bug the server fixed:
+                a two-trial arm that got lucky rode to the top of the list, and
+                the top row is the one anyone reads. The bar is drawn at the
+                shrunk value with a tick at the raw one, so how far a thin arm
+                was pulled toward the population is visible rather than
+                asserted. */}
             <div className="space-y-1.5">
               {result.population
                 .slice()
-                .sort((a, b) => b.mean_intent - a.mean_intent)
+                .sort((a, b) => rankValue(b) - rankValue(a))
                 .map((v) => (
                   <div key={v.id} className="flex items-baseline gap-3 text-xs">
                     <span className="w-10 shrink-0 font-mono text-[10px] text-muted">
                       g{v.generation}
                     </span>
-                    <span className="h-1 w-20 shrink-0 bg-white/[0.06]">
+                    <span className="relative h-1 w-20 shrink-0 bg-white/[0.06]">
                       <span
                         className="block h-1"
                         style={{
-                          width: `${v.mean_intent * 100}%`,
+                          width: `${rankValue(v) * 100}%`,
                           background: v.id === result.best_variant_id ? "#16d016" : "rgb(var(--region-rgb))",
                         }}
                       />
+                      {v.shrunk_intent != null && v.trials > 0 && (
+                        <span
+                          aria-hidden
+                          title={`raw mean ${v.mean_intent.toFixed(2)} over ${v.trials} trials`}
+                          className="absolute top-[-2px] h-2 w-px bg-white/50"
+                          style={{ left: `${Math.min(100, v.mean_intent * 100)}%` }}
+                        />
+                      )}
                     </span>
                     <span className="w-24 shrink-0 font-mono text-[10px] tabular-nums text-muted">
                       {v.trials > 0 ? `${v.mean_intent.toFixed(2)} · n=${v.trials}` : "unevaluated"}

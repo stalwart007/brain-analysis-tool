@@ -50,6 +50,7 @@ import binascii
 import re
 from enum import Enum
 from html import unescape
+from html.parser import HTMLParser
 from typing import Literal, Optional
 
 import openai
@@ -456,6 +457,234 @@ _HIDDEN = re.compile(
 )
 
 
+#: Elements whose closing tag ends a readable block of copy.
+_BLOCK_TAGS = frozenset(
+    {"h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "section", "article",
+     "main", "div", "header", "footer", "blockquote", "figcaption", "td", "dd"}
+)
+#: Never rendered, never read.
+_SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "template", "head"})
+#: Site furniture, by element and by ARIA role.
+_CHROME_TAGS = frozenset({"nav", "menu", "dialog"})
+_CHROME_ROLES = frozenset({"navigation", "menu", "menubar", "dialog", "search", "banner"})
+#: Void elements never get a closing tag; HTMLParser reports them via
+#: `handle_startendtag` only when they are self-closed in the source, so the
+#: stack has to know not to wait for `</img>`.
+_VOID_TAGS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+     "meta", "param", "source", "track", "wbr"}
+)
+
+
+class _BlockReader(HTMLParser):
+    """Extract readable copy blocks from HTML with a real parser.
+
+    WHY THIS REPLACED A REGEX. The previous extractor matched
+    `<(div|section|…)>(.*?)</\\1>` non-greedily, which is wrong on any nested
+    element of the same name: `<div><div>copy</div></div>` closes the OUTER
+    match at the INNER `</div>`, so the block boundaries a modern page produces
+    are essentially arbitrary. Measured against real sites, stripe.com yielded
+    ZERO usable sections out of 11,162 characters of visible prose — the
+    landing-page path simply did not work on one of the most-copied marketing
+    pages on the web, and the failure surfaced as "this page builds its copy in
+    the browser", which was not true and sent people to fix nothing.
+
+    `html.parser` is stdlib, so this costs no dependency and the container
+    keeps its no-native-code property.
+
+    THE RULE for what becomes a block: a block-level element emits its text
+    only if no block-level DESCENDANT already emitted. That is what keeps a
+    `<section>` wrapping five `<p>`s from emitting the same copy a sixth time,
+    while still letting a `<div>` that holds copy directly — which is most of
+    the modern web — emit at all.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.blocks: list[str] = []
+        # (tag, parts, non_link_parts, child_emitted)
+        self._stack: list[tuple[str, list[str], list[str], list[bool]]] = []
+        self._skip_depth = 0
+        self._drop_depth = 0
+        self._anchor_depth = 0
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_hidden(attrs: list[tuple[str, Optional[str]]]) -> bool:
+        """Content present in the markup but never shown.
+
+        Dropping it is an ANALYSIS correctness fix before it is a security one:
+        a closed nav menu, a cookie modal, tab panels behind other tabs and
+        screen-reader-only text are all in the document on arrival, and counting
+        them as beats reports an audience reaction to something nobody looked at.
+        """
+        for key, value in attrs:
+            key = key.lower()
+            value = (value or "").lower()
+            if key == "hidden":
+                return True
+            if key == "aria-hidden" and value == "true":
+                return True
+            if key == "style" and ("display:none" in value.replace(" ", "")
+                                   or "visibility:hidden" in value.replace(" ", "")):
+                return True
+        return False
+
+    @staticmethod
+    def _is_chrome(tag: str, attrs: list[tuple[str, Optional[str]]]) -> bool:
+        if tag in _CHROME_TAGS:
+            return True
+        for key, value in attrs:
+            if key.lower() == "role" and (value or "").lower() in _CHROME_ROLES:
+                return True
+        return False
+
+    # ── parser callbacks ──────────────────────────────────────────────────
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag in _VOID_TAGS:
+            return
+        if self._skip_depth or tag in _SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._drop_depth or self._is_chrome(tag, attrs) or self._is_hidden(attrs):
+            self._drop_depth += 1
+            return
+        if tag == "a":
+            self._anchor_depth += 1
+        if tag in _BLOCK_TAGS:
+            self._stack.append((tag, [], [], [False]))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in _VOID_TAGS:
+            return
+        if self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._drop_depth:
+            self._drop_depth -= 1
+            return
+        if tag == "a":
+            self._anchor_depth = max(0, self._anchor_depth - 1)
+        if tag not in _BLOCK_TAGS:
+            return
+        # Unbalanced markup is the norm, not the exception. Unwind to the
+        # nearest matching frame rather than assuming the document is
+        # well-formed; a stray `</div>` must not silently close a `<section>`.
+        for depth in range(len(self._stack) - 1, -1, -1):
+            if self._stack[depth][0] == tag:
+                frames = self._stack[len(self._stack) : depth - 1 if depth else None]
+                break
+        else:
+            return
+        while len(self._stack) > depth:
+            name, parts, own, child_emitted = self._stack.pop()
+            text = _WS.sub(" ", "".join(parts)).strip()
+            own_text = _WS.sub(" ", "".join(own)).strip()
+            emitted = False
+            if (
+                not child_emitted[0]
+                and _qualifies(name, text, own_text)
+                and text not in self.blocks
+            ):
+                self.blocks.append(text)
+                emitted = True
+            if self._stack:
+                parent = self._stack[-1]
+                parent[1].append(" " + text)
+                parent[2].append(" " + own_text)
+                parent[3][0] = parent[3][0] or emitted or child_emitted[0]
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or self._drop_depth or not self._stack:
+            return
+        frame = self._stack[-1]
+        frame[1].append(data)
+        # Text outside an anchor is the page's own copy; text inside one is a
+        # link label. Keeping them apart is what distinguishes a hero (a
+        # headline that happens to sit beside two buttons) from a menu.
+        if not self._anchor_depth:
+            frame[2].append(data)
+
+    def close_all(self) -> list[str]:
+        """Flush frames left open by unterminated markup."""
+        while self._stack:
+            name, parts, own, child_emitted = self._stack.pop()
+            text = _WS.sub(" ", "".join(parts)).strip()
+            own_text = _WS.sub(" ", "".join(own)).strip()
+            if (
+                not child_emitted[0]
+                and _qualifies(name, text, own_text)
+                and text not in self.blocks
+            ):
+                self.blocks.append(text)
+        return self.blocks
+
+
+_HEADINGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+
+
+def _qualifies(tag: str, text: str, own_text: str) -> bool:
+    """Should this block become a beat?
+
+    HEADINGS GET A LOWER BAR, and they have to. The prose heuristic below
+    exists to tell copy from navigation, and its main instrument is length — a
+    nav item is a short Title Case fragment. But a headline is ALSO short by
+    design, and it is the single most important beat on a landing page:
+    Stripe's "Financial infrastructure to grow your revenue" is six words and
+    was being discarded for it, along with essentially every hero on the web.
+
+    A heading does not need the heuristic, because the markup has already made
+    the claim the heuristic is trying to infer: `<h1>` is not what anyone wraps
+    a menu in. So headings qualify on length alone, and everything else still
+    has to read like prose.
+    """
+    if tag in _HEADINGS:
+        return len(text) >= 12 and len(text.split()) >= 3
+    return len(text) >= 40 and _is_prose_text(text, own_text)
+
+
+def _is_prose_text(text: str, own_text: str) -> bool:
+    """Does this read like something a person wrote to be read?
+
+    Navigation survives tag-stripping as a run of short Title Case fragments
+    with no sentence in it, so that is what this tests.
+
+    A link-DENSITY ratio was tried first and was wrong: at 0.6 it correctly
+    rejected Stripe's secondary nav and then also rejected Stripe's hero,
+    because "Financial infrastructure to grow your revenue" shares a wrapper
+    with "Start now" and "Contact sales". The ratio punishes a block for having
+    calls to action, which every landing page hero has by design. Asking
+    whether real copy exists OUTSIDE the links separates the two cleanly and
+    needs no threshold tuning.
+    """
+    words = text.split()
+    if len(words) < 8:
+        return False
+    # A menu is links and nothing else; a hero is a headline beside buttons.
+    if len(own_text) < 40:
+        return False
+    # A sentence mark is the strongest single signal, but a headline
+    # legitimately has none — so a long block with normal lower-case flow also
+    # qualifies.
+    has_sentence = any(mark in text for mark in (". ", "! ", "? ", ", "))
+    lowercase = sum(1 for w in words if w[:1].islower())
+    return has_sentence or lowercase / len(words) > 0.5
+
+
+def extract_blocks(html: str) -> list[str]:
+    """Readable copy blocks from a page, in DOM order."""
+    reader = _BlockReader()
+    try:
+        reader.feed(html)
+    except Exception:  # noqa: BLE001 — malformed markup must not lose the page
+        pass
+    return reader.close_all()
+
+
 def _beats_from_page(asset: ContentAsset) -> BeatSequence:
     """A landing page read in DOM order — which is the order a scroller meets it.
 
@@ -465,22 +694,7 @@ def _beats_from_page(asset: ContentAsset) -> BeatSequence:
     """
     if not asset.text:
         raise UnsupportedAsset("a page asset needs its HTML or extracted text")
-    # Order matters: unrenderable tags, then hidden content, then site
-    # furniture. Stripping chrome last would leave a nav whose wrapper was
-    # already consumed as a block.
-    html = _CHROME.sub(" ", _HIDDEN.sub(" ", _DROPPED.sub(" ", asset.text)))
-    blocks: list[str] = []
-    for _tag, inner in _TAG_BLOCK.findall(html):
-        # Entities are decoded here, not left as written. python.org's code
-        # samples came through as `&#39;` and `&gt;&gt;&gt;`, and a twin asked
-        # to react to a beat containing raw entity references is reacting to
-        # markup rather than to the page.
-        text = unescape(_WS.sub(" ", _TAGS.sub(" ", inner))).strip()
-        text = _WS.sub(" ", text)
-        # Drop chrome and fragments: a nav link is not a beat, and neither is
-        # a run of them that happened to share a wrapper.
-        if len(text) >= 40 and _is_prose(text, inner) and text not in blocks:
-            blocks.append(text)
+    blocks = extract_blocks(asset.text)
     if len(blocks) < MIN_BEATS:
         # Not HTML, or HTML with no prose — fall through to the text path
         # rather than fabricating structure.
@@ -604,6 +818,73 @@ def preview_page(asset: ContentAsset) -> list[str]:
     eye is the UI's job.
     """
     return _beats_from_page(asset).beats
+
+
+# ── PDF / deck ───────────────────────────────────────────────────────────
+
+#: A deck is beats; a hundred-page report is not, and asking a swarm to
+#: experience one page by page would cost a hundred appraisal tensors to
+#: measure something nobody reads that way. Truncation is reported rather than
+#: silent, because "we studied the first 40 pages" and "we studied the
+#: document" are different claims.
+MAX_PDF_PAGES = 40
+
+
+def pages_from_pdf(data: bytes) -> tuple[list[str], int]:
+    """Extract per-page text from a PDF. Returns (pages, total_page_count).
+
+    Page structure is kept rather than flattened to one blob: for a deck, a
+    page IS a beat, and it is the only modality that arrives pre-segmented.
+    Throwing that away and re-segmenting with a model would replace a fact
+    about the document with an inference about it.
+
+    A page with no extractable text is kept as an empty string and filtered by
+    the caller, so page NUMBERS stay aligned with the document — an image-only
+    slide silently shifting every subsequent page's index is worse than a gap.
+    """
+    from io import BytesIO
+
+    import pypdf
+
+    try:
+        reader = pypdf.PdfReader(BytesIO(data))
+        total = len(reader.pages)
+        out: list[str] = []
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            try:
+                text = _WS.sub(" ", (page.extract_text() or "")).strip()
+            except Exception:  # noqa: BLE001 — one bad page must not lose the file
+                text = ""
+            out.append(text)
+        return out, total
+    except Exception as exc:  # noqa: BLE001 — pypdf raises a wide variety
+        raise UnsupportedAsset(
+            f"that PDF could not be read ({type(exc).__name__}). It may be "
+            "encrypted, or scanned images with no text layer — in which case "
+            "export the slides as images and study them that way."
+        ) from exc
+
+
+#: Platforms that serve a player page rather than the media itself. Detected so
+#: the refusal can name the actual problem: fetching youtube.com/watch returns
+#: an HTML shell whose visible prose is the title and the comment policy, and
+#: studying that as a "landing page" would produce a full appraisal tensor
+#: about a page nobody came to read.
+_PLAYER_HOSTS = (
+    "youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "instagram.com",
+    "facebook.com", "twitter.com", "x.com", "linkedin.com", "loom.com",
+)
+
+
+def is_player_url(url: str) -> Optional[str]:
+    """The host name if this is a known player page, else None."""
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    for known in _PLAYER_HOSTS:
+        if host == known or host.endswith("." + known):
+            return known
+    return None
 
 
 async def extract_beats(asset: ContentAsset) -> BeatSequence:

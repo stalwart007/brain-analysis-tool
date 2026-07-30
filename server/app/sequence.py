@@ -104,6 +104,16 @@ _EPS = 1e-12
 # cheap enough to stay inside one request.
 _LIFT_REPS = 200
 _LIFT_SEED = 5701
+# Permutation replicates for the gain's null distribution. The null is the
+# expensive one to get right, so it gets the same budget as the bootstrap.
+_PERM_REPS = 200
+_PERM_SEED = 88_003
+# Repeated split-halves for the cross-fitted point estimate. One split is an
+# unbiased but very noisy estimate of the honest gain — it throws away half the
+# data for selection and the other half for evaluation. Averaging over repeated
+# random splits (and both role assignments within each) recovers most of the
+# precision while keeping selection and evaluation disjoint in every term.
+_SPLIT_REPS = 12
 # A twin "commits" when it finishes the sequence still wanting to act. 0.5 is
 # the midpoint of the 0..1 intent scale AND the threshold written into the twin
 # prompt ("above 0.5 means you would actually act"), so it is the twins' own
@@ -416,6 +426,86 @@ def _estimate(
     return matrix, support, content, position, mu
 
 
+def _select_ordering(
+    net: Sequence[Sequence[float]],
+    submitted: list[int],
+    walked: set[tuple[int, ...]],
+) -> tuple[str, list[int], float, dict]:
+    """Pick the best ordering under a given net-advantage matrix.
+
+    Factored out because SELECTION and EVALUATION must be able to run on
+    different data. While this was inline there was exactly one `net` in scope
+    and no way to express the split, which is how the bias below survived.
+    """
+    solved, solved_objective, search_info = solve_linear_ordering(net)
+    candidates: list[tuple[str, list[int], float]] = [
+        ("heuristic", solved, solved_objective),
+        ("submitted", submitted, ordering_objective(submitted, net)),
+    ]
+    for order in sorted(walked):
+        candidates.append(("walked", list(order), ordering_objective(list(order), net)))
+    source, recommended, objective = max(candidates, key=lambda c: c[2])
+    # The heuristic's own score travels with the search metadata rather than as
+    # a fifth return value — it belongs to the search, and every caller that
+    # wants it already wants the rest of `search_info`.
+    search_info = {**search_info, "heuristic_objective": round(solved_objective, 4)}
+    return source, recommended, objective, search_info
+
+
+def _split_gain(
+    infos: Sequence[dict],
+    submitted: list[int],
+    walked: set[tuple[int, ...]],
+    n: int,
+    idx: list[int],
+) -> Optional[float]:
+    """Select on one half of the walks, evaluate the gain on the other.
+
+    Both role assignments are averaged, so every walk contributes to selection
+    once and to evaluation once and the estimate does not depend on which half
+    was arbitrarily called "training".
+    """
+    half = len(idx) // 2
+    if half < 2:
+        return None
+    parts = ([infos[i] for i in idx[:half]], [infos[i] for i in idx[half:]])
+    out: list[float] = []
+    for train, test in (parts, parts[::-1]):
+        try:
+            net_train = net_advantage(_estimate(train, n)[0])
+            net_test = net_advantage(_estimate(test, n)[0])
+        except (ValueError, ZeroDivisionError):
+            continue
+        _, pick, _, _ = _select_ordering(net_train, submitted, walked)
+        out.append(
+            ordering_objective(pick, net_test) - ordering_objective(submitted, net_test)
+        )
+    return _mean(out) if out else None
+
+
+def _permute_labels(info: dict, rng: random.Random) -> dict:
+    """One walk under the null that MESSAGE IDENTITY carries no information.
+
+    Positions are held fixed and their gains untouched; only which message sat
+    at each position is shuffled. That is the precise null the recommendation
+    is claiming to beat — it preserves the position effects (primacy, recency,
+    fatigue), the per-walk gain distribution, and the walk length, and destroys
+    only the message→position association the ordering search exists to find.
+
+    Shuffling the gains instead would have tested a different and much weaker
+    null, one that any position effect at all would reject.
+    """
+    shuffled = list(info["ordering"])
+    rng.shuffle(shuffled)
+    return {
+        **info,
+        "ordering": shuffled,
+        # gains are (message, position, gain); the position and the gain stay
+        # welded together, the message label at that position is resampled.
+        "gains": [(shuffled[p], p, g) for (_m, p, g) in info["gains"]],
+    }
+
+
 def sequence_result(
     walks: list[dict],
     messages: list[str],
@@ -456,33 +546,102 @@ def sequence_result(
     recency = (position[n - 1] - middle_mean) if n > 0 and position[n - 1] is not None else None
 
     # ── solve, then take the best of solved / submitted / anything walked ──
-    solved, solved_objective, search_info = solve_linear_ordering(net)
-    submitted_objective = ordering_objective(submitted, net)
-    candidates: list[tuple[str, list[int], float]] = [
-        ("heuristic", solved, solved_objective),
-        ("submitted", submitted, submitted_objective),
-    ]
     walked = {tuple(i["ordering"]) for i in infos if len(i["ordering"]) == n}
-    for order in sorted(walked):
-        candidates.append(("walked", list(order), ordering_objective(list(order), net)))
-    source, recommended, objective = max(candidates, key=lambda c: c[2])
+    submitted_objective = ordering_objective(submitted, net)
+    source, recommended, objective, search_info = _select_ordering(
+        net, submitted, walked
+    )
 
-    # ── lift over the submitted ordering, with a resampling interval ────
-    gain = objective - submitted_objective
-    rng = random.Random(_LIFT_SEED)
+    # ── how much that ordering actually gains, without the selection bias ──
+    #
+    # THE BUG THIS REPLACES. `recommended` is the argmax over candidates scored
+    # on the full sample; `naive_gain` is then its margin over `submitted`
+    # measured on that same sample. Taking a maximum over ~40 candidates and
+    # reporting its value on the data that chose it is the textbook winner's
+    # curse, and the old bootstrap did nothing about it: it re-estimated the
+    # matrix per replicate but held `recommended` FIXED, so it measured the
+    # uncertainty of scoring one pre-chosen ordering and never the uncertainty
+    # of the choosing. Measured on 150 studies with NO order effect whatsoever,
+    # `gain_supported` fired 20.7% of the time against a nominal 2.5%, with a
+    # mean "gain" of +0.75 and P(gain > 0) = 98.7%. The product was telling
+    # researchers to reorder their campaign on the basis of noise, five times
+    # more often than its own stated error rate.
+    #
+    # Two independent corrections, because they answer different questions:
+    #
+    #   SAMPLE SPLITTING gives an unbiased magnitude. Selection runs on one
+    #   half of the walks and evaluation on the other, so the half that scores
+    #   the winner had no say in picking it. Repeated over random splits (both
+    #   role assignments each time) to recover the precision that splitting
+    #   costs.
+    #
+    #   A PERMUTATION TEST gives a real p-value. The whole select-then-evaluate
+    #   procedure is re-run on data where message identity has been shuffled
+    #   within each walk, so the null distribution is of the PROCEDURE — the
+    #   maximisation included — rather than of a statistic. That is the only
+    #   way the winner's curse can appear in the null as well as the estimate,
+    #   which is what makes the comparison fair.
+    #
+    # `naive_gain` is still reported, labelled as what it is. Dropping it would
+    # hide the size of the correction, and the gap between it and `gain` is
+    # itself the diagnostic for how hard the search was working.
+    naive_gain = objective - submitted_objective
+
+    split_rng = random.Random(_LIFT_SEED)
+    order_idx = list(range(len(infos)))
+    honest: list[float] = []
+    for _ in range(_SPLIT_REPS):
+        split_rng.shuffle(order_idx)
+        g = _split_gain(infos, submitted, walked, n, order_idx)
+        if g is not None:
+            honest.append(g)
+    gain = round(_mean(honest), 4) if honest else None
+
+    # Bootstrap the WHOLE procedure — resample walks, then split, select and
+    # evaluate inside the replicate. Resampling around a fixed winner would
+    # reproduce the original error in a new place.
+    boot_rng = random.Random(_LIFT_SEED + 1)
     replicates: list[float] = []
-    for _ in range(_LIFT_REPS):
-        resample = [infos[rng.randrange(len(infos))] for _ in range(len(infos))]
-        rep_matrix, _, _, _, _ = _estimate(resample, n)
-        rep_net = net_advantage(rep_matrix)
-        replicates.append(
-            ordering_objective(recommended, rep_net)
-            - ordering_objective(submitted, rep_net)
-        )
-    gain_ci = _percentile_ci(replicates)
-    # The honest reading of the interval: if it straddles zero, the recommended
-    # ordering is not distinguishable from the one already planned.
-    gain_supported = bool(gain_ci and gain_ci[0] > 0)
+    if honest:
+        for _ in range(_LIFT_REPS):
+            resample = [infos[boot_rng.randrange(len(infos))] for _ in range(len(infos))]
+            rep_walked = {tuple(i["ordering"]) for i in resample if len(i["ordering"]) == n}
+            rep_idx = list(range(len(resample)))
+            boot_rng.shuffle(rep_idx)
+            g = _split_gain(resample, submitted, rep_walked or walked, n, rep_idx)
+            if g is not None:
+                replicates.append(g)
+    gain_ci = _percentile_ci(replicates) if len(replicates) >= 20 else None
+
+    # Permutation null over the same cross-fitted statistic.
+    perm_rng = random.Random(_PERM_SEED)
+    n_ge = 0
+    n_perm = 0
+    if gain is not None:
+        for _ in range(_PERM_REPS):
+            permuted = [_permute_labels(i, perm_rng) for i in infos]
+            perm_walked = {tuple(i["ordering"]) for i in permuted if len(i["ordering"]) == n}
+            perm_idx = list(range(len(permuted)))
+            perm_rng.shuffle(perm_idx)
+            g = _split_gain(permuted, submitted, perm_walked or walked, n, perm_idx)
+            if g is None:
+                continue
+            n_perm += 1
+            if g >= gain:
+                n_ge += 1
+    # Add-one estimator, so p is never reported as exactly zero at finite P.
+    gain_p_value = round((1.0 + n_ge) / (1.0 + n_perm), 4) if n_perm else None
+    # BOTH conditions. A significant p with a negative point estimate is a
+    # fluke of the tail, and a positive estimate whose interval straddles zero
+    # is not a finding — the old code required only the latter.
+    gain_supported = bool(
+        gain is not None
+        and gain > 0
+        and gain_p_value is not None
+        and gain_p_value < 0.05
+        and gain_ci
+        and gain_ci[0] > 0
+    )
 
     # ── per-ordering outcomes + posteriors over what was actually walked ──
     by_order: dict[tuple[int, ...], list[dict]] = {}
@@ -534,9 +693,26 @@ def sequence_result(
         "recommended_messages": [messages[i][:160] for i in recommended],
         "objective": round(objective, 4),
         "submitted_objective": round(submitted_objective, 4),
-        "objective_gain": round(gain, 4),
+        # The headline gain is the CROSS-FITTED one: selection and evaluation
+        # never saw the same walks. None when there were too few walks to split.
+        "objective_gain": gain,
         "objective_gain_ci": gain_ci,
+        "gain_p_value": gain_p_value,
         "gain_supported": gain_supported,
+        # In-sample, selection-biased, kept only so the size of the correction
+        # is visible. Never render this as the gain.
+        "naive_objective_gain": round(naive_gain, 4),
+        "selection_bias": (
+            round(naive_gain - gain, 4) if gain is not None else None
+        ),
+        "gain_inference": (
+            "cross-fitted: the ordering is selected on one half of the walks "
+            "and scored on the other, averaged over repeated random splits. "
+            "The p-value permutes message identity within each walk — holding "
+            "position and its gain fixed — and re-runs the entire "
+            "select-then-evaluate procedure, so the winner's curse is present "
+            "in the null as well as in the estimate."
+        ),
         "objective_units": (
             "sum over ordered pairs of the NET position-adjusted precedence "
             "advantage (what the later message gains minus what the earlier one "
@@ -546,7 +722,6 @@ def sequence_result(
         "search": {
             **search_info,
             "heuristic": "greedy insertion by net outflow + pairwise-swap local search",
-            "heuristic_objective": round(solved_objective, 4),
             "optimal": False,
             "note": (
                 "The linear ordering problem is NP-hard; this is a local optimum "

@@ -15,6 +15,7 @@ import dynamic from "next/dynamic";
 import { CognitiveLoad, WalkAggregate } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
 import SimStage from "./sim/SimStage";
 import type { GateEvent } from "./sim/FunnelSim";
@@ -27,6 +28,7 @@ export default function FlowPanel({ personaCount }: { personaCount: number }) {
   const [stepsText, setStepsText] = useState("");
   const [twins, setTwins] = useState(2);
   const [load, setLoad] = useState<CognitiveLoad>("high");
+  const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<WalkAggregate | null>(null);
@@ -49,7 +51,7 @@ export default function FlowPanel({ personaCount }: { personaCount: number }) {
     try {
       await streamRun(
         "/swarm/walk/stream",
-        { steps, twins_per_persona: twins, cognitive_load: load },
+        { steps, twins_per_persona: twins, cognitive_load: load, research_question: question },
         (evt) => {
           if (evt.type === "start") setTotal(evt.total as number);
           else if (evt.type === "step") {
@@ -116,6 +118,13 @@ export default function FlowPanel({ personaCount }: { personaCount: number }) {
         className="w-full resize-y rounded-xl border border-hairline bg-surface-2 p-3.5 font-mono text-xs leading-relaxed outline-none placeholder:text-muted focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
       />
 
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. which step is the real drop-off, and why there?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <span className="text-xs text-muted tabular-nums">{steps.length} steps</span>
         <label className="flex items-center gap-2 text-xs text-muted">
@@ -150,6 +159,7 @@ export default function FlowPanel({ personaCount }: { personaCount: number }) {
             exit={{ opacity: 0 }}
             className="mt-6"
           >
+          <FindingsPanel findings={result.findings} />
             <div className="mb-4 flex gap-8">
               <div>
                 <div className="text-xs uppercase tracking-wider text-muted">Completion</div>
