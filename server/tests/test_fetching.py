@@ -284,3 +284,50 @@ def test_a_failing_status_is_diagnosed_rather_than_guessed_at():
     # an unrecognised status is reported as unexplained, never speculated about
     odd = _status_hint(418)
     assert "login" not in odd.lower() and "blocking" not in odd.lower()
+
+
+# ── the egress proxy: a hole with exactly one shape ────────────────────────
+
+
+def test_the_proxy_allowlist_is_visible_to_importers():
+    """The set is mutated in place, never rebound.
+
+    A `global` reassignment would leave every `from .fetching import
+    PROXY_ALLOWED_URLS` holding the empty set captured at import time, so an
+    auditor reading the name would see "empty" while the check inside the
+    function saw the populated one. A security control whose contents depend on
+    how you look at it is worse than a permissive one.
+    """
+    from app.fetching import PROXY_ALLOWED_URLS
+    import app.youtube  # noqa: F401 — registers the InnerTube endpoint
+
+    assert "https://www.youtube.com/youtubei/v1/player" in PROXY_ALLOWED_URLS
+
+
+def test_the_proxy_refuses_every_destination_but_the_allowlisted_one():
+    """THE boundary. Everywhere else the SSRF defence is "resolve it ourselves
+    and connect to the address we validated" — and a proxy makes that
+    impossible, because the proxy resolves. What replaces it is that the
+    destination cannot come from a request at all.
+    """
+    import app.youtube  # noqa: F401
+    from app.fetching import UnsafeURL, proxied_fetch_json
+
+    hostile = [
+        "http://169.254.169.254/latest/meta-data/",       # cloud metadata
+        "http://cogniswarm-api.internal:8000/v1/sessions",  # the private backend
+        "http://127.0.0.1:8000/healthz",
+        "https://www.youtube.com/youtubei/v1/player.evil.test",
+        "https://evil.test/youtubei/v1/player",
+    ]
+    for url in hostile:
+        with pytest.raises(UnsafeURL):
+            asyncio.run(proxied_fetch_json(url, proxy="http://proxy.test:8080"))
+
+
+def test_a_query_string_cannot_smuggle_a_destination_past_the_allowlist():
+    """Matched on the path, so `?key=…&next=http://…` changes nothing."""
+    import app.youtube  # noqa: F401
+    from app.fetching import PROXY_ALLOWED_URLS
+
+    assert all("?" not in entry for entry in PROXY_ALLOWED_URLS)

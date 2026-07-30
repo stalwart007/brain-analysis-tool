@@ -13,7 +13,7 @@ import {
 } from "recharts";
 import dynamic from "next/dynamic";
 import { BayesianResult, CognitiveLoad, CompareResult } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
@@ -37,6 +37,7 @@ interface EarlyStop {
 
 export default function ComparePanel({ personaCount }: { personaCount: number }) {
   const entrance = useEntranceEnabled();
+  const streamRun = useStreamRun();
   const [variants, setVariants] = useState<Variant[]>([
     { name: "A (control)", scenario: "" },
     { name: "B", scenario: "" },

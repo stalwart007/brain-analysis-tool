@@ -12,7 +12,7 @@
 import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import BrainMap, { SystemScores } from "./BrainMap";
 import SimStage from "./sim/SimStage";
@@ -21,7 +21,11 @@ import ChartFrame from "./charts/ChartFrame";
 import TensorSim from "./sim/TensorSim";
 import TensorExplorer from "./TensorExplorer";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
-import { AssetInput, assetReady, KINDS, type AssetKind, type ContentAsset } from "./AssetInput";
+import { AssetInput, assetReady, type AssetKind, type ContentAsset } from "./AssetInput";
+import { clock, type YouTubeManifest } from "./content/YouTubeIngest";
+import VideoTimeline from "./content/VideoTimeline";
+import BeatDiagnostic from "./content/BeatDiagnostic";
+import SynchronyNull, { type IscBlock } from "./content/SynchronyNull";
 
 interface RetentionStep {
   beat: number;
@@ -55,7 +59,12 @@ interface ContentResult {
   curve_pointwise_cis?: Record<string, ([number, number] | null)[] | null>;
   band_method?: string;
   findings?: FindingsBlock | null;
-  isc: { overall: number; grip: string; leave_one_out: (number | null)[]; method: string } | null;
+  /** Where each beat sits on the clock, for content that has one. Null for a
+   *  deck or an article, which have an order and no duration. */
+  timestamps_ms?: number[] | null;
+  isc:
+    | (IscBlock & { leave_one_out: (number | null)[] })
+    | null;
   change_points: number[] | null;
   memory: {
     remembered_affect: number;
@@ -105,6 +114,7 @@ export default function ContentImpactPanel(props: { personaCount: number }) {
 
 
 function ContentImpactInner({ personaCount }: { personaCount: number }) {
+  const streamRun = useStreamRun();
   const [kind, setKind] = useState<AssetKind>("text");
   const [asset, setAsset] = useState<ContentAsset>({ kind: "text" });
   const [question, setQuestion] = useState("");
@@ -118,6 +128,12 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
   const [expected, setExpected] = useState(0);   // twins dispatched, from `start`
   const [passes, setPasses] = useState<string[]>([]); // analysis stages seen
   const [result, setResult] = useState<ContentResult | null>(null);
+  // Kept beside the result because it carries what the RESULT cannot: the real
+  // runtime, the chapter titles, and the still frames the beats were read from.
+  // A beat labelled "B3" is a bar on a chart; the same beat labelled "1:24 —
+  // The fix" with its frame under it is a moment in a video someone can go and
+  // watch.
+  const [youtube, setYoutube] = useState<YouTubeManifest | null>(null);
   // ONE cursor for the beat axis, shared by the attention field, the
   // peak-index distribution, the retention curve and the brain-map scrubber.
   // The scrubber used to own a separate `beat` state, so clicking a beat there
@@ -179,45 +195,33 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
         <span className="text-xs text-muted">what the content does to an audience, beat by beat</span>
       </div>
       <p className="lede mb-4">
-        Any digital content — a script, a static ad, a video, a podcast, a
-        landing page, a deck. The swarm experiences it beat by beat; you get
-        attention synchrony, drop-off, what memory keeps, the emotional arc,
-        and a functional brain atlas. Statistics that the format cannot support
-        are withheld with their reason rather than computed anyway.
+        Paste a link to anything — a YouTube video, a podcast, a landing page, a
+        deck, an image — or paste the copy itself. We work out what it is; you
+        do not classify it. The swarm then experiences it beat by beat and you
+        get attention synchrony, drop-off, what memory keeps, the emotional arc,
+        and a functional brain atlas. Statistics the format cannot support are
+        withheld with their reason rather than computed anyway.
       </p>
 
-      {/* Modality picker. Each kind reaches the study through a different
-          adapter and lands on a different AXIS, which is what decides whether
-          peak-end, change points and retention are meaningful at all. */}
-      <div
-        role="radiogroup"
-        aria-label="Content type"
-        className="mb-3 flex flex-wrap gap-1.5"
-      >
-        {KINDS.map((k) => (
-          <button
-            key={k.id}
-            role="radio"
-            aria-checked={kind === k.id}
-            title={k.hint}
-            disabled={busy}
-            onClick={() => {
-              setKind(k.id);
-              setAsset({ kind: k.id });
-              setResult(null);
-            }}
-            className={`rounded-lg border px-3 py-1.5 text-xs transition ${
-              kind === k.id
-                ? "border-accent/60 bg-accent/[0.10] text-ink"
-                : "border-hairline text-muted hover:border-accent/40 hover:text-ink-2"
-            }`}
-          >
-            {k.label}
-          </button>
-        ))}
-      </div>
-
-      <AssetInput kind={kind} asset={asset} onChange={setAsset} disabled={busy} />
+      {/* The modality picker used to live here, ABOVE the input, as a gate:
+          choose what your content is, then get the box that accepts it. It now
+          lives inside `AssetInput` underneath the one box, because it reports
+          what the server detected rather than asking the researcher to
+          classify their own URL. Each kind still reaches the study through a
+          different adapter and lands on a different AXIS — that part was always
+          right, and is what decides whether peak-end, change points and
+          retention are meaningful at all. */}
+      <AssetInput
+        kind={kind}
+        asset={asset}
+        onChange={setAsset}
+        onKindChange={(k) => {
+          setKind(k);
+          setResult(null);
+        }}
+        disabled={busy}
+        onYouTube={setYoutube}
+      />
 
       {/* The one field that changes what the REPORT is about rather than what
           the run measures. Placed after the asset because the useful questions
@@ -351,6 +355,23 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
             </div>
           )}
 
+          {/* On a real clock, with the frames the beats were read from. Only
+              for content that HAS a clock — `timestamps_ms` is absent for a
+              deck or an article, and drawing those against elapsed time would
+              invent a duration they do not have. */}
+          {asset.frames && asset.frames.length > 0 && result.timestamps_ms && (
+            <VideoTimeline
+              frames={asset.frames}
+              timestampsMs={result.timestamps_ms}
+              attention={result.curves.attention}
+              segments={result.segments}
+              durationS={youtube?.duration_s ?? Math.max(...result.timestamps_ms) / 1000}
+              chapters={youtube?.chapters}
+              changePoints={result.change_points}
+              cursor={beatCursor}
+            />
+          )}
+
           {/* The whole tensor, not one ninth of it. Reading DOWN a column —
               everything that happened at one beat — is the view that was
               impossible before, and it is usually what explains a weak beat:
@@ -363,6 +384,19 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
             cursor={beatCursor}
             twinCurves={traces}
           />
+
+          {/* …and that same reading, performed rather than left to the eye. */}
+          {result.curves.cognitive_effort && (
+            <BeatDiagnostic
+              attention={result.curves.attention}
+              effort={result.curves.cognitive_effort}
+              segments={result.segments}
+              cursor={beatCursor}
+              timeLabels={
+                result.timestamps_ms?.map((t) => clock(t / 1000)) ?? undefined
+              }
+            />
+          )}
 
           <div className="grid gap-5 lg:grid-cols-2">
             {/* brain atlas with beat scrubber */}
@@ -398,6 +432,13 @@ function ContentImpactInner({ personaCount }: { personaCount: number }) {
             <div className="space-y-4">
               {/* ISC */}
               {result.isc && <IscSynchrony isc={result.isc} />}
+
+              {/* The permutation null behind the p-value beside it. 500 full
+                  re-runs of the estimator were already being spent to produce
+                  that number and then reported as three decimal places. */}
+              {result.isc?.null_r_distribution?.length ? (
+                <SynchronyNull isc={result.isc} />
+              ) : null}
 
               {/* memory — the peak-index DISTRIBUTION, not a softmax.
                   Peak-end is a within-subject phenomenon, so this is where

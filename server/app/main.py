@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Optional
+from urllib.parse import urlparse
 
 import json
 from html import escape as html_escape
@@ -49,14 +50,27 @@ from .boardroom import (
     room_call_estimate,
     stream_deliberation,
 )
-from .fetching import FetchFailed, UnsafeURL, fetch_url
+from .fetching import ASSET_KINDS, FetchFailed, UnsafeURL, fetch_url, probe_url
 from .findings import build_findings
+from .providers import describe_link
 from .modality import (
     UnsupportedAsset,
     is_player_url,
     pages_from_pdf,
     preview_page,
     visible_text_length,
+)
+from .youtube import (
+    LADDER,
+    YouTubeUnavailable,
+    choose_rung,
+    fetch_captions,
+    fetch_manifest,
+    is_youtube_url,
+    manifest_envelope,
+    parse_video_id,
+    pick_caption_track,
+    plan_keyframes,
 )
 from .oai import Refusal
 from .persona import seed_persona
@@ -489,6 +503,24 @@ class _IngestLimiter:
 _ingest_limiter = _IngestLimiter(
     limit=int(os.environ.get("COGNISWARM_INGEST_RATE_LIMIT", "120")),
     window_s=float(os.environ.get("COGNISWARM_INGEST_RATE_WINDOW_S", "60")),
+)
+
+#: The media relay, which is the one authenticated endpoint whose cost is
+#: BANDWIDTH rather than tokens.
+#:
+#: It will fetch up to 80 MB from an arbitrary public URL and stream it back, so
+#: a key-holder — or anything that has got hold of a key — can turn it into an
+#: egress amplifier and the bill lands on the Fly account, not on OpenAI's.
+#: Nothing else here has that shape: every other endpoint is bounded by twin
+#: counts, which `MAX_TWINS_PER_RUN` already caps.
+#:
+#: The legitimate ceiling is small and knowable. A YouTube ingest relays at most
+#: five spritesheets plus four stills plus a thumbnail — ten requests — and a
+#: hosted MP4 is one. Sixty a minute is six full ingests back to back, which no
+#: human reaches and a script exceeds immediately.
+_relay_limiter = _IngestLimiter(
+    limit=int(os.environ.get("COGNISWARM_RELAY_RATE_LIMIT", "60")),
+    window_s=float(os.environ.get("COGNISWARM_RELAY_RATE_WINDOW_S", "60")),
 )
 
 
@@ -1223,6 +1255,93 @@ async def room_stream(caller: CallerDep, request: RoomRequest) -> StreamingRespo
 # ------------------------------------------------------------------ page fetch
 
 
+async def _metadata_rung(url: str, html: str, envelope: dict) -> dict:
+    """The floor under every HTML URL: study how the thing presents itself.
+
+    Reached in two cases that used to be 422s — a player page (whose prose is
+    furniture) and a page that renders its copy in the browser (whose prose is
+    absent). Both are extremely common and neither is a reason to hand back
+    nothing.
+
+    What comes out is a REAL study of a REAL asset, and a narrower one than the
+    caller asked for. When the page publishes a hero image, that image is
+    fetched and studied for visual hierarchy, with the title and description as
+    the brief — which is exactly the study you want for "does this thumbnail
+    earn a click". When there is no image but there is copy, the copy is
+    studied as text. `rung` carries the distinction upward so the UI can say
+    which one happened, because a study of a listing presented as a study of
+    the video would be the most misleading thing this endpoint could do.
+    """
+    meta = await describe_link(url, html)
+    if meta is None or not meta.usable:
+        # Genuinely nothing. Report the measurement rather than a theory about
+        # why — the same discipline the prose path already follows.
+        visible = visible_text_length(html)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"We reached that page and found {visible:,} characters of readable "
+                "text, no sections long enough to read as beats, and no preview "
+                "image or description in its markup — so there is nothing to build "
+                "a study from. Paste the copy as a script, or upload a screenshot "
+                "and study it as an image."
+            ),
+        )
+
+    label = meta.site_name or urlparse(url).hostname or "that page"
+    shared = {
+        **envelope,
+        "rung": "metadata",
+        "meta": {
+            "title": meta.title,
+            "author": meta.author,
+            "description": meta.description,
+            "site_name": meta.site_name,
+            "og_type": meta.og_type,
+            "duration_s": meta.duration_s,
+            "sources": meta.sources,
+            "image_url": meta.image_url,
+        },
+    }
+
+    # ── the hero image, when there is one ───────────────────────────────
+    if meta.image_url:
+        try:
+            hero = await fetch_url(meta.image_url, kinds=("image",))
+        except (UnsafeURL, FetchFailed):
+            hero = None
+        if hero is not None and hero.bytes_read > 0:
+            return {
+                **shared,
+                "kind": "image",
+                "asset": {
+                    "kind": "image",
+                    "image_b64": base64.b64encode(hero.content).decode("ascii"),
+                    "media_type": hero.content_type,
+                    "brief": meta.as_brief()[:1000],
+                },
+                "note": (
+                    f"{label} does not publish readable page copy, so this studies "
+                    f"its PREVIEW — the image and headline a scroller actually sees "
+                    f"before deciding to click, not the content behind it. "
+                    f"Read from {', '.join(meta.sources)}."
+                ),
+            }
+
+    # ── the listing copy, when there is no usable image ─────────────────
+    return {
+        **shared,
+        "kind": "text",
+        "asset": {"kind": "text", "text": meta.as_brief()},
+        "note": (
+            f"{label} publishes no readable page copy and no usable preview image, "
+            f"so this studies its DESCRIPTION — the {len(meta.description)} "
+            f"characters it uses to sell itself, not the content behind it. "
+            f"Read from {', '.join(meta.sources)}."
+        ),
+    }
+
+
 @app.post("/v1/content/fetch")
 async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
     """Turn a pasted URL into whatever kind of study asset it actually is.
@@ -1252,30 +1371,210 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
        and "the model refused" want different messages, and folding them into
        one call means reporting a network problem as an analysis problem.
     """
-    # Player pages are caught BEFORE the fetch, because the fetch would succeed.
-    # youtube.com/watch answers 200 with an HTML shell, and its extractable
-    # prose is the video title and the comment policy — a page study of that
-    # returns a complete appraisal tensor about something nobody watched.
-    player = is_player_url(request.url)
-    if player:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{player} serves a player page, not the media — fetching it "
-                "would return the page furniture around the video rather than "
-                "the video. Download the file and upload it, or paste a direct "
-                "link to the media file itself."
-            ),
-        )
+    # ── YouTube: read properly, rather than refused ─────────────────────
+    #
+    # This used to be a flat 422 alongside every other player host, on the
+    # reasoning that fetching youtube.com/watch returns an HTML shell whose
+    # prose is the title and the comment policy. That observation is correct
+    # and the conclusion drawn from it was not: the shell is what the PAGE
+    # fetcher gets, not what a server can get. The InnerTube player endpoint
+    # gives duration, chapters, the description and the caption list, and the
+    # scrub-bar storyboard gives real frames every two seconds. See
+    # `app.youtube` for what is and is not touched, and why.
+    if is_youtube_url(request.url):
+        video_id = parse_video_id(request.url)
+        if not video_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "that is a YouTube link but not to a single video — channel "
+                    "pages, playlists and search results have no content to "
+                    "study. Paste a link to one video."
+                ),
+            )
+        try:
+            manifest = await fetch_manifest(video_id)
+        except YouTubeUnavailable as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except (UnsafeURL, FetchFailed) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        track = pick_caption_track(manifest.caption_tracks)
+        # Best-effort and deliberately not awaited behind a failure path: an
+        # absent transcript costs the study its speech channel, not its life.
+        cues = await fetch_captions(track) if track else []
+        frames = plan_keyframes(manifest)
+        rung = choose_rung(manifest, cues, frames)
+        if rung == "none":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"'{manifest.title}' has no filmstrip, no readable transcript "
+                    "and no chapters, so there is nothing to build beats from. "
+                    "Download the video and upload it — keyframes are extracted "
+                    "in your browser."
+                ),
+            )
+
+        # ── the route round the bot wall: unsigned CDN frames ───────────
+        #
+        # Four real frames spanning the video, needing no player-API call at
+        # all, so this survives exactly the block that takes out everything
+        # above it. Declared as `video` because that is what it is — the client
+        # relays four images and crops nothing. Their positions are known as
+        # fractions and not as times, which is why they travel with `t_ms: -1`
+        # and land on a sequential axis rather than an invented clock.
+        if rung == "cdn_frames":
+            return {
+                "kind": "video",
+                "final_url": manifest.watch_url,
+                "hops": [request.url],
+                "bytes": 0,
+                "content_type": "application/x-youtube-manifest",
+                "rung": "cdn_frames",
+                "youtube": manifest_envelope(manifest, cues, frames),
+                "asset": {"kind": "video"},
+                "note": manifest_envelope(manifest, cues, frames)["note"],
+            }
+
+        # ── the bottom rung: the thumbnail ──────────────────────────────
+        #
+        # Reached whenever InnerTube refused us and only the public preview
+        # survived — which, measured from Fly, is the COMMON case rather than an
+        # edge one. Answered as an ordinary image study of the thumbnail rather
+        # than as a video study with nothing in it, because that is what it
+        # actually is, and returning `kind: video` here would fail downstream on
+        # "a video asset needs keyframes" after the researcher had been told the
+        # link was read successfully.
+        if rung == "metadata":
+            envelope = manifest_envelope(manifest, cues, frames)
+            try:
+                hero = await fetch_url(manifest.thumbnail_url, kinds=("image",))
+            except (UnsafeURL, FetchFailed) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"YouTube would not describe '{manifest.title}' to this "
+                        f"server and its thumbnail could not be fetched either "
+                        f"({exc}). Download the video and upload it instead."
+                    ),
+                ) from exc
+            return {
+                "kind": "image",
+                "final_url": manifest.watch_url,
+                "hops": [request.url],
+                "bytes": hero.bytes_read,
+                "content_type": hero.content_type,
+                "rung": "metadata",
+                "youtube": envelope,
+                "asset": {
+                    "kind": "image",
+                    "image_b64": base64.b64encode(hero.content).decode("ascii"),
+                    "media_type": hero.content_type,
+                    "brief": (
+                        f'YouTube thumbnail for "{manifest.title}"'
+                        + (f" by {manifest.author}" if manifest.author else "")
+                        + ". The video itself could not be read."
+                    ),
+                },
+                "note": envelope["note"],
+            }
+
+        return {
+            # Declared as a video whatever rung it lands on, so the client's
+            # kind check passes and the ladder is reported in `youtube.rung`
+            # rather than by silently changing what the caller asked for.
+            "kind": "video",
+            "final_url": manifest.watch_url,
+            "hops": [request.url],
+            "bytes": 0,
+            "content_type": "application/x-youtube-manifest",
+            "youtube": manifest_envelope(manifest, cues, frames),
+            "asset": {"kind": "video"},
+            "note": manifest_envelope(manifest, cues, frames)["note"],
+        }
+
+    # Other player pages are NO LONGER refused here.
+    #
+    # The original refusal rested on a correct observation — the visible prose
+    # of a Vimeo or TikTok page is furniture, and a "landing page" study of it
+    # would describe a nav bar — and then drew a wrong conclusion from it,
+    # that there was therefore nothing to study. There is: the page describes
+    # itself in its own markup, in OpenGraph tags that exist precisely so a
+    # link unfurls, and the hero image those tags point at is a real asset.
+    #
+    # So the prose path is SKIPPED for these hosts (the original insight is
+    # kept) and they fall through to the metadata rung below, which studies the
+    # listing — the thumbnail and the copy that decide whether anyone clicks.
+    # That is a different question from what the video does, and it is labelled
+    # as a different question everywhere it surfaces.
+    skip_prose = is_player_url(request.url) is not None
+
+    # Identify before downloading. A hosted video is the common case here and
+    # the ONLY thing this call needs to know about one is that it is a video —
+    # a fact the response headers carry. Reading the body first pulled up to
+    # eighty megabytes into memory so that the relay could pull the same eighty
+    # megabytes again a moment later.
     try:
-        fetched = await fetch_url(request.url)
+        probed = await probe_url(request.url)
     except UnsafeURL as exc:
         # 400, not 403: the caller is authenticated and permitted, the URL is
         # the thing that is wrong, and they can fix it by pasting another one.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FetchFailed as exc:
         # 502: we are reporting someone else's failure, not our own.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if probed.kind in {"video", "audio"}:
+        # ── video / audio: relayed to the BROWSER, decoded there ────────
+        #
+        # The server never decodes this. Running a media decoder over bytes an
+        # arbitrary URL supplied is a large and historically hostile attack
+        # surface, and the browser already has a decoder plus a sandbox around
+        # it. So the probe proves the URL is safe and reachable, and the actual
+        # bytes go to the client through the relay below, which re-validates.
+        declared = probed.declared_length
+        cap = ASSET_KINDS[probed.kind][1]
+        if declared is not None and declared > cap:
+            # Caught here rather than after the download, so the refusal costs
+            # one round trip instead of eighty megabytes of transfer that ends
+            # in the same refusal.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"that file declares {declared / 1_000_000:.0f} MB, over the "
+                    f"{cap // 1_000_000} MB ceiling for {probed.kind}. Trim it, or "
+                    "upload a shorter cut — keyframes are extracted in your browser."
+                ),
+            )
+        return {
+            "kind": probed.kind,
+            "final_url": probed.final_url,
+            "hops": list(probed.hops),
+            "bytes": declared or 0,
+            "content_type": probed.content_type,
+            "asset": {"kind": probed.kind},
+            "media_relay": "/content/media",
+            "note": (
+                (f"{declared / 1_000_000:.1f} MB of " if declared else "")
+                + f"{probed.content_type}. "
+                + (
+                    "Keyframes are extracted in your browser — the file is never "
+                    "decoded on the server."
+                    if probed.kind == "video"
+                    else "Paste a transcript below; timings turn it into a timeline."
+                )
+            ),
+        }
+
+    # Everything else is small enough to read, and has to be read to be useful:
+    # a page has to be parsed for sections, a PDF for pages, an image encoded
+    # for the vision call.
+    try:
+        fetched = await fetch_url(request.url)
+    except UnsafeURL as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FetchFailed as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     envelope = {
@@ -1302,29 +1601,8 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
             ),
         }
 
-    # ── video / audio: relayed to the BROWSER, decoded there ────────────
-    #
-    # The server never decodes this. Running a media decoder over bytes an
-    # arbitrary URL supplied is a large and historically hostile attack
-    # surface, and the browser already has a decoder plus a sandbox around it.
-    # So the fetch proves the URL is safe and reachable, and the actual bytes
-    # go to the client through the relay below, which re-validates. The
-    # boundary the upload path already respected now holds for links too.
-    if fetched.kind in {"video", "audio"}:
-        return {
-            **envelope,
-            "asset": {"kind": fetched.kind},
-            "media_relay": "/content/media",
-            "note": (
-                f"{fetched.bytes_read / 1_000_000:.1f} MB of {fetched.content_type}. "
-                + (
-                    "Keyframes are extracted in your browser — the file is never "
-                    "decoded on the server."
-                    if fetched.kind == "video"
-                    else "Paste a transcript below; timings turn it into a timeline."
-                )
-            ),
-        }
+    # Video and audio never reach here — they are answered from the probe
+    # above, without a download.
 
     # ── PDF: pages are beats, already segmented by the document ─────────
     if fetched.kind == "document":
@@ -1360,9 +1638,17 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
         }
 
     # ── page: unchanged, and still the subtlest of the five ─────────────
+    #
+    # Player hosts skip straight to the metadata rung. Their prose EXISTS and
+    # is furniture, which is the one case the section extractor cannot detect
+    # for itself — it would happily return "Sign in", "Subscribe" and a comment
+    # policy as three beats.
+    if skip_prose:
+        return await _metadata_rung(request.url, fetched.html, envelope)
+
     try:
         sections = preview_page(ContentAsset.model_construct(kind="page", text=fetched.html))
-    except UnsupportedAsset as exc:
+    except UnsupportedAsset:
         # Reached and read, but no prose came out.
         #
         # This deliberately does NOT diagnose why. Two heuristics were tried —
@@ -1370,23 +1656,14 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
         # both misclassified real sites in both directions: tailwindcss.com
         # SUCCEEDS at a lower prose ratio (0.008) than stripe.com FAILS at
         # (0.014), because what matters is not how much text a page has but
-        # whether any of it sits in blocks long enough to be a beat. Guessing
-        # "your page uses JavaScript" and being wrong sends someone to fix
-        # something that is not broken.
+        # whether any of it sits in blocks long enough to be a beat.
         #
-        # So it reports the measurement and the options, and lets the person
-        # looking at their own page draw the conclusion.
-        visible = visible_text_length(fetched.html)
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{exc}. We reached the page and found {visible:,} characters of "
-                "readable text, but not two sections long enough to read as "
-                "separate beats — which is usual for pages that build their copy "
-                "in the browser. Paste the copy as a script, or upload a "
-                "screenshot and study it as an image."
-            ),
-        ) from exc
+        # It used to end here, as a 422 listing the caller's options. It no
+        # longer has to: a page that builds its copy in the browser still
+        # published OpenGraph tags server-side for the link preview, and those
+        # describe the thing well enough to study. The refusal is kept inside
+        # `_metadata_rung` for the case where even that comes back empty.
+        return await _metadata_rung(request.url, fetched.html, envelope)
 
     # Send back the EXTRACTED PROSE, not the page.
     #
@@ -1411,7 +1688,9 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
 
 
 @app.post("/v1/content/media")
-async def content_media(caller: CallerDep, request: PageFetchRequest) -> StreamingResponse:
+async def content_media(
+    caller: CallerDep, request: PageFetchRequest, http: Request
+) -> StreamingResponse:
     """Relay video/audio bytes to the browser, which decodes them.
 
     THE PROBLEM THIS SOLVES. Keyframe extraction already happens client-side —
@@ -1428,20 +1707,46 @@ async def content_media(caller: CallerDep, request: PageFetchRequest) -> Streami
     interprets what it is carrying, and the browser at the far end does the
     decoding it was always going to do.
 
+    IMAGES TOO, and for the same reason rather than as a widening. A YouTube
+    storyboard sheet is a grid of frames on i.ytimg.com that the browser has to
+    crop on a canvas, and the dashboard's CSP is `img-src 'self' data: blob:` —
+    so the browser cannot reach it either. The alternative was to add a third
+    party to `img-src` and `connect-src` permanently, which buys a hostile
+    script an approved exfiltration destination on every page of the app. A
+    sheet is ~25 kB; relaying it costs nothing and keeps the policy shut.
+
     NOT AN OPEN PROXY, in the four ways that matter: it is behind the same API
     key as everything else, it re-runs the full SSRF validation rather than
     trusting that `/content/fetch` already did (the two calls are separate
     requests and a name can be re-pointed between them), it accepts only
-    video and audio content types, and it caps bytes. The response is forced to
-    `application/octet-stream` with a nosniff header so nothing relayed through
-    here can be interpreted as script by the browser that receives it.
+    video, audio and image content types, and it caps bytes. The response is
+    forced to `application/octet-stream` with a nosniff header so nothing
+    relayed through here can be interpreted as script — or as an image — by the
+    browser that receives it.
     """
-    if is_player_url(request.url):
+    # Metered per API key, not per IP: in the deployed topology every request
+    # arrives from the dashboard proxy, so the socket peer is the same for
+    # everyone and the key is the only thing that distinguishes callers. An
+    # unscoped key falls back to a shared bucket, which is the conservative
+    # direction — it throttles the admin key rather than exempting it.
+    client = http.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        http.client.host if http.client else "unknown"
+    )
+    if not _relay_limiter.allow(caller.site_id or "unscoped", client):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many relay requests. This endpoint moves whole media files, "
+                "so it is capped separately from the analysis API."
+            ),
+            headers={"Retry-After": str(int(_relay_limiter.window_s))},
+        )
+    if is_player_url(request.url) and not is_youtube_url(request.url):
         raise HTTPException(
             status_code=422, detail="That is a player page, not a media file."
         )
     try:
-        fetched = await fetch_url(request.url, kinds=("video", "audio"))
+        fetched = await fetch_url(request.url, kinds=("video", "audio", "image"))
     except UnsafeURL as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FetchFailed as exc:

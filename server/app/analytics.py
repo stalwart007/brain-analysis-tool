@@ -192,6 +192,17 @@ def consensus_label(entropy: float, bc: Optional[float]) -> str:
 # ────────────────────────────────────────────────────────── bootstrap
 
 
+#: Below this, a resampled interval is not an interval.
+#:
+#: The guard is the fix, not the estimator choice: at n = 2 this function used
+#: to return the sample RANGE and call it 95% — measured coverage of the range
+#: of two Exponential(1) draws is 46.5%. Named rather than inlined because the
+#: UI has to say WHY an interval is missing, and "fewer than 8" is the whole
+#: reason. `None` from this function has exactly one cause, which is what lets
+#: the frontend explain it without being told the sample size.
+MIN_BOOTSTRAP_N = 8
+
+
 def bootstrap_ci(
     values: Sequence[float],
     iterations: int = 2000,
@@ -255,7 +266,7 @@ def bootstrap_ci(
     near-degenerate remainder.
     """
     n = len(values)
-    if n < 8:
+    if n < MIN_BOOTSTRAP_N:
         return None
     sample_mean = sum(values) / n
     if min(values) == max(values):

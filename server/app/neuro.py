@@ -33,6 +33,7 @@ from typing import AsyncIterator, Optional, Sequence
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import bootstrap_ci, simultaneous_band
 from .modality import UnsupportedAsset, extract_beats
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
@@ -230,6 +231,22 @@ def intersubject_correlation(
         "null_mean_r": round(
             math.tanh(sum(z for z in null_z if z is not None) / max(1, len(null_z))), 4
         ),
+        # The null itself, not just its mean.
+        #
+        # Five hundred permutations are computed to produce `p_value` and then
+        # collapsed to one number, which is the one summary that cannot be
+        # argued with and also the one nobody believes. Shown as a distribution
+        # with the observed statistic standing next to it, "these twins agree
+        # more than chance" stops being a claim and becomes a picture: here is
+        # what agreement looks like when the beats are shuffled, and here is
+        # where this content landed.
+        #
+        # Back-transformed to r rather than shipped as Fisher z, because r is
+        # the axis the observed value is drawn on and asking the client to
+        # tanh() a null is asking it to re-implement the estimator.
+        "null_r_distribution": [
+            round(math.tanh(z), 4) for z in null_z if z is not None
+        ],
         "leave_one_out": loo,
         "grip": grip,
         "method": (
@@ -1043,13 +1060,11 @@ async def stream_content_study(
     }
 
     semaphore = asyncio.Semaphore(SWARM_CONCURRENCY)
-    tasks = [
-        asyncio.create_task(_content_twin(p, segments, request.cognitive_load, semaphore))
-        for p in roster
-    ]
+    dispatch = as_they_land(
+        _content_twin(p, segments, request.cognitive_load, semaphore) for p in roster
+    )
     responses: list[TwinContentResponse] = []
-    for fut in asyncio.as_completed(tasks):
-        resp = await fut
+    async for resp in dispatch:
         if resp is None:
             yield {"type": "agent_failed"}
             continue

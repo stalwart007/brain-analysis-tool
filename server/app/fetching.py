@@ -169,6 +169,11 @@ class Fetched:
     bytes_read: int
     #: Which study modality this content belongs to, decided by content type.
     kind: Optional[str] = None
+    #: What the origin SAID the body weighs, when probing rather than reading.
+    #: Deliberately not folded into `bytes_read`: one is a measurement of bytes
+    #: this process actually counted and the other is an unverified claim, and a
+    #: size cap that trusts the claim is not a cap.
+    declared_length: Optional[int] = None
     #: What the response said it was encoded as. Carried rather than assumed:
     #: decoding a Latin-1 or Shift-JIS page as UTF-8 replaces every non-ASCII
     #: character with U+FFFD, and the beats a study then runs on are the page's
@@ -335,37 +340,36 @@ async def fetch_page(url: str) -> Fetched:
     return fetched
 
 
-async def fetch_url(
-    url: str, kinds: Sequence[str] = tuple(ASSET_KINDS), max_bytes: Optional[int] = None
+async def _guarded_request(
+    url: str,
+    *,
+    allowed_prefixes: tuple[str, ...],
+    cap: int,
+    accept: str,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    body_content_type: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    on_wrong_type: Optional[object] = None,
+    probe: bool = False,
 ) -> Fetched:
-    """Fetch `url` safely, following and revalidating up to MAX_REDIRECTS hops.
+    """The guarded transport. Every byte this process pulls off the internet
+    comes through here, and nothing else opens a socket.
 
-    `kinds` narrows what will be accepted. Every caller states it, because
-    "whatever comes back" is how a study ends up analysing a 404 page: a URL
-    that was meant to be a video and answers with HTML should fail as the wrong
-    kind of thing rather than quietly become a page study of an error message.
+    THE SSRF DEFENCE LIVES HERE AND ONLY HERE. Scheme and port allowlist,
+    resolve every address ourselves, connect to the address we validated rather
+    than to the name, revalidate on every redirect, forward no credentials, cap
+    time and bytes. That is the reason this stayed a single function when the
+    fetcher grew from HTML to five modalities, and it is the reason the JSON
+    path added for YouTube is a POLICY WRAPPER over this rather than a second
+    transport: adding a second fetch path would have doubled the number of
+    places that have to get all of the above right, which is precisely how one
+    of them ends up not.
 
-    The SSRF defence is unchanged and is the reason this stayed a single
-    function when it grew from HTML to five modalities. Scheme and port
-    allowlist, resolve every address ourselves, connect to the address we
-    validated rather than to the name, revalidate on every redirect, forward no
-    credentials, cap time and bytes — all of it applies identically whether the
-    payload turns out to be a landing page or an MP4. Adding a second fetch
-    path for media would have doubled the number of places that have to get
-    that right, which is precisely how one of them ends up not.
+    `on_wrong_type` is a callable taking the served content type and returning
+    the refusal message, so the study-asset wrapper can keep its modality-aware
+    wording without this function knowing what a modality is.
     """
-    allowed_prefixes = tuple(
-        p for k in kinds for p in ASSET_KINDS.get(k, ((), 0))[0]
-    )
-    if not allowed_prefixes:
-        raise UnsafeURL(f"no fetchable content kinds requested (got {list(kinds)!r})")
-    cap = max_bytes or max(ASSET_KINDS[k][1] for k in kinds if k in ASSET_KINDS)
-    # Wildcard families (`video/`, `audio/`) become `video/*` so the header is
-    # a legal media range; concrete types pass through unchanged.
-    accept = ", ".join(
-        dict.fromkeys(p + "*" if p.endswith("/") else p for p in allowed_prefixes)
-    )
-
     hops: list[str] = []
     current = url
 
@@ -388,40 +392,52 @@ async def fetch_url(
             literal = f"[{addr}]" if family == socket.AF_INET6 else addr
             pinned = urlparse(normalised)._replace(netloc=f"{literal}:{port}")
 
-            async def _get(agent: str):
-                return await client.get(
+            async def _send(agent: str):
+                headers = {
+                    # The origin still needs to know which vhost we want,
+                    # and TLS still has to be verified against the NAME —
+                    # `sni_hostname` drives both SNI and certificate
+                    # validation, so pinning the IP does not silently
+                    # downgrade us to an unverified connection.
+                    "Host": host if port in (80, 443) else f"{host}:{port}",
+                    "User-Agent": agent,
+                    # Derived from what the caller will actually accept, not
+                    # hardcoded. This header said `text/html,…` while the
+                    # fetcher had grown to five modalities, and a correctly
+                    # behaved origin honours it: Wikimedia answered 400 and
+                    # w3.org 403 for an image and a PDF, which read as
+                    # "blocking automated access" and were nothing of the
+                    # kind — we asked for HTML and were served the refusal
+                    # we requested.
+                    "Accept": accept,
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+                if body_content_type:
+                    headers["Content-Type"] = body_content_type
+                return await client.request(
+                    method,
                     urlunparse(pinned),
-                    headers={
-                        # The origin still needs to know which vhost we want,
-                        # and TLS still has to be verified against the NAME —
-                        # `sni_hostname` drives both SNI and certificate
-                        # validation, so pinning the IP does not silently
-                        # downgrade us to an unverified connection.
-                        "Host": host if port in (80, 443) else f"{host}:{port}",
-                        "User-Agent": agent,
-                        # Derived from what the caller will actually accept, not
-                        # hardcoded. This header said `text/html,…` while the
-                        # fetcher had grown to five modalities, and a correctly
-                        # behaved origin honours it: Wikimedia answered 400 and
-                        # w3.org 403 for an image and a PDF, which read as
-                        # "blocking automated access" and were nothing of the
-                        # kind — we asked for HTML and were served the refusal
-                        # we requested.
-                        "Accept": accept,
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
+                    content=body,
+                    headers=headers,
                     extensions={"sni_hostname": host},
                 )
 
+            primary = user_agent or USER_AGENT
             try:
-                response = await _get(USER_AGENT)
+                response = await _send(primary)
                 # One retry without the browser costume. Some origins refuse a
                 # Chrome string from a datacentre IP precisely because it is
                 # transparently not Chrome, and the refusal is indistinguishable
                 # from a login wall in the message we would otherwise show.
-                if response.status_code in _UA_RETRY_STATUSES:
+                #
+                # Skipped when the caller pinned a User-Agent: an API client
+                # string like InnerTube's is not a costume to be dropped, it is
+                # the credential that selects the response shape, and re-asking
+                # as someone else returns a DIFFERENT document rather than the
+                # same one unblocked.
+                if response.status_code in _UA_RETRY_STATUSES and user_agent is None:
                     await response.aclose()
-                    response = await _get(BOT_USER_AGENT)
+                    response = await _send(BOT_USER_AGENT)
             except httpx.HTTPError as exc:
                 raise FetchFailed(f"could not reach {host}: {type(exc).__name__}") from exc
 
@@ -437,23 +453,37 @@ async def fetch_url(
                 continue
 
             if response.status_code >= 400:
+                status = response.status_code
                 await response.aclose()
-                raise FetchFailed(f"{host} answered {response.status_code}. {_status_hint(response.status_code)}")
+                raise FetchFailed(f"{host} answered {status}. {_status_hint(status)}")
 
             ctype = response.headers.get("content-type", "").split(";")[0].strip().lower()
             if ctype and not ctype.startswith(allowed_prefixes):
                 await response.aclose()
-                served = kind_for_content_type(ctype)
-                if served:
-                    raise FetchFailed(
-                        f"that URL serves {ctype}, which is a {served}, but this "
-                        f"study is expecting {' or '.join(kinds)}. Switch the "
-                        "content type and paste the link again."
-                    )
-                raise FetchFailed(
-                    f"that URL serves {ctype}, which is not something this "
-                    "platform can study. Supported: web pages, images, video, "
-                    "audio and PDFs."
+                if callable(on_wrong_type):
+                    raise FetchFailed(on_wrong_type(ctype))
+                raise FetchFailed(f"that URL serves {ctype}, which was not expected here.")
+
+            if probe:
+                # Everything the caller wanted is in the headers. Reading the
+                # body would pull down up to eighty megabytes of video in order
+                # to learn a content type — which is what this endpoint used to
+                # do, twice, once here and once again in the relay.
+                declared = response.headers.get("content-length")
+                await response.aclose()
+                return Fetched(
+                    content=b"",
+                    final_url=normalised,
+                    hops=tuple(hops),
+                    content_type=ctype or "application/octet-stream",
+                    # A CLAIM by the server, not a measurement, and named as one
+                    # by `declared_length` rather than being passed off as
+                    # `bytes_read`. The cap is still enforced on real bytes when
+                    # the relay actually pulls them.
+                    bytes_read=0,
+                    declared_length=int(declared) if (declared or "").isdigit() else None,
+                    kind=kind_for_content_type(ctype),
+                    encoding=response.encoding,
                 )
 
             # Streamed with a running total: Content-Length is a claim by the
@@ -484,3 +514,265 @@ async def fetch_url(
     raise FetchFailed(
         f"that URL redirected more than {MAX_REDIRECTS} times without settling"
     )
+
+
+async def fetch_url(
+    url: str,
+    kinds: Sequence[str] = tuple(ASSET_KINDS),
+    max_bytes: Optional[int] = None,
+    *,
+    probe: bool = False,
+) -> Fetched:
+    """Fetch `url` safely as a STUDY ASSET, following up to MAX_REDIRECTS hops.
+
+    `kinds` narrows what will be accepted. Every caller states it, because
+    "whatever comes back" is how a study ends up analysing a 404 page: a URL
+    that was meant to be a video and answers with HTML should fail as the wrong
+    kind of thing rather than quietly become a page study of an error message.
+
+    `probe` stops after the headers — see `probe_url`, which is the name to
+    call it by.
+    """
+    allowed_prefixes = tuple(
+        p for k in kinds for p in ASSET_KINDS.get(k, ((), 0))[0]
+    )
+    if not allowed_prefixes:
+        raise UnsafeURL(f"no fetchable content kinds requested (got {list(kinds)!r})")
+    cap = max_bytes or max(ASSET_KINDS[k][1] for k in kinds if k in ASSET_KINDS)
+    # Wildcard families (`video/`, `audio/`) become `video/*` so the header is
+    # a legal media range; concrete types pass through unchanged.
+    accept = ", ".join(
+        dict.fromkeys(p + "*" if p.endswith("/") else p for p in allowed_prefixes)
+    )
+
+    def _refusal(ctype: str) -> str:
+        served = kind_for_content_type(ctype)
+        if served:
+            return (
+                f"that URL serves {ctype}, which is a {served}, but this "
+                f"study is expecting {' or '.join(kinds)}. Switch the "
+                "content type and paste the link again."
+            )
+        return (
+            f"that URL serves {ctype}, which is not something this "
+            "platform can study. Supported: web pages, images, video, "
+            "audio and PDFs."
+        )
+
+    return await _guarded_request(
+        url,
+        allowed_prefixes=allowed_prefixes,
+        cap=cap,
+        accept=accept,
+        on_wrong_type=_refusal,
+        probe=probe,
+    )
+
+
+async def probe_url(url: str, kinds: Sequence[str] = tuple(ASSET_KINDS)) -> Fetched:
+    """Identify a URL without downloading its body.
+
+    WHY. `/content/fetch` needs one fact about a hosted video — what it is —
+    and used to establish it by pulling the entire file into memory, after
+    which `/content/media` pulled the identical file into memory a second time
+    so the browser could have it. Two full downloads and two copies of up to
+    eighty megabytes resident, to answer a question the response headers had
+    already answered before the first byte of body arrived.
+
+    This is a real GET rather than a HEAD, because origins lie about HEAD far
+    more than they lie about GET — S3-compatible hosts and CDNs routinely
+    answer 403 or 405 to a HEAD for an object they will happily serve — and
+    because the redirect walk has to run identically either way. The body is
+    simply never read: the response is closed as soon as the content type is
+    known, so the connection carries headers and nothing else.
+    """
+    return await fetch_url(url, kinds=kinds, probe=True)
+
+
+#: What a JSON API answers with. Narrow on purpose: this path exists for one
+#: caller (the YouTube manifest) and must not become a general-purpose way to
+#: pull arbitrary documents back through the guard.
+JSON_PREFIXES = ("application/json", "text/json")
+
+#: A metadata document, not a media file. Two orders of magnitude below the
+#: asset caps because an InnerTube player response is ~200 kB and anything
+#: claiming to be far larger is not the document we asked for.
+MAX_JSON_BYTES = 4_000_000
+
+
+async def fetch_json(
+    url: str,
+    *,
+    body: Optional[bytes] = None,
+    user_agent: Optional[str] = None,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> tuple[dict, str]:
+    """POST (or GET) a JSON API through the same guard, returning (doc, final_url).
+
+    The SSRF surface is identical to `fetch_url` because it IS `fetch_url`'s
+    transport — only the accepted content type and the size cap differ. A
+    `body` makes it a POST, which is what InnerTube requires.
+    """
+    import json as _json
+
+    fetched = await _guarded_request(
+        url,
+        allowed_prefixes=JSON_PREFIXES,
+        cap=max_bytes,
+        accept="application/json",
+        method="POST" if body is not None else "GET",
+        body=body,
+        body_content_type="application/json" if body is not None else None,
+        user_agent=user_agent,
+        on_wrong_type=lambda ctype: (
+            f"expected JSON from that endpoint and got {ctype} — it is not the "
+            "API it claims to be, or the request was intercepted."
+        ),
+    )
+    try:
+        doc = _json.loads(fetched.content)
+    except ValueError as exc:
+        raise FetchFailed("that endpoint answered with malformed JSON") from exc
+    if not isinstance(doc, dict):
+        raise FetchFailed("that endpoint answered with JSON that is not an object")
+    return doc, fetched.final_url
+
+
+#: The ONLY destinations reachable through the egress proxy.
+#:
+#: THIS TUPLE IS THE SECURITY BOUNDARY, so it is a constant and never a
+#: parameter. Everywhere else in this module the SSRF defence rests on
+#: resolving the host ourselves and connecting to the ADDRESS we validated —
+#: and that is exactly what a proxy makes impossible, because the proxy does
+#: the resolution and we never see the address. Routing caller-supplied URLs
+#: through it would hand back every hole this file exists to close: the
+#: metadata service, the private 6PN backend, the lot.
+#:
+#: So the proxy is not a general capability. It carries one hardcoded URL,
+#: matched in full, and `proxied_fetch_json` refuses anything else before it
+#: opens a socket. Adding an entry here is a security decision and should read
+#: as one.
+#: Mutated in place, never rebound. A `global` reassignment here would leave
+#: every `from .fetching import PROXY_ALLOWED_URLS` holding the empty set it
+#: captured at import time — which reads as "the allowlist is empty" to a human
+#: auditing it, while the check inside the function sees the populated one. A
+#: security control whose contents differ depending on how you look at it is
+#: worse than a permissive one.
+PROXY_ALLOWED_URLS: set[str] = set()
+
+
+def allow_proxy_url(url: str) -> None:
+    """Register a constant URL as proxy-reachable. Import-time only.
+
+    Called by `app.youtube` for the InnerTube player endpoint. A function
+    rather than a literal in this file so the destination lives beside the code
+    that knows why it needs one, but the ENFORCEMENT stays here, next to the
+    guard it is an exception to.
+    """
+    # Compared without its query string, because the query is where a
+    # caller-controlled value would hide.
+    base, _, _ = url.partition("?")
+    PROXY_ALLOWED_URLS.add(base)
+
+
+async def proxied_fetch_json(
+    url: str,
+    *,
+    proxy: str,
+    body: Optional[bytes] = None,
+    user_agent: Optional[str] = None,
+    max_bytes: int = 4_000_000,
+) -> tuple[dict, str]:
+    """POST a JSON API through an egress proxy, to a constant destination.
+
+    The IP-pinning defence cannot apply here and is not pretended at. What
+    replaces it is that the destination is not caller-controlled at all: the URL
+    must appear in `PROXY_ALLOWED_URLS`, which no request can influence.
+
+    Redirects are NOT followed. Elsewhere they are walked by hand and
+    revalidated; through a proxy there is nothing to revalidate against, so a
+    redirect is a signal that the destination is not what we allowlisted and is
+    treated as a failure rather than a hop.
+    """
+    import json as _json
+
+    base, _, _ = url.partition("?")
+    if base not in PROXY_ALLOWED_URLS:
+        raise UnsafeURL(
+            f"{base} is not an allowlisted proxy destination. The egress proxy "
+            "carries a fixed set of endpoints and cannot be pointed at a URL "
+            "from a request."
+        )
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": user_agent or USER_AGENT,
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        async with httpx.AsyncClient(
+            proxy=proxy,
+            follow_redirects=False,
+            timeout=httpx.Timeout(TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT),
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=0),
+            trust_env=False,
+        ) as client:
+            response = await client.request(
+                "POST" if body is not None else "GET", url, content=body, headers=headers
+            )
+    except httpx.HTTPError as exc:
+        raise FetchFailed(f"egress proxy could not reach the endpoint: {type(exc).__name__}") from exc
+
+    if response.is_redirect:
+        raise FetchFailed("the allowlisted endpoint redirected, which is not expected")
+    if response.status_code >= 400:
+        raise FetchFailed(f"endpoint answered {response.status_code} through the proxy")
+    content = response.content[: max_bytes + 1]
+    if len(content) > max_bytes:
+        raise FetchFailed("the endpoint returned more than the cap through the proxy")
+    try:
+        doc = _json.loads(content)
+    except ValueError as exc:
+        raise FetchFailed("the endpoint answered with malformed JSON through the proxy") from exc
+    if not isinstance(doc, dict):
+        raise FetchFailed("the endpoint answered with JSON that is not an object")
+    return doc, url
+
+
+#: A caption track is served as JSON or as one of two XML dialects depending on
+#: the `fmt` asked for, and which one an origin honours is not knowable in
+#: advance — so the accepted set spans all of them and the PARSER decides.
+TEXT_DOCUMENT_PREFIXES = (
+    "application/json",
+    "text/json",
+    "text/xml",
+    "application/xml",
+    "application/ttml+xml",
+    "text/plain",
+    "text/vtt",
+)
+
+
+async def fetch_text(
+    url: str,
+    *,
+    prefixes: tuple[str, ...] = TEXT_DOCUMENT_PREFIXES,
+    user_agent: Optional[str] = None,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> str:
+    """Fetch a small text document (a caption track) through the same guard.
+
+    Separate from `fetch_json` only because the payload may legitimately be
+    either JSON or XML and the caller parses whichever arrived. The transport,
+    and therefore the entire SSRF surface, is identical.
+    """
+    fetched = await _guarded_request(
+        url,
+        allowed_prefixes=prefixes,
+        cap=max_bytes,
+        accept=", ".join(prefixes),
+        user_agent=user_agent,
+        on_wrong_type=lambda ctype: f"expected a text document and got {ctype}",
+    )
+    return fetched.html

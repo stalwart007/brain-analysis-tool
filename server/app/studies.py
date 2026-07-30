@@ -16,6 +16,7 @@ from typing import Literal
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import (
     auto_cluster,
     pca_2d,
@@ -154,14 +155,13 @@ async def stream_price_sensitivity(
     total = len(personas) * twins_per_persona
     yield {"type": "start", "total": total, "prices": prices}
 
-    tasks = [
-        asyncio.create_task(_price_twin(p, product, prices, cognitive_load, semaphore))
+    dispatch = as_they_land(
+        _price_twin(p, product, prices, cognitive_load, semaphore)
         for p in personas
         for _ in range(twins_per_persona)
-    ]
+    )
     curves: list[list[float]] = []
-    for coro in asyncio.as_completed(tasks):
-        curve = await coro
+    async for curve in dispatch:
         if curve is None:
             yield {"type": "agent_failed"}
             continue
@@ -365,14 +365,13 @@ async def stream_objection_scan(
     total = len(personas) * twins_per_persona
     yield {"type": "start", "total": total}
 
-    tasks = [
-        asyncio.create_task(_objection_twin(p, pitch, cognitive_load, semaphore))
+    dispatch = as_they_land(
+        _objection_twin(p, pitch, cognitive_load, semaphore)
         for p in personas
         for _ in range(twins_per_persona)
-    ]
+    )
     objs: list[TwinObjection] = []
-    for coro in asyncio.as_completed(tasks):
-        o = await coro
+    async for o in dispatch:
         if o is None:
             yield {"type": "agent_failed"}
             continue

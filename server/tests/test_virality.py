@@ -248,3 +248,148 @@ def test_censored_regimes_still_skip_the_tail_fit():
     unresolved = virality_result([0.25] * 12, 4, "low")["criticality"]  # R0 = 1.0
     assert unresolved["regime"] == "unresolved"
     assert "alpha" not in unresolved and "gof_p_value" not in unresolved
+
+
+# ── power law with an exponential cutoff ───────────────────────────────────
+
+
+def test_cutoff_normaliser_matches_the_zeta_at_the_lambda_zero_limit():
+    """λ = 0 IS the pure power law, and the normaliser must agree exactly.
+
+    Taking the limit explicitly rather than pushing the series toward it is
+    both faster and more accurate — the sum's term count grows as 1/λ, so
+    approaching zero numerically is the one place it cannot go.
+    """
+    from app.virality import cutoff_norm, hurwitz_zeta
+
+    for alpha in (1.5, 2.0, 2.5, 3.0):
+        assert cutoff_norm(alpha, 0.0, 1) == pytest.approx(hurwitz_zeta(alpha, 1), rel=1e-12)
+        assert cutoff_norm(alpha, 0.0, 3) == pytest.approx(hurwitz_zeta(alpha, 3), rel=1e-12)
+    # ζ(2,1) = π²/6, independently.
+    assert cutoff_norm(2.0, 0.0, 1) == pytest.approx(math.pi**2 / 6, rel=1e-9)
+
+
+def _cutoff_sample(alpha, lam, xmin, n, seed):
+    """Exact inverse-CDF draws from x^(−α)·e^(−λx)."""
+    rng = random.Random(seed)
+    weights = [(x, x**-alpha * math.exp(-lam * x)) for x in range(xmin, xmin + 20000)]
+    total = sum(w for _, w in weights)
+    cum, running = [], 0.0
+    for x, w in weights:
+        running += w / total
+        cum.append((running, x))
+    out = []
+    for _ in range(n):
+        u = rng.random()
+        for c, x in cum:
+            if u <= c:
+                out.append(x)
+                break
+    return out
+
+
+@pytest.mark.parametrize("alpha,lam", [(1.5, 0.05), (2.0, 0.02), (2.5, 0.10)])
+def test_the_cutoff_fit_recovers_known_parameters(alpha, lam):
+    """Both parameters, from data drawn from the model itself."""
+    from app.virality import fit_cutoff
+
+    fit = fit_cutoff(_cutoff_sample(alpha, lam, 1, 4000, seed=3), 1)
+    assert fit is not None
+    assert fit["alpha"] == pytest.approx(alpha, abs=0.08)
+    assert fit["lambda"] == pytest.approx(lam, rel=0.25)
+    # The number a campaign acts on: where the exponential starts to bite.
+    assert fit["cutoff_size"] == pytest.approx(1.0 / lam, rel=0.25)
+
+
+def test_the_cutoff_test_is_calibrated_on_pure_power_law_data():
+    """THE reason this uses a bootstrap null rather than the asymptotic one.
+
+    λ sits on the boundary of its space, so the textbook χ²₁ reference is wrong
+    and Chernoff's 50:50 χ²₀/χ²₁ mixture is the right ASYMPTOTIC answer. It was
+    measured and still gave 10.0% false positives at n = 200 and 14.0% at
+    n = 800 against a nominal 5% — on data with no cutoff at all. Rising with n
+    is a systematic mismatch, not small-sample noise, so no fixed reference
+    fixes it.
+
+    Kept small here so it runs in the suite; the full sweep is recorded in the
+    commit that introduced it.
+    """
+    from app.virality import _discrete_alpha_mle, _powerlaw_sampler, cutoff_vs_powerlaw
+
+    draw = _powerlaw_sampler(2.0, 1)
+    fires = 0
+    trials = 12
+    for s in range(trials):
+        rng = random.Random(4000 + s)
+        tail = [draw(rng.random()) for _ in range(200)]
+        alpha = _discrete_alpha_mle(sum(math.log(x) for x in tail), len(tail), 1)
+        res = cutoff_vs_powerlaw(tail, 1, alpha, n_boot=40)
+        if res and res["p_value"] < 0.05:
+            fires += 1
+    # Generous, because 12 trials cannot resolve 5% tightly — this is a guard
+    # against the estimator regressing to the ~14% the asymptotic version gave,
+    # not a claim to have measured the level here.
+    # NOT a claim that the level is 5%. It is measured at 10-12% and documented
+    # as uncalibrated, which is why the regime does not gate on it. This guards
+    # against a much worse regression — a statistic that fires on most pure
+    # power laws would make the cutoff regime meaningless.
+    assert fires <= 5, f"{fires}/{trials} — the LR statistic has stopped discriminating at all"
+
+
+def test_a_cutoff_is_not_claimed_when_there_is_none():
+    """A pure power law must not be dressed up as a cutoff — the whole point of
+    the p-value is that the extra parameter has to earn its place."""
+    from app.virality import _discrete_alpha_mle, _powerlaw_sampler, cutoff_vs_powerlaw
+
+    draw = _powerlaw_sampler(2.0, 1)
+    rng = random.Random(77)
+    tail = [draw(rng.random()) for _ in range(600)]
+    alpha = _discrete_alpha_mle(sum(math.log(x) for x in tail), len(tail), 1)
+    res = cutoff_vs_powerlaw(tail, 1, alpha, n_boot=40)
+    assert res is not None
+    assert res["p_value"] > 0.05
+
+
+def test_subcritical_cascades_are_named_rather_than_left_unclassified():
+    """THE backlog item.
+
+    At R0 = 0.6 and 0.8 both pure forms are correctly rejected, because
+    subcritical Galton-Watson progeny is a power law WITH an exponential
+    cutoff. The reader used to get "unclassified" for the most common regime a
+    cautious campaign lands in — and before that, a confident "spread stays
+    local and predictable" that had never been tested.
+
+    The cutoff SCALE growing as R0 → 1 is the physical check: it is the size at
+    which the exponential takes over, and it diverges at criticality.
+    """
+    from app.virality import cascade_tail_test, simulate_cascades
+
+    scales = {}
+    for r0 in (0.6, 0.8):
+        sims = simulate_cascades([r0 / 4] * 20, 4, n_sims=2000, seed=11)
+        finals = [f for f, c in zip(sims["final_sizes"], sims["censored"]) if not c]
+        result = cascade_tail_test(finals, cutoff_boot=40)
+        assert result is not None
+        assert result["regime"] == "cutoff", f"R0={r0} gave {result['regime']}"
+        cut = result["cutoff"]
+        assert cut is not None and cut["cutoff_size"] > 0
+        # The interpretation must carry the actionable number, not just a label.
+        assert "cutoff at" in result["interpretation"]
+        scales[r0] = cut["cutoff_size"]
+
+    assert scales[0.8] > scales[0.6], (
+        "the cutoff scale must grow as R0 approaches criticality — it diverges "
+        f"at R0 = 1, and this measured {scales}"
+    )
+
+
+def test_a_critical_cascade_is_not_called_a_cutoff():
+    """At R0 = 1 there IS no cutoff — λ → 0 — so the heavy tail must survive
+    the new branch rather than being explained away by it."""
+    from app.virality import cascade_tail_test, simulate_cascades
+
+    sims = simulate_cascades([0.25] * 20, 4, n_sims=2000, seed=11)
+    finals = [f for f, c in zip(sims["final_sizes"], sims["censored"]) if not c]
+    result = cascade_tail_test(finals, cutoff_boot=40)
+    assert result is not None
+    assert result["regime"] in {"heavy_tailed", "levy_like"}

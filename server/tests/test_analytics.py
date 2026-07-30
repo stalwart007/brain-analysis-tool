@@ -673,3 +673,28 @@ def test_benjamini_hochberg_is_monotone_and_passes_none_through():
     assert out["q_values"][1] is None and out["q_values"][4] is None
     assert out["n_tests"] == 4
     assert all(q <= 1.0 for q in qs)
+
+
+def test_the_bootstrap_floor_is_named_and_matches_the_frontend():
+    """The threshold is duplicated in `dashboard/src/components/Interval.tsx`,
+    which uses it to explain WHY an interval is absent. A drift would have the
+    UI cite a number the estimator does not use — and the whole point of that
+    message is that it tells a reader exactly how many more twins to run.
+    """
+    import pathlib
+    import re
+
+    from app.analytics import MIN_BOOTSTRAP_N, bootstrap_ci
+
+    assert bootstrap_ci([0.5] * (MIN_BOOTSTRAP_N - 1)) is None
+    assert bootstrap_ci([i / 10 for i in range(MIN_BOOTSTRAP_N)]) is not None
+
+    ui = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "dashboard/src/components/Interval.tsx"
+    )
+    if not ui.exists():          # server-only checkout
+        return
+    found = re.search(r"MIN_BOOTSTRAP_N\s*=\s*(\d+)", ui.read_text())
+    assert found, "the frontend must keep a named copy of the floor"
+    assert int(found.group(1)) == MIN_BOOTSTRAP_N

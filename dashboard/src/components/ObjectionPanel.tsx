@@ -4,7 +4,7 @@ import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import dynamic from "next/dynamic";
 import { CognitiveLoad, ObjectionResult } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
@@ -21,6 +21,7 @@ const SENTIMENT_COLOR: Record<string, string> = {
 
 export default function ObjectionPanel({ personaCount }: { personaCount: number }) {
   const entrance = useEntranceEnabled();
+  const streamRun = useStreamRun();
   const [pitch, setPitch] = useState("");
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");

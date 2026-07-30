@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Interval from "./Interval";
 import { motion } from "framer-motion";
 import { api, CalibrationReport, MetricCalibration, SwarmRunRow } from "@/lib/api";
 
@@ -154,24 +155,6 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
  *  scores showing through, not precision — bootstrap_ci returns (0.5, 0.5) for
  *  a unanimous sample at any n — and a null one means the sample was too small
  *  to resample at all. Both used to degrade silently to a bare number. */
-function Interval({ ci }: { ci?: [number, number] | null }) {
-  if (!ci) return <span className="text-muted"> · interval n/a</span>;
-  const [lo, hi] = ci;
-  if (hi - lo <= 0) {
-    return (
-      <span className="text-muted" title="Every observation was identical, so the bootstrap has no sampling spread to report — this is not a tight interval.">
-        {" "}· no observed spread
-      </span>
-    );
-  }
-  return (
-    <span className="text-muted">
-      {" "}
-      · [{lo.toFixed(3)}, {hi.toFixed(3)}]
-    </span>
-  );
-}
-
 /**
  * The reliability diagram: where along the range the predictor drifts.
  *

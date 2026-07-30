@@ -1,23 +1,32 @@
 "use client";
 
 /**
- * Build a ContentAsset from whatever form the content actually exists in.
+ * Get content into the study. One box, whatever form the content is in.
  *
- * Everything here happens in the BROWSER, including video keyframe extraction.
- * That is a deliberate boundary, not a shortcut: decoding caller-supplied
- * media server-side means running a decoder on untrusted input, which is a
- * large and historically hostile attack surface. The browser already has a
- * video decoder and already has permission to read the user's own files.
+ * WHAT THIS USED TO BE, and why it changed. Six modalities each owned an
+ * input, behind a content-type radio that had to be set correctly BEFORE
+ * anything would be read: a YouTube box, a video-link box, a page-link box, a
+ * PDF-link box, an audio-link box, a file picker per kind. Six ways to paste a
+ * link into the same product, and a picker that acted as a gate — classify
+ * your own URL first, and be told off if you got it wrong.
  *
- * The one exception is a landing page URL, which the browser CANNOT fetch —
- * cross-origin reads are blocked, and no amount of wanting changes that. So
- * that single case goes through `POST /v1/content/fetch`, which is guarded
- * against SSRF rather than being refused outright. `ContentAsset` still has no
- * `url` field: the fetch is its own step, and what comes back is submitted as
- * ordinary `page` text.
+ * The classification was never the researcher's job, and they are worse at it
+ * than the server is: `…/promo.mp4` served as HTML is a player page, `…/x?id=9`
+ * served as image/png is an image, and looking at either URL tells you
+ * nothing. So `UniversalInput` takes anything — a link of any kind, pasted
+ * copy, or a file — the server says what it actually is, and the picker below
+ * becomes a READOUT of that answer rather than a question asked in advance.
+ *
+ * WHAT SURVIVES PER MODALITY. Only the genuine extras, and only once the kind
+ * is known: a transcript box for audio and video (nothing in this pipeline
+ * transcribes, so for audio it is the actual input), a pages box for a deck,
+ * and a brief. These are REFINEMENTS to an asset that already exists, not
+ * alternative front doors to the product.
  */
 
-import { useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import UniversalInput, { type ResolvedAsset } from "./content/UniversalInput";
+import { VideoReceipt, type YouTubeManifest } from "./content/YouTubeIngest";
 
 export type AssetKind = "text" | "image" | "video" | "audio" | "page" | "document";
 
@@ -40,208 +49,12 @@ export interface ContentAsset {
 
 export const KINDS: { id: AssetKind; label: string; hint: string }[] = [
   { id: "text", label: "Script / copy", hint: "a video script, ad copy, an article" },
-  { id: "image", label: "Image", hint: "a static ad, poster, banner — upload or paste a link" },
-  { id: "video", label: "Video", hint: "upload or paste a link; keyframes are extracted in your browser" },
+  { id: "image", label: "Image", hint: "a static ad, poster, banner" },
+  { id: "video", label: "Video", hint: "keyframes are read in your browser" },
   { id: "audio", label: "Audio", hint: "a transcript, with timings if you have them" },
-  { id: "page", label: "Landing page", hint: "paste a link — we read the page for you" },
-  { id: "document", label: "Deck / document", hint: "paste a PDF link, or one block per slide" },
+  { id: "page", label: "Landing page", hint: "prose read in the order a scroller meets it" },
+  { id: "document", label: "Deck / document", hint: "one beat per page" },
 ];
-
-/** What came back from POST /content/fetch, whatever kind it turned out to be. */
-export interface FetchedAsset {
-  kind: AssetKind;
-  final_url: string;
-  hops: string[];
-  bytes: number;
-  content_type: string;
-  note?: string;
-  sections?: string[];
-  pages?: string[];
-  page_count?: number;
-  asset: Partial<ContentAsset>;
-  media_relay?: string;
-}
-
-/**
- * Paste a link, get an asset — for every modality, not just landing pages.
- *
- * The server decides what the URL actually IS from its content type and hands
- * back either a ready asset (image, PDF, page) or a pointer to the media relay
- * (video, audio). Nothing here guesses from the file extension, because the
- * server does not either: a `.mp4` served as HTML is a player page.
- */
-export function LinkInput({
-  kind,
-  onResolved,
-  disabled,
-  placeholder,
-}: {
-  kind: AssetKind;
-  onResolved: (fetched: FetchedAsset) => void | Promise<void>;
-  disabled?: boolean;
-  placeholder: string;
-}) {
-  const [url, setUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    const target = url.trim();
-    if (!target) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/cs/content/fetch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // Sent as typed. Adding a scheme here would mean guessing https for a
-        // host that only serves http and reporting the wrong failure.
-        body: JSON.stringify({ url: target }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(data?.detail ?? `Could not fetch that link (${res.status})`);
-      // The server may disagree with the picker about what this is — a link
-      // chosen under "Video" that resolves to an image is an image. Surfacing
-      // that beats studying the wrong thing silently.
-      if (data.kind !== kind) {
-        throw new Error(
-          `That link is ${data.kind === "page" ? "a web page" : `a ${data.kind}`} ` +
-            `(${data.content_type}), not ${kind === "image" ? "an image" : `a ${kind}`}. ` +
-            `Switch the content type above, or paste a different link.`
-        );
-      }
-      await onResolved(data as FetchedAsset);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not fetch that link");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          type="url"
-          inputMode="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              if (!busy && url.trim()) load();
-            }
-          }}
-          disabled={disabled || busy}
-          placeholder={placeholder}
-          aria-label={`${kind} URL`}
-          className="min-w-56 flex-1 rounded-lg border border-hairline bg-surface-2 px-3 py-2 text-sm outline-none placeholder:text-muted focus:border-accent/60 disabled:opacity-50"
-        />
-        <button
-          type="button"
-          onClick={load}
-          disabled={disabled || busy || !url.trim()}
-          className="rounded-lg border border-hairline px-3 py-2 text-xs text-ink-2 transition hover:border-accent/50 hover:text-ink disabled:opacity-40"
-        >
-          {busy ? "fetching…" : "fetch"}
-        </button>
-      </div>
-      {error && <p className="text-[11px] leading-relaxed text-critical">{error}</p>}
-    </div>
-  );
-}
-
-/** Provenance strip: what was actually retrieved, before any twins are spent. */
-function FetchReceipt({ fetched }: { fetched: FetchedAsset }) {
-  const redirected = fetched.hops.length > 1;
-  return (
-    <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
-      <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
-        <span className="text-good">✓ {fetched.kind}</span>
-        <span className="text-muted">{(fetched.bytes / 1024).toFixed(0)} kB</span>
-        <span className="text-muted">{fetched.content_type}</span>
-        {/* Where we ENDED UP, which is not always where they pointed — an apex
-            that lands on a regional or consent URL is a different asset from
-            the one they meant to study. */}
-        <span className="truncate text-muted">{fetched.final_url}</span>
-        {redirected && (
-          <span className="text-accent-2">· redirected {fetched.hops.length - 1}×</span>
-        )}
-      </div>
-      {fetched.note && (
-        <p className="mt-1 font-mono text-[9px] leading-relaxed text-muted">{fetched.note}</p>
-      )}
-    </div>
-  );
-}
-
-/** Sampled evenly across the duration. Ten frames over a 30s spot is one every
- *  three seconds — finer than the beat structure the study can resolve, and
- *  each one costs a vision call, so more is spend without resolution. */
-const FRAME_COUNT = 8;
-
-async function fileToBase64(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  let binary = "";
-  const bytes = new Uint8Array(buf);
-  // Chunked: String.fromCharCode(...bytes) blows the argument limit and throws
-  // a RangeError on anything above a few hundred kB.
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
-}
-
-async function extractKeyframes(
-  file: File,
-  onProgress: (done: number, total: number) => void
-): Promise<{ t_ms: number; image_b64: string; media_type: string }[]> {
-  const video = document.createElement("video");
-  video.preload = "auto";
-  video.muted = true;
-  video.src = URL.createObjectURL(file);
-
-  await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error("Could not decode that video in this browser."));
-  });
-
-  const duration = video.duration;
-  if (!Number.isFinite(duration) || duration <= 0) {
-    URL.revokeObjectURL(video.src);
-    throw new Error("That video reports no duration, so frames cannot be sampled.");
-  }
-
-  const canvas = document.createElement("canvas");
-  const scale = Math.min(1, 640 / (video.videoWidth || 640));
-  canvas.width = Math.max(1, Math.round((video.videoWidth || 640) * scale));
-  canvas.height = Math.max(1, Math.round((video.videoHeight || 360) * scale));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas is unavailable in this browser.");
-
-  const frames: { t_ms: number; image_b64: string; media_type: string }[] = [];
-  for (let i = 0; i < FRAME_COUNT; i++) {
-    // Sample at beat centres, not at 0 and the very end: the first frame of a
-    // cut is often black and the last is often a logo card, and both would be
-    // described as if they were the content.
-    const t = (duration * (i + 0.5)) / FRAME_COUNT;
-    await new Promise<void>((resolve) => {
-      video.onseeked = () => resolve();
-      video.currentTime = t;
-    });
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
-    frames.push({
-      t_ms: Math.round(t * 1000),
-      image_b64: dataUrl.split(",")[1],
-      media_type: "image/jpeg",
-    });
-    onProgress(i + 1, FRAME_COUNT);
-  }
-  URL.revokeObjectURL(video.src);
-  return frames;
-}
 
 /** `00:12 text` or `12.5 text` per line. Lines without a stamp become cues
  *  with no timing, which downgrades the axis from temporal to sequential
@@ -262,27 +75,87 @@ export function parseCues(raw: string): { cues: TranscriptCue[]; timed: boolean 
   return { cues: timed ? cues.filter((c) => c.t_ms >= 0) : [], timed };
 }
 
+/** Provenance strip: what was actually retrieved, before any twins are spent.
+ *
+ *  A study that silently ran against a cookie wall is worse than one that
+ *  refused, because it produces numbers that look fine. */
+function Receipt({ receipt, kind }: { receipt: ResolvedAsset["receipt"]; kind: AssetKind }) {
+  const redirected = receipt.hops.length > 1;
+  return (
+    <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
+      <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
+        <span className="text-good">✓ {kind}</span>
+        {receipt.bytes > 0 && <span className="text-muted">{(receipt.bytes / 1024).toFixed(0)} kB</span>}
+        {receipt.contentType && <span className="text-muted">{receipt.contentType}</span>}
+        {/* Where we ENDED UP, which is not always where they pointed — an apex
+            that lands on a regional or consent URL is a different asset from
+            the one they meant to study. */}
+        <span className="truncate text-muted">{receipt.finalUrl}</span>
+        {redirected && <span className="text-accent-2">· redirected {receipt.hops.length - 1}×</span>}
+      </div>
+      {/* The rung, when the server had to settle for less than the content
+          itself. This is the difference between a study of a video and a study
+          of its thumbnail, and it is never allowed to be implicit. */}
+      {receipt.rung && receipt.rung !== "video" && (
+        <p className="mt-1.5 rounded border border-[#f2ad1f]/40 bg-[#f2ad1f]/[0.07] px-2 py-1 font-mono text-[9px] leading-relaxed text-[#f2ad1f]">
+          <b className="uppercase tracking-wider">{receipt.rung} study</b> — this reads what the
+          page publishes about itself, not the content behind it.
+        </p>
+      )}
+      {receipt.note && (
+        <p className="mt-1 font-mono text-[9px] leading-relaxed text-muted">{receipt.note}</p>
+      )}
+      {receipt.sections && receipt.sections.length > 0 && (
+        <ol className="mt-1.5 space-y-0.5">
+          {receipt.sections.slice(0, 4).map((s, i) => (
+            <li key={i} className="truncate text-[11px] leading-snug text-ink-2">
+              <span className="mr-1 font-mono text-[9px] text-muted">{i + 1}</span>
+              {s}
+            </li>
+          ))}
+          {receipt.sections.length > 4 && (
+            <li className="font-mono text-[9px] text-muted">
+              +{receipt.sections.length - 4} more
+            </li>
+          )}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 export function AssetInput({
   kind,
   asset,
   onChange,
+  onKindChange,
   disabled,
+  onYouTube,
 }: {
   kind: AssetKind;
   asset: ContentAsset;
   onChange: (a: ContentAsset) => void;
+  /** The picker is a readout, so the component that owns `kind` has to accept
+   *  it changing as a RESULT of ingest rather than only as a click. */
+  onKindChange: (k: AssetKind) => void;
   disabled?: boolean;
+  onYouTube?: (manifest: YouTubeManifest | null) => void;
 }) {
-  const [note, setNote] = useState<string | null>(null);
-  const [working, setWorking] = useState(false);
-  const [fetched, setFetched] = useState<FetchedAsset | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const [receipt, setReceipt] = useState<ResolvedAsset["receipt"] | null>(null);
+  const [manifest, setManifest] = useState<YouTubeManifest | null>(null);
+  const [detected, setDetected] = useState(false);
+
+  // `direct` means the server read the content itself and there is nothing to
+  // warn about; anything else means it settled for less than what was asked
+  // for, and the picker says so rather than only the receipt.
+  const rung = manifest?.rung ?? receipt?.rung;
+  const degradedRung = rung && rung !== "video" && rung !== "direct" ? rung : null;
 
   const textarea = (
     placeholder: string,
     value: string,
     set: (v: string) => void,
-    rows = 6
+    rows = 4
   ) => (
     <textarea
       value={value}
@@ -294,294 +167,179 @@ export function AssetInput({
     />
   );
 
-  if (kind === "image" || kind === "video") {
-    const isVideo = kind === "video";
-    return (
-      <div className="space-y-3">
-        <input
-          ref={fileRef}
-          type="file"
-          accept={isVideo ? "video/*" : "image/*"}
-          disabled={disabled || working}
-          className="block w-full text-xs text-muted file:mr-3 file:rounded-lg file:border file:border-hairline file:bg-surface-2 file:px-3 file:py-1.5 file:text-xs file:text-ink-2"
-          onChange={async (e) => {
-            const file = e.target.files?.[0];
-            if (!file) return;
-            setWorking(true);
-            setNote(null);
-            setFetched(null);
-            try {
-              if (isVideo) {
-                const frames = await extractKeyframes(file, (d, t) =>
-                  setNote(`extracting keyframe ${d} of ${t}…`)
-                );
-                onChange({ ...asset, kind, frames });
-                setNote(`${frames.length} keyframes extracted in your browser`);
-              } else {
-                const b64 = await fileToBase64(file);
-                onChange({ ...asset, kind, image_b64: b64, media_type: file.type || "image/png" });
-                setNote(`${file.name} · ${(file.size / 1024).toFixed(0)} kB`);
-              }
-            } catch (err) {
-              setNote(err instanceof Error ? err.message : "Could not read that file.");
-            } finally {
-              setWorking(false);
-            }
-          }}
-        />
-
-        <div className="flex items-center gap-2">
-          <span className="h-px flex-1 bg-hairline" />
-          <span className="font-mono text-[9px] uppercase tracking-wider text-muted">
-            or paste a link
-          </span>
-          <span className="h-px flex-1 bg-hairline" />
-        </div>
-
-        <LinkInput
-          kind={kind}
-          disabled={disabled || working}
-          placeholder={
-            isVideo ? "https://cdn.yoursite.com/spot.mp4" : "https://yoursite.com/hero-ad.png"
-          }
-          onResolved={async (f) => {
-            setFetched(f);
-            setNote(null);
-            if (!isVideo) {
-              // An image arrives complete — the server already base64'd it.
-              onChange({ ...asset, kind, ...f.asset });
-              return;
-            }
-            // A video does NOT. The server relays the bytes and the BROWSER
-            // decodes them, which is the same boundary the upload path
-            // respects: no media decoder ever runs in the API process.
-            setWorking(true);
-            try {
-              setNote("downloading through the relay…");
-              const res = await fetch("/api/cs/content/media", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: f.final_url }),
-              });
-              if (!res.ok) throw new Error(`Relay failed (${res.status})`);
-              const blob = await res.blob();
-              const file = new File([blob], "remote-video", {
-                type: f.content_type || "video/mp4",
-              });
-              const frames = await extractKeyframes(file, (d, t) =>
-                setNote(`extracting keyframe ${d} of ${t}…`)
-              );
-              onChange({ ...asset, kind, frames });
-              setNote(`${frames.length} keyframes extracted in your browser`);
-            } catch (err) {
-              setNote(
-                err instanceof Error
-                  ? `${err.message} — try downloading the file and uploading it.`
-                  : "Could not decode that video."
-              );
-            } finally {
-              setWorking(false);
-            }
-          }}
-        />
-        {fetched && <FetchReceipt fetched={fetched} />}
-
-        {note && <p className="font-mono text-[11px] text-accent">{note}</p>}
-        {isVideo &&
-          textarea(
-            "Optional transcript, one line per cue:\n0:03 Your tools were supposed to help\n0:11 One clean interface slides in",
-            asset.transcript_cues?.map((c) => `${(c.t_ms / 1000).toFixed(1)} ${c.text}`).join("\n") ?? "",
-            (v) => onChange({ ...asset, transcript_cues: parseCues(v).cues }),
-            4
-          )}
-        {textarea(
-          "Optional brief — what is this asset for, who is it aimed at?",
-          asset.brief ?? "",
-          (v) => onChange({ ...asset, brief: v }),
-          2
-        )}
-      </div>
-    );
-  }
-
-  if (kind === "audio") {
-    return (
-      <div className="space-y-2">
-        <LinkInput
-          kind="audio"
-          disabled={disabled}
-          placeholder="https://cdn.yoursite.com/episode.mp3"
-          onResolved={(f) => {
-            setFetched(f);
-            // A reachable audio file is confirmed here, but the STUDY still
-            // needs a transcript: nothing in this pipeline transcribes, and
-            // inventing beats from a waveform would be fabricating the content
-            // rather than analysing it. The receipt says the link is good; the
-            // transcript box below is still the input.
-            onChange({ ...asset, kind: "audio" });
-          }}
-        />
-        {fetched && <FetchReceipt fetched={fetched} />}
-        {textarea(
-          "Transcript. Prefix each line with a timestamp to get a timeline:\n0:00 Welcome back to the show\n0:14 Today we are talking about…",
-          asset.transcript_cues?.length
-            ? asset.transcript_cues.map((c) => `${(c.t_ms / 1000).toFixed(1)} ${c.text}`).join("\n")
-            : asset.text ?? "",
-          (v) => {
-            const { cues, timed } = parseCues(v);
-            // Untimed transcripts stay as plain text so the server treats them
-            // as a sequence rather than fabricating a clock.
-            onChange(timed ? { ...asset, transcript_cues: cues, text: undefined } : { ...asset, text: v, transcript_cues: [] });
-          },
-          8
-        )}
-        <p className="font-mono text-[10px] text-muted">
-          with timestamps → a timeline (retention in seconds) · without → an
-          ordered transcript (retention per beat)
-        </p>
-      </div>
-    );
-  }
-
-  if (kind === "document") {
-    return (
-      <div className="space-y-2">
-        <LinkInput
-          kind="document"
-          disabled={disabled}
-          placeholder="https://yoursite.com/deck.pdf"
-          onResolved={(f) => {
-            setFetched(f);
-            // Pages arrive already separated by the document itself. That is a
-            // FACT about the file, not an inference — re-segmenting a deck with
-            // a model would replace it with a guess.
-            onChange({ ...asset, kind: "document", pages: f.pages ?? [] });
-          }}
-        />
-        {fetched && <FetchReceipt fetched={fetched} />}
-        <div className="flex items-center gap-2">
-          <span className="h-px flex-1 bg-hairline" />
-          <span className="font-mono text-[9px] uppercase tracking-wider text-muted">
-            or paste the pages
-          </span>
-          <span className="h-px flex-1 bg-hairline" />
-        </div>
-        {textarea(
-          "One slide or page per block, separated by a blank line.",
-          (asset.pages ?? []).join("\n\n"),
-          (v) => onChange({ ...asset, pages: v.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean) }),
-          8
-        )}
-        <p className="font-mono text-[10px] text-muted">
-          {(asset.pages ?? []).length} page{(asset.pages ?? []).length === 1 ? "" : "s"} detected
-        </p>
-      </div>
-    );
-  }
-
-  if (kind === "page") {
-    return (
-      <PageInput asset={asset} onChange={onChange} textarea={textarea} />
-    );
-  }
-
-  return textarea(
-    "Paste a video script, storyboard, ad copy, or article.",
-    asset.text ?? "",
-    (v) => onChange({ ...asset, text: v }),
-    6
-  );
-}
-
-/**
- * A landing page, from a link.
- *
- * The obvious version of this screen asked for HTML, which meant telling a
- * researcher to open DevTools and copy `outerHTML`. Nobody does that. They
- * paste a link, so this pastes a link — the server fetches it behind an SSRF
- * guard and hands back the markup.
- *
- * The fetch is a SEPARATE step from the study on purpose. It shows what came
- * back — the final URL after redirects, and the actual sections found — before
- * any twin calls are spent. A study that silently ran against a cookie wall is
- * worse than one that refused, because it produces numbers that look fine.
- *
- * Pasting HTML directly still works, for pages behind a login.
- */
-function PageInput({
-  asset,
-  onChange,
-  textarea,
-}: {
-  asset: ContentAsset;
-  onChange: (a: ContentAsset) => void;
-  textarea: (ph: string, value: string, set: (v: string) => void, rows?: number) => ReactNode;
-}) {
-  const [fetched, setFetched] = useState<FetchedAsset | null>(null);
-  const [manual, setManual] = useState(false);
-
   return (
-    <div className="space-y-2">
-      <LinkInput
-        kind="page"
-        placeholder="https://yourproduct.com/landing"
-        onResolved={(f) => {
-          setFetched(f);
-          // The server returns extracted prose, not the page: real marketing
-          // HTML runs to megabytes and would blow the asset's text limit.
-          onChange({ ...asset, text: f.asset.text ?? "" });
+    <div className="space-y-3">
+      <UniversalInput
+        disabled={disabled}
+        onText={(text) => {
+          // Prose could be a script, an article or ad copy, and no inspection
+          // distinguishes them — this is the one case the picker is genuinely
+          // the researcher's to set, so a CHOSEN kind is respected.
+          //
+          // A DETECTED one is not, and the difference matters. After resolving
+          // a link the picker holds an answer the server produced; pasting a
+          // script next inherited it, so three scenes of copy were studied as a
+          // "Landing page" because the previous thing in the box happened to be
+          // one. Detection is about the last asset, not this one, so it is
+          // dropped rather than carried forward.
+          const next: AssetKind = !detected && (kind === "text" || kind === "page") ? kind : "text";
+          setReceipt(null);
+          setManifest(null);
+          setDetected(false);
+          onKindChange(next);
+          onChange({ kind: next, text });
+          onYouTube?.(null);
+        }}
+        onResolved={(r) => {
+          setReceipt(r.receipt);
+          setManifest(r.manifest ?? null);
+          setDetected(true);
+          onKindChange(r.kind);
+          // REPLACED, not merged. Spreading the previous asset carried its
+          // fields into the new one — resolve a video, then an image, and the
+          // image asset still had eight keyframes hanging off it. The kind
+          // decides which field the server reads, so the stale ones were
+          // invisible rather than harmless: they travelled with every
+          // subsequent request and would be picked up the moment the picker
+          // was clicked back.
+          onChange({ ...r.asset, kind: r.kind } as ContentAsset);
+          onYouTube?.(r.manifest ?? null);
         }}
       />
 
-      {fetched && (
-        <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
-          <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
-            <span className="text-good">✓ {(fetched.sections ?? []).length} sections</span>
-            {/* Where we ENDED UP, which is not always where they pointed —
-                an apex that lands on a regional or consent URL is a different
-                page from the one they meant to study. */}
-            <span className="truncate text-muted">{fetched.final_url}</span>
-            {fetched.hops.length > 1 && (
-              <span className="text-accent-2">· redirected {fetched.hops.length - 1}×</span>
-            )}
-          </div>
-          <ol className="mt-1.5 space-y-0.5">
-            {(fetched.sections ?? []).slice(0, 4).map((s, i) => (
-              <li key={i} className="truncate text-[11px] leading-snug text-ink-2">
-                <span className="mr-1 font-mono text-[9px] text-muted">{i + 1}</span>
-                {s}
-              </li>
-            ))}
-            {(fetched.sections ?? []).length > 4 && (
-              <li className="font-mono text-[9px] text-muted">
-                +{(fetched.sections ?? []).length - 4} more
-              </li>
-            )}
-          </ol>
-          <p className="mt-1.5 font-mono text-[9px] leading-relaxed text-muted">
-            In DOM order — the order a scroller meets them. Hidden elements and
-            unopened menus are excluded, so this is what a visitor sees.
+      {/* DETECTED, not selected. Still clickable, because a resolved asset can
+          legitimately be studied two ways — page prose is also just text — and
+          because the pasted-prose case has no detectable answer. */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {/* The label carries the warning, not just the receipt below it.
+            When a YouTube link degrades to its thumbnail the picker jumps from
+            Script/copy to Image on its own, and that jump is what the eye is
+            on — reported as "feels weird" by someone watching it happen, with
+            the explanation sitting three lines lower in 9px amber. A picker
+            that moves silently is the problem; one that says why it moved is
+            the product doing the work. */}
+        {detected && degradedRung ? (
+          <span className="hud-label mr-1 text-[#f2ad1f]">
+            DETECTED · {degradedRung === "metadata" ? "PREVIEW ONLY" : `${degradedRung} ONLY`}
+          </span>
+        ) : (
+          <span className="hud-label mr-1 text-muted">{detected ? "DETECTED" : "STUDY AS"}</span>
+        )}
+        {KINDS.map((k) => {
+          const on = kind === k.id;
+          return (
+            <button
+              key={k.id}
+              type="button"
+              role="radio"
+              aria-checked={on}
+              title={k.hint}
+              disabled={disabled}
+              onClick={() => onKindChange(k.id)}
+              className={`rounded-lg border px-2.5 py-1 text-[11px] transition ${
+                on
+                  ? "border-accent/60 bg-accent/[0.10] text-ink"
+                  : "border-hairline text-muted hover:border-accent/40 hover:text-ink-2"
+              }`}
+            >
+              {k.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {manifest ? <VideoReceipt manifest={manifest} /> : receipt && <Receipt receipt={receipt} kind={kind} />}
+
+      {/* ── refinements, per kind, only once there is something to refine ── */}
+
+      {kind === "audio" && (
+        <div className="space-y-1.5">
+          {textarea(
+            "Transcript. Prefix each line with a timestamp to get a timeline:\n0:00 Welcome back to the show\n0:14 Today we are talking about…",
+            asset.transcript_cues?.length
+              ? asset.transcript_cues.map((c) => `${(c.t_ms / 1000).toFixed(1)} ${c.text}`).join("\n")
+              : asset.text ?? "",
+            (v) => {
+              const { cues, timed } = parseCues(v);
+              // Untimed transcripts stay as plain text so the server treats
+              // them as a sequence rather than fabricating a clock.
+              onChange(
+                timed
+                  ? { ...asset, transcript_cues: cues, text: undefined }
+                  : { ...asset, text: v, transcript_cues: [] }
+              );
+            },
+            8
+          )}
+          <p className="font-mono text-[10px] text-muted">
+            Nothing here transcribes audio, so this is the actual input — with
+            timestamps → a timeline (retention in seconds), without → an ordered
+            transcript (retention per beat).
           </p>
         </div>
       )}
 
-      {!fetched && !manual && (
-        <p className="font-mono text-[10px] leading-relaxed text-muted">
-          Paste a link and we read the page for you.{" "}
-          <button type="button" onClick={() => setManual(true)} className="underline hover:text-ink-2">
-            or paste HTML
-          </button>{" "}
-          — for pages behind a login.
-        </p>
+      {kind === "video" && (
+        <details className="text-xs">
+          <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted hover:text-ink-2">
+            add a transcript ({asset.transcript_cues?.length ?? 0} cues)
+          </summary>
+          <div className="mt-1.5">
+            {textarea(
+              "Optional — one line per cue:\n0:03 Your tools were supposed to help\n0:11 One clean interface slides in",
+              asset.transcript_cues?.map((c) => `${(c.t_ms / 1000).toFixed(1)} ${c.text}`).join("\n") ?? "",
+              (v) => onChange({ ...asset, transcript_cues: parseCues(v).cues }),
+              4
+            )}
+          </div>
+        </details>
       )}
 
-      {(manual || (asset.text ?? "").length > 0) &&
-        textarea(
-          "Paste the page HTML. Sections are read in DOM order.",
-          asset.text ?? "",
-          (v) => onChange({ ...asset, text: v }),
-          fetched ? 4 : 8
-        )}
+      {kind === "document" && (
+        <div className="space-y-1.5">
+          {textarea(
+            "One slide or page per block, separated by a blank line.",
+            (asset.pages ?? []).join("\n\n"),
+            (v) =>
+              onChange({
+                ...asset,
+                pages: v.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean),
+              }),
+            6
+          )}
+          <p className="font-mono text-[10px] text-muted">
+            {(asset.pages ?? []).length} page{(asset.pages ?? []).length === 1 ? "" : "s"}
+          </p>
+        </div>
+      )}
+
+      {(kind === "text" || kind === "page") && (asset.text ?? "").length > 0 && (
+        <details className="text-xs">
+          <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted hover:text-ink-2">
+            edit the copy ({(asset.text ?? "").length.toLocaleString()} characters)
+          </summary>
+          <div className="mt-1.5">
+            {textarea("The copy the swarm will read.", asset.text ?? "", (v) =>
+              onChange({ ...asset, text: v }), 8)}
+          </div>
+        </details>
+      )}
+
+      {(kind === "image" || kind === "video") && (
+        <details className="text-xs">
+          <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted hover:text-ink-2">
+            add a brief
+          </summary>
+          <div className="mt-1.5">
+            {textarea(
+              "What is this asset for, who is it aimed at?",
+              asset.brief ?? "",
+              (v) => onChange({ ...asset, brief: v }),
+              2
+            )}
+          </div>
+        </details>
+      )}
     </div>
   );
 }
@@ -589,8 +347,8 @@ function PageInput({
 /** Enough to run? Mirrors the server's refusals so the button explains itself
  *  instead of round-tripping to a 400. */
 export function assetReady(kind: AssetKind, a: ContentAsset): string | null {
-  if (kind === "image") return a.image_b64 ? null : "choose an image";
-  if (kind === "video") return a.frames?.length ? null : "choose a video";
+  if (kind === "image") return a.image_b64 ? null : "paste an image link, or choose a file";
+  if (kind === "video") return a.frames?.length ? null : "paste a video link, or choose a file";
   if (kind === "audio")
     return a.transcript_cues?.length || (a.text ?? "").trim().length >= 20
       ? null
@@ -599,3 +357,5 @@ export function assetReady(kind: AssetKind, a: ContentAsset): string | null {
     return (a.pages ?? []).length >= 2 ? null : "at least two pages or slides";
   return (a.text ?? "").trim().length >= 20 ? null : "paste at least 20 characters";
 }
+
+export type { ResolvedAsset };

@@ -700,7 +700,21 @@ class TranscriptCue(BaseModel):
 
 
 class VideoFrame(BaseModel):
-    t_ms: int = Field(ge=0, description="Keyframe timestamp, ms from start.")
+    #: `-1` means the position on the clock is UNKNOWN, not zero.
+    #:
+    #: Reached for YouTube's unsigned interior frames (`hq1`/`hq2`/`hq3`), which
+    #: are only used when the player API has refused us — so the runtime is
+    #: unavailable and the frames are known to be in ORDER without being known
+    #: to be at any particular second. The modality layer reads this as a
+    #: sequential axis and withholds anything phrased in seconds.
+    #:
+    #: A sentinel rather than `Optional[int]` because the field is already
+    #: persisted in stored runs and read by the dashboard; widening the type
+    #: would make every existing consumer handle a null it has never seen. The
+    #: bound stays at -1 so an arbitrary negative number is still rejected.
+    t_ms: int = Field(
+        ge=-1, description="Keyframe timestamp, ms from start. -1 when unknown."
+    )
     image_b64: str = Field(
         max_length=8_000_000,
         description="Base64 keyframe. Extracted client-side — see modality.py.",

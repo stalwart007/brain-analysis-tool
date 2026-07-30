@@ -263,6 +263,10 @@ async def _describe_frame(
             return None
 
 
+#: What to call a frame whose position is known as a fraction and not as a time.
+_POSITIONS = ("opening", "a quarter in", "midpoint", "three quarters in")
+
+
 async def _beats_from_video(asset: ContentAsset) -> BeatSequence:
     """Keyframes plus optional transcript.
 
@@ -277,7 +281,22 @@ async def _beats_from_video(asset: ContentAsset) -> BeatSequence:
             "a video asset needs keyframes — extract them client-side and send "
             "them with timestamps"
         )
-    frames = sorted(asset.frames, key=lambda f: f.t_ms)[:MAX_FRAMES]
+    # A frame with `t_ms < 0` is one whose position on the clock is UNKNOWN,
+    # not one at the start. That happens for YouTube's unsigned interior frames
+    # (`hq1`/`hq2`/`hq3`), which are reached only when the player API has
+    # refused us — so the runtime is unavailable and the frames are known to be
+    # in order without being known to be at any particular second.
+    #
+    # This mirrors what the audio adapter already does with cues: timings
+    # present means a temporal axis, timings absent means a sequential one. The
+    # alternative is inventing a duration, and every timestamp in the output
+    # would then be a number nothing measured.
+    timed = any(f.t_ms >= 0 for f in asset.frames)
+    frames = (
+        sorted(asset.frames, key=lambda f: f.t_ms)[:MAX_FRAMES]
+        if timed
+        else list(asset.frames)[:MAX_FRAMES]
+    )
     semaphore = asyncio.Semaphore(4)
     described = await asyncio.gather(
         *(
@@ -296,13 +315,19 @@ async def _beats_from_video(asset: ContentAsset) -> BeatSequence:
     for frame, description in zip(frames, described):
         if description is None:
             continue
-        spoken = [c.text for c in lines if abs(c.t_ms - frame.t_ms) <= 2500]
-        seconds = frame.t_ms / 1000
-        beat = f"[{seconds:.1f}s] {description}"
+        if timed:
+            spoken = [c.text for c in lines if abs(c.t_ms - frame.t_ms) <= 2500]
+            beat = f"[{frame.t_ms / 1000:.1f}s] {description}"
+            stamps.append(frame.t_ms)
+        else:
+            # Positional, because that is what is actually known. "opening" and
+            # "a quarter of the way in" are true; "[0.0s]" and "[45.2s]" would
+            # be a clock nobody measured.
+            spoken = []
+            beat = f"[{_POSITIONS[len(beats)] if len(beats) < len(_POSITIONS) else f'part {len(beats) + 1}'}] {description}"
         if spoken:
             beat += f' — heard: "{" ".join(spoken)[:160]}"'
         beats.append(beat)
-        stamps.append(frame.t_ms)
 
     if len(beats) < MIN_BEATS:
         raise UnsupportedAsset(
@@ -311,11 +336,18 @@ async def _beats_from_video(asset: ContentAsset) -> BeatSequence:
         )
     return BeatSequence(
         beats,
-        BeatAxis.TEMPORAL,
+        BeatAxis.TEMPORAL if timed else BeatAxis.SEQUENTIAL,
         source="vision",
-        timestamps_ms=stamps,
-        notes=f"{len(beats)} keyframes described"
-        + (f", {len(lines)} transcript cues aligned" if lines else ", no transcript"),
+        timestamps_ms=stamps if timed else None,
+        notes=(
+            f"{len(beats)} keyframes described"
+            + (
+                (f", {len(lines)} transcript cues aligned" if lines else ", no transcript")
+                if timed
+                else " at known positions but unknown times, so retention is per "
+                     "beat rather than in seconds"
+            )
+        ),
     )
 
 
@@ -748,9 +780,35 @@ async def _llm_segments(content: str, content_type: str) -> list[str]:
     return segs
 
 
+#: The floor for a text asset, in characters after stripping.
+#:
+#: The dashboard has enforced this since the panel was written (`assetReady`),
+#: and the API did not — so the guard lived entirely in the client and any
+#: direct caller walked straight past it. Measured against the deployed API:
+#: `{"content": "hi"}` was accepted, segmented into beats, and dispatched to the
+#: full twin swarm, which spends real OpenAI credit producing confident
+#: statistics — synchrony, peak-end, a retention curve — about two characters.
+#:
+#: Twenty is the client's number, kept identical on purpose. A server floor that
+#: disagreed with the button would either reject something the UI had just
+#: enabled or accept something it had greyed out, and both read as a bug in
+#: whichever half the reader is looking at.
+MIN_TEXT_CHARS = 20
+
+
 async def _beats_from_text(asset: ContentAsset) -> BeatSequence:
-    if not asset.text:
+    text = (asset.text or "").strip()
+    if not text:
         raise UnsupportedAsset("a text asset needs text")
+    if len(text) < MIN_TEXT_CHARS:
+        # Refused BEFORE the segmenter, which is the whole point: the segmenter
+        # is an LLM call and the twins after it are many more, so the cheapest
+        # place to decline is the first one.
+        raise UnsupportedAsset(
+            f"that is {len(text)} characters, and a study needs at least "
+            f"{MIN_TEXT_CHARS} to have anything to read. Paste the script, the "
+            "copy, or a link to the content."
+        )
     try:
         segs = await _llm_segments(asset.text, asset.content_type or "text")
         return BeatSequence(segs, BeatAxis.SEQUENTIAL, source="llm")

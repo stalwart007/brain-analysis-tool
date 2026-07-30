@@ -1,0 +1,686 @@
+"""YouTube ingest: URL parsing, chapter detection, storyboard geometry.
+
+Everything here is offline and pure. The network-facing half of `app.youtube`
+is one function (`fetch_manifest`) whose behaviour is YouTube's to change, and
+a test that asserts on it is a test that fails on a Tuesday for reasons nobody
+in this repo controls. What IS ours is the arithmetic that turns a storyboard
+specification into tile coordinates, and the judgement about what a video can
+support — both of which are silently wrong-able, which is what tests are for.
+
+The case that earns its place most is `test_prose_timestamps_are_not_chapters`.
+A description mentioning two times in passing produced a two-chapter running
+order, which then decided where every keyframe was sampled — so a video with no
+chapters at all was studied at moments chosen by a sentence about something
+else, and nothing in the output said so.
+"""
+
+import asyncio
+
+import pytest
+
+from app.youtube import (
+    CDN_FRAMES,
+    CDN_RESOLUTIONS,
+    MAX_KEYFRAMES,
+    CaptionTrack,
+    VideoManifest,
+    _parse_json3,
+    _parse_timedtext_xml,
+    _is_bot_wall,
+    _storyboard_from_spec,
+    choose_rung,
+    is_youtube_url,
+    manifest_envelope,
+    parse_chapters,
+    parse_video_id,
+    pick_caption_track,
+    plan_keyframes,
+)
+
+#: The real specification returned for dQw4w9WgXcQ, verbatim apart from a
+#: shortened `sqp`. The shape is load-bearing — `$L`, `$N` and `$M` are
+#: substituted, the tile grid is read out of the `#`-separated fields, and the
+#: LEVEL INDEX is positional — so a synthetic or trimmed string would test the
+#: parser against a format of this file's own invention. All three tiers are
+#: kept for that reason: dropping one silently renumbers the rest.
+def asyncio_run(coro):
+    """`asyncio.run` under a name that reads as a helper at the call sites."""
+    return asyncio.run(coro)
+
+
+REAL_SPEC = (
+    "https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L$L/$N.jpg?sqp=-oaymwENSDf"
+    "|48#27#100#10#10#0#default#rs$AOn4CLDgtWGAnaqZ"
+    "|80#45#108#10#10#2000#M$M#rs$AOn4CLBf8GkpJjLT0"
+    "|160#90#108#5#5#2000#M$M#rs$AOn4CLClA1jTU48sH"
+)
+
+
+# ── URL parsing ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://youtu.be/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://youtu.be/dQw4w9WgXcQ?t=42", "dQw4w9WgXcQ"),
+        ("https://m.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxyz", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://www.youtube.com/live/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("  https://www.youtube.com/watch?v=dQw4w9WgXcQ  ", "dQw4w9WgXcQ"),
+    ],
+)
+def test_every_spelling_youtube_emits_is_accepted(url, expected):
+    """A researcher pastes whatever the share button gave them."""
+    assert parse_video_id(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/@SomeChannel",
+        "https://www.youtube.com/playlist?list=PLxyz",
+        "https://www.youtube.com/results?search_query=cats",
+        "https://www.youtube.com/watch?v=tooshort",
+        "https://www.youtube.com/watch",
+    ],
+)
+def test_youtube_urls_without_a_video_yield_no_id(url):
+    """Still YouTube, still nothing to study — the two facts are separate."""
+    assert parse_video_id(url) is None
+    assert is_youtube_url(url) is True
+
+
+def test_lookalike_host_is_not_youtube():
+    """The check that stops `youtube.com.evil.test` reaching the InnerTube path.
+
+    Suffix matching on the hostname is the classic way this goes wrong, and it
+    would let an attacker choose the host the manifest call is sent to.
+    """
+    assert is_youtube_url("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ") is False
+    assert parse_video_id("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ") is None
+    assert is_youtube_url("https://notyoutube.com/watch?v=dQw4w9WgXcQ") is False
+
+
+def test_video_id_shape_is_checked():
+    """Eleven URL-safe base64 characters, or it is not an id.
+
+    Without this, `?v=../../etc` is passed to the API as a video id.
+    """
+    assert parse_video_id("https://www.youtube.com/watch?v=../../../etc/passwd") is None
+    assert parse_video_id("https://www.youtube.com/watch?v=abc!def@hij") is None
+
+
+# ── chapters ───────────────────────────────────────────────────────────────
+
+
+def test_chapters_are_read_and_given_end_times():
+    chapters = parse_chapters(
+        "Welcome!\n0:00 Intro\n1:30 The problem\n4:12 The fix\n7:00 Wrap up\nthanks",
+        duration_s=500,
+    )
+    assert [c["title"] for c in chapters] == ["Intro", "The problem", "The fix", "Wrap up"]
+    assert chapters[0]["start_s"] == 0
+    # Each chapter ends where the next begins; the last runs to the end.
+    assert chapters[0]["end_s"] == 90
+    assert chapters[-1]["end_s"] == 500
+
+
+def test_hour_long_stamps_parse():
+    chapters = parse_chapters("0:00 Start\n1:02:03 Later\n", duration_s=7200)
+    assert [c["start_s"] for c in chapters] == [0, 3723]
+
+
+def test_prose_timestamps_are_not_chapters():
+    """THE regression. Times mentioned in a sentence are not a running order.
+
+    Read as chapters they would decide where every keyframe is sampled, so a
+    video with no chapters gets studied at moments chosen by a sentence about
+    something else — and the output would not say so anywhere.
+    """
+    assert parse_chapters("See 4:12 for the demo, and 1:02 for setup.", 500) == []
+
+
+def test_out_of_order_and_overrunning_stamps_are_rejected():
+    # Descending: a highlight list, not a structure.
+    assert parse_chapters("0:00 A\n5:00 B\n2:00 C", 600) == []
+    # Past the end of the video: these are timestamps for something else.
+    assert parse_chapters("0:00 A\n1:00 B\n99:00 C", 300) == []
+
+
+def test_a_running_order_must_start_at_the_beginning():
+    """A list starting at 4:12 is highlights. A video's first chapter is its opening."""
+    assert parse_chapters("4:12 Middle bit\n6:00 Another bit", 600) == []
+
+
+def test_bare_timestamp_with_no_label_is_skipped():
+    assert parse_chapters("0:00\n1:00\n2:00", 300) == []
+
+
+# ── storyboard geometry ────────────────────────────────────────────────────
+
+
+def test_highest_level_is_taken_and_sheets_are_counted():
+    board = _storyboard_from_spec(REAL_SPEC, duration_s=213)
+    assert board is not None
+    # The 160×90 tier, not the 48×27 one — the difference between a frame a
+    # vision model can describe and a smudge.
+    assert (board.width, board.height) == (160, 90)
+    assert (board.cols, board.rows) == (5, 5)
+    assert board.frame_count == 108
+    # 108 frames at 25 per sheet is five sheets, the last one partial.
+    assert len(board.sheet_urls) == 5
+    assert "storyboard3_L2/M0.jpg" in board.sheet_urls[0]
+    assert "storyboard3_L2/M4.jpg" in board.sheet_urls[4]
+    # Refused without the signature.
+    assert all("sigh=rs$AOn4CLClA1jTU48sH" in u for u in board.sheet_urls)
+
+
+def test_tile_coordinates_walk_the_grid_then_the_sheet():
+    board = _storyboard_from_spec(REAL_SPEC, duration_s=213)
+    first = board.locate(0)
+    assert (first["x"], first["y"], first["sheet"]) == (0, 0, 0)
+    assert first["t_ms"] == 0
+
+    # Frame 6 in a 5-wide grid is row 1, column 1.
+    sixth = board.locate(6)
+    assert (sixth["x"], sixth["y"], sixth["sheet"]) == (160, 90, 0)
+    assert sixth["t_ms"] == 12_000
+
+    # Frame 25 is the first tile of the SECOND sheet, back at the origin.
+    across = board.locate(25)
+    assert (across["x"], across["y"], across["sheet"]) == (0, 0, 1)
+    assert "M1.jpg" in across["sheet_url"]
+
+
+def test_out_of_range_frames_have_no_location():
+    board = _storyboard_from_spec(REAL_SPEC, duration_s=213)
+    assert board.locate(-1) is None
+    assert board.locate(board.frame_count) is None
+
+
+def test_zero_interval_tier_derives_its_spacing_from_the_duration():
+    """The lowest tier packs N frames across the runtime instead of sampling.
+
+    Left at zero, every frame reports t=0 and the whole timeline collapses.
+    """
+    single = "https://x.test/sb/$L/$N.jpg?a=b|48#27#100#10#10#0#default#rs$SIG"
+    board = _storyboard_from_spec(single, duration_s=200)
+    assert board.interval_ms == 2000
+    assert board.locate(50)["t_ms"] == 100_000
+
+
+def test_malformed_specs_are_refused_rather_than_guessed():
+    assert _storyboard_from_spec("", 100) is None
+    assert _storyboard_from_spec("https://x.test/only-a-base", 100) is None
+    assert _storyboard_from_spec("https://x.test/$L|48#27#100", 100) is None
+    # A zero-width tile would make every crop empty.
+    assert _storyboard_from_spec("https://x.test/$L/$N|0#27#100#10#10#0#d#rs$S", 100) is None
+    # No duration and no interval: nothing to derive a clock from.
+    assert _storyboard_from_spec("https://x.test/$L/$N|48#27#100#10#10#0#d#rs$S", 0) is None
+
+
+# ── keyframe planning ──────────────────────────────────────────────────────
+
+
+def _manifest(**over) -> VideoManifest:
+    base = dict(
+        video_id="dQw4w9WgXcQ",
+        title="T",
+        author="A",
+        duration_s=213,
+        description="",
+        thumbnail_url="https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+        storyboard=_storyboard_from_spec(REAL_SPEC, duration_s=213),
+    )
+    base.update(over)
+    return VideoManifest(**base)
+
+
+def test_frames_are_sampled_at_beat_centres_not_boundaries():
+    """Never t=0. The first frame after a cut is often black, and a vision
+    model asked to describe it describes black as if it were the content."""
+    frames = plan_keyframes(_manifest(), want=8)
+    # Four published stills plus filmstrip tiles in the gaps, capped.
+    assert 8 <= len(frames) <= MAX_KEYFRAMES
+    assert all(f["source"] == "even" for f in frames if f["kind"] == "tile")
+    # Tiles are never at t=0: the first frame after a cut is often black, and a
+    # vision model asked to describe it describes black as if it were content.
+    assert all(f["t_ms"] > 0 for f in frames if f["kind"] == "tile")
+    # Monotonic and inside the runtime.
+    stamps = [f["t_ms"] for f in frames]
+    assert stamps == sorted(stamps)
+    assert stamps[-1] <= 213_000
+
+
+def test_chapters_decide_the_tile_sampling_when_the_creator_wrote_them():
+    """Authored structure beats an even split for the TILES.
+
+    The four full-resolution stills are published at fixed points and are
+    always included; the chapters decide where the filmstrip fills in around
+    them.
+    """
+    chapters = [
+        {"start_s": 0, "end_s": 60, "title": "Intro"},
+        {"start_s": 60, "end_s": 140, "title": "Middle"},
+        {"start_s": 140, "end_s": 213, "title": "End"},
+    ]
+    frames = plan_keyframes(_manifest(chapters=chapters), want=8)
+    tiles = [f for f in frames if f["kind"] == "tile"]
+    assert all(t["source"] == "chapters" for t in tiles)
+    assert [t["label"] for t in tiles] == ["Middle"] or all(
+        t["label"] in {"Intro", "Middle", "End"} for t in tiles
+    )
+    # Everything is in running order and inside the runtime.
+    stamps = [f["t_ms"] for f in frames]
+    assert stamps == sorted(stamps)
+    assert stamps[-1] <= 213_000
+
+
+def test_two_chapters_inside_one_interval_do_not_crop_the_same_tile_twice():
+    """Otherwise two vision calls describe one picture and one beat is lost."""
+    chapters = [
+        {"start_s": 0, "end_s": 1, "title": "A"},
+        {"start_s": 1, "end_s": 2, "title": "B"},
+    ]
+    frames = plan_keyframes(_manifest(chapters=chapters), want=8)
+    assert len({f["t_ms"] for f in frames}) == len(frames)
+
+
+def test_no_storyboard_still_yields_the_published_stills():
+    """The filmstrip is the optional part now, not the load-bearing one."""
+    frames = plan_keyframes(_manifest(storyboard=None))
+    assert len(frames) == len(CDN_FRAMES)
+    assert all(f["kind"] == "image" for f in frames)
+    # Highest resolution first: 1280×720 against a tile's 160×90.
+    assert all(f["urls"][0].startswith("https://i.ytimg.com/vi/") for f in frames)
+    assert all("maxres" in f["urls"][0] for f in frames)
+
+
+def test_frame_count_is_capped():
+    frames = plan_keyframes(_manifest(), want=999)
+    assert len(frames) <= MAX_KEYFRAMES
+
+
+# ── the ladder ─────────────────────────────────────────────────────────────
+
+
+def test_rung_prefers_picture_then_speech_then_the_creators_own_words():
+    board_frames = plan_keyframes(_manifest(), want=4)
+    cues = [{"t_ms": i * 1000, "text": "x"} for i in range(8)]
+    chapters = [{"start_s": 0, "end_s": 5, "title": "A"}, {"start_s": 5, "end_s": 9, "title": "B"}]
+
+    assert choose_rung(_manifest(), cues, board_frames) == "video"
+    assert choose_rung(_manifest(), cues, []) == "audio"
+    assert choose_rung(_manifest(chapters=chapters), [], []) == "text"
+    # No filmstrip, but the unsigned CDN frames are always there — measured
+    # present for every video tested, including a 19-second clip with no
+    # storyboard at all. Four ordered frames beats one thumbnail by enough that
+    # it is worth its own rung.
+    from app.youtube import cdn_frame_urls
+    assert choose_rung(
+        _manifest(storyboard=None, cdn_frames=cdn_frame_urls("dQw4w9WgXcQ")), [], []
+    ) == "cdn_frames"
+    # The floor: a thumbnail and nothing else.
+    assert choose_rung(_manifest(storyboard=None), [], []) == "metadata"
+    # Nothing readable at all, not even a still, is refused rather than studied.
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url=""), [], []) == "none"
+
+
+def test_the_bot_wall_is_named_as_a_block_on_us_not_on_the_video():
+    """THE production regression.
+
+    InnerTube refuses datacentre addresses with "Sign in to confirm you're not a
+    bot". That was reported as "Private, age-restricted, members-only and
+    region-blocked videos all look like this" — four permission states, none of
+    which applied, for a video that was public. It sent the reader to check
+    settings they did not need to change, on a condition that clears by itself.
+    """
+    assert _is_bot_wall("Sign in to confirm you’re not a bot") is True
+    assert _is_bot_wall("SIGN IN TO CONFIRM you are not a BOT") is True
+    # A real permission failure must NOT be softened into "just retry".
+    assert _is_bot_wall("This video is private") is False
+    assert _is_bot_wall("") is False
+
+
+def test_a_metadata_rung_manifest_reports_the_cause_before_anything_else():
+    """The receipt leads with why it degraded, because that is the only line
+    that tells the reader whether there is anything to do."""
+    blocked = _manifest(
+        storyboard=None, client="oembed", blocked_reason="Sign in to confirm you’re not a bot"
+    )
+    envelope = manifest_envelope(blocked, [], [])
+    assert envelope["rung"] == "metadata"  # constructed without cdn_frames
+    assert envelope["degraded"] is True
+    assert envelope["note"].startswith("YouTube refused to describe this video")
+    assert "blocks datacentre addresses" in envelope["note"]
+    # The unrelated explanations must not also appear and confuse the cause.
+    assert "too short" not in envelope["note"]
+    assert "no captions published" not in envelope["note"]
+
+
+def test_a_study_needs_at_least_two_frames():
+    """One frame is a picture. Two is a sequence. The floor matters because
+    every temporal statistic downstream presumes an ordering to measure."""
+    # A manifest with neither a filmstrip NOR published stills is the only way
+    # to end up under the floor now.
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url="t"), [], []) == "metadata"
+    assert choose_rung(_manifest(storyboard=None, thumbnail_url=""), [], []) == "none"
+
+
+def test_one_chapter_is_not_a_running_order():
+    """A single named section says nothing about structure, so sampling falls
+    back to an even split rather than putting every frame in one place."""
+    frames = plan_keyframes(_manifest(chapters=[{"start_s": 0, "end_s": 213, "title": "All"}]))
+    assert all(f["source"] == "even" for f in frames if f["kind"] == "tile")
+
+
+# ── caption tracks ─────────────────────────────────────────────────────────
+
+
+def test_human_written_captions_beat_machine_ones_even_across_languages():
+    """An ASR track is a machine's guess at what was said; a manual track is
+    what someone typed. For a study that reads the words AS CONTENT, that is
+    worth more than the language matching."""
+    tracks = [
+        CaptionTrack("en", "English (auto)", auto_generated=True, url="u1"),
+        CaptionTrack("de", "Deutsch", auto_generated=False, url="u2"),
+    ]
+    assert pick_caption_track(tracks).url == "u2"
+
+
+def test_preferred_language_wins_among_equals():
+    tracks = [
+        CaptionTrack("ja", "Japanese", auto_generated=False, url="u1"),
+        CaptionTrack("en", "English", auto_generated=False, url="u2"),
+    ]
+    assert pick_caption_track(tracks).url == "u2"
+    assert pick_caption_track([]) is None
+
+
+def test_json3_cues_are_joined_and_unwrapped():
+    raw = """{"events":[
+      {"tStartMs":0,"segs":[{"utf8":"Hello"},{"utf8":" there"}]},
+      {"tStartMs":1500,"segs":[{"utf8":"line one\\nline two"}]},
+      {"tStartMs":3000,"segs":[{"utf8":"  "}]}
+    ]}"""
+    cues = _parse_json3(raw)
+    # The blank cue is dropped; the wrapped one becomes a single line, because
+    # `\n` inside a cue is the caption renderer wrapping, not a sentence break.
+    assert cues == [
+        {"t_ms": 0, "text": "Hello there"},
+        {"t_ms": 1500, "text": "line one line two"},
+    ]
+
+
+def test_both_xml_caption_dialects_parse_to_the_same_shape():
+    """srv1 counts in seconds, srv3 in milliseconds. Reading one as the other
+    puts the whole transcript at the wrong point on the timeline."""
+    srv1 = (
+        '<transcript><text start="1.5" dur="2">Hello &amp; welcome</text>'
+        '<text start="4" dur="1">Bye</text></transcript>'
+    )
+    assert _parse_timedtext_xml(srv1) == [
+        {"t_ms": 1500, "text": "Hello & welcome"},
+        {"t_ms": 4000, "text": "Bye"},
+    ]
+
+    srv3 = '<timedtext><body><p t="1500" d="2000">Hello</p><p t="4000">Bye</p></body></timedtext>'
+    assert _parse_timedtext_xml(srv3) == [
+        {"t_ms": 1500, "text": "Hello"},
+        {"t_ms": 4000, "text": "Bye"},
+    ]
+
+
+# ── the oEmbed fallback ────────────────────────────────────────────────────
+
+
+def test_innertube_refusal_falls_back_to_the_public_preview(monkeypatch):
+    """THE production fix, exercised without a network.
+
+    Measured from the deployment host: InnerTube answers "Sign in to confirm
+    you're not a bot" for most videos, while oEmbed answers 200 for all of
+    them. Before this fallback existed, that combination produced a 502 for a
+    public video — so the feature worked in development and failed in
+    production, which is the worst shape a failure can take.
+    """
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        if "youtubei" in url:
+            # What the bot wall actually returns: HTTP 200, with the refusal
+            # inside `playabilityStatus`. A status-code check would miss it.
+            return (
+                {
+                    "playabilityStatus": {
+                        "status": "LOGIN_REQUIRED",
+                        "reason": "Sign in to confirm you’re not a bot",
+                    },
+                    "videoDetails": {},
+                },
+                url,
+            )
+        return (
+            {
+                "title": "Me at the zoo",
+                "author_name": "jawed",
+                "thumbnail_url": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg",
+            },
+            url,
+        )
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+    assert manifest.client == "oembed"
+    assert manifest.title == "Me at the zoo"
+    assert manifest.author == "jawed"
+    assert manifest.thumbnail_url.endswith("hqdefault.jpg")
+    # EXACTLY ONE InnerTube call. The wall is keyed to the address, so the
+    # second client shares it and would meet the same refusal — and spending the
+    # request deepens the throttle for the next caller. Measured: a burst of
+    # probing took this host from "ANDROID answers with a storyboard" to "every
+    # client and every HTTP library refuses".
+    assert sum(1 for c in calls if "youtubei" in c) == 1
+    # Duration is NOT invented. Every downstream timestamp derives from it.
+    assert manifest.duration_s == 0
+    assert yt._is_bot_wall(manifest.blocked_reason)
+
+    envelope = yt.manifest_envelope(manifest, [], [])
+    # The preview fallback now carries the CDN frames, so it lands on the
+    # frames rung rather than the thumbnail one.
+    assert envelope["rung"] == "cdn_frames"
+    assert len(envelope["cdn_frames"]) == len(yt.CDN_FRAMES)
+    assert "blocks datacentre addresses" in envelope["note"]
+
+
+def test_a_real_permission_failure_is_not_softened_into_retry_advice(monkeypatch):
+    """A private video and a rate-limited server look similar and are not.
+
+    Telling someone to retry a video they do not have access to is a loop.
+    """
+    import app.youtube as yt
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "ERROR", "reason": "This video is private"}, "videoDetails": {}}, url)
+        return ({"title": "Private thing", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+    note = yt.manifest_envelope(manifest, [], [])["note"]
+    assert "This video is private" in note
+    assert "blocks datacentre" not in note
+
+
+def test_everything_failing_still_raises(monkeypatch):
+    """The fallback must not turn a dead link into a confident empty study."""
+    import app.youtube as yt
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        raise yt.FetchFailed("nope")
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    with pytest.raises(yt.YouTubeUnavailable):
+        asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+
+def test_a_permanent_refusal_still_tries_every_client(monkeypatch):
+    """The early exit is for the BOT WALL only.
+
+    The wall is keyed to our address, so every client meets it and fanning out
+    is wasted volume. A permission failure is keyed to the VIDEO, and a second
+    client genuinely can be permitted where the first was not — so that case
+    must still fan out. The reason string is what separates them.
+    """
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "ERROR", "reason": "This video is private"},
+                     "videoDetails": {}}, url)
+        return ({"title": "T", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    yt_manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+
+    assert yt_manifest.client == "oembed"
+    # A permission failure is per-VIDEO, not per-address, so the other client is
+    # worth trying — it is only the bot wall that makes fanning out pointless.
+    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS)
+
+
+def test_a_repeated_link_costs_no_requests(monkeypatch):
+    """The only lever that helps: ask less.
+
+    The wall is earned by VOLUME, so a researcher pasting the same link twice,
+    re-running a study, or a colleague studying the same video must not each
+    spend a request. Caching successes is what keeps the budget for links
+    nobody has looked at yet.
+    """
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        return (
+            {
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {"title": "T", "author": "A", "lengthSeconds": "100",
+                                 "shortDescription": "", "viewCount": "5"},
+            },
+            url,
+        )
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    first = asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    second = asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    assert len(calls) == 1
+    assert second is first
+
+    # A DIFFERENT video is not served from the first one's entry.
+    asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+    assert len(calls) == 2
+
+
+def test_a_refusal_is_never_cached(monkeypatch):
+    """Caching a refusal would turn one throttled second into an hour of them,
+    for a link that would have worked on the very next attempt."""
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "LOGIN_REQUIRED",
+                                           "reason": "Sign in to confirm you’re not a bot"},
+                     "videoDetails": {}}, url)
+        return ({"title": "T", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    before = len(calls)
+    asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    assert len(calls) > before, "a degraded result must not be cached as if it were the answer"
+
+
+def test_cdn_frames_span_the_video_and_need_no_api_call(monkeypatch):
+    """THE route round the bot wall.
+
+    `hqdefault`/`hq1`/`hq2`/`hq3` are unsigned, sit on the image CDN rather than
+    behind the player API, and answer `Access-Control-Allow-Origin: *`. Measured
+    present for every video tried, including a 19-second clip that has no
+    storyboard at all. Four ordered frames is a study of the video; the
+    thumbnail alone is a study of a thumbnail.
+    """
+    from app.youtube import cdn_frame_urls
+
+    frames = cdn_frame_urls("bBC-nXj3Ng4")
+    assert len(frames) == len(CDN_FRAMES)
+    # Spread across the video, in order, and never past the end.
+    fractions = [f["fraction"] for f in frames]
+    assert fractions == sorted(fractions)
+    assert fractions[0] == 0.0 and fractions[-1] < 1.0
+    # Unsigned: no `sigh`, no key, nothing that expires.
+    for f in frames:
+        assert all(u.startswith("https://i.ytimg.com/vi/bBC-nXj3Ng4/") for u in f["urls"])
+        assert all("?" not in u for u in f["urls"])
+    # Resolution ladder, best first — 1280×720 against a tile's 160×90.
+    assert "maxres" in frames[0]["urls"][0]
+    assert [t for t in CDN_RESOLUTIONS] == list(CDN_RESOLUTIONS)
+    # Without a duration the position is a fraction, never a fabricated time.
+    assert all(f["t_ms"] == -1 for f in frames)
+    timed = cdn_frame_urls("bBC-nXj3Ng4", duration_s=200)
+    assert [f["t_ms"] for f in timed] == [0, 50_000, 100_000, 150_000]
+
+
+def test_untimed_frames_produce_a_sequential_axis_not_an_invented_clock():
+    """When the player API refuses, the runtime is unknown.
+
+    The frames are known to be IN ORDER and not known to be at any second, so
+    the axis is sequential and `timestamps_ms` is absent. Inventing a duration
+    would put a number on every beat that nothing measured — and retention
+    would then be reported in seconds that do not exist.
+    """
+    import asyncio as _aio
+
+    from app.modality import BeatAxis, _beats_from_video
+    from app.schemas import ContentAsset, VideoFrame
+
+    async def fake_describe(b64, media_type, t_ms, semaphore):
+        return f"frame at {t_ms}"
+
+    import app.modality as m
+
+    original = m._describe_frame
+    m._describe_frame = fake_describe
+    try:
+        asset = ContentAsset(
+            kind="video",
+            frames=[VideoFrame(t_ms=-1, image_b64="AA==", media_type="image/jpeg") for _ in range(4)],
+        )
+        seq = _aio.run(_beats_from_video(asset))
+    finally:
+        m._describe_frame = original
+
+    assert seq.axis is BeatAxis.SEQUENTIAL
+    assert seq.timestamps_ms is None
+    assert seq.beats[0].startswith("[opening]")
+    assert "[a quarter in]" in seq.beats[1]
+    # No fabricated seconds anywhere.
+    assert not any("s]" in b.split("]")[0] + "]" for b in seq.beats)
