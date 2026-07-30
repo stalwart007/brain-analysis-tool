@@ -201,6 +201,10 @@ class VideoManifest:
     #: "this server is being rate-limited" instead of implying the video is
     #: private — they call for completely different actions from the reader.
     blocked_reason: str = ""
+    #: Unsigned interior frames from the image CDN — the opening, quarter, half
+    #: and three-quarter points. Populated only when the player API is out of
+    #: reach, because when it is not the storyboard is strictly better.
+    cdn_frames: list[dict] = field(default_factory=list)
 
     @property
     def watch_url(self) -> str:
@@ -536,8 +540,51 @@ async def fetch_manifest(video_id: str) -> VideoManifest:
     )
 
 
+#: Interior frames every video exposes as plain, unsigned CDN URLs.
+#:
+#: THE ROUTE ROUND THE BOT WALL, and the reason a blocked video is still worth
+#: studying. `hq1`, `hq2` and `hq3` are the frames YouTube generates at roughly
+#: the quarter, half and three-quarter points, and `hqdefault` is the opening.
+#: They need NO API call, carry no signature, sit on the image CDN rather than
+#: behind the player API, and answer `Access-Control-Allow-Origin: *`. Measured
+#: present for every video tested — including "Me at the zoo", which is 19
+#: seconds long and has no storyboard at all.
+#:
+#: Four frames is not eight, and the fractions are approximate. But four real
+#: frames spanning the video is a temporal study, and the thumbnail alone is a
+#: picture of a thumbnail. That is the whole difference between this tier
+#: existing and not.
+CDN_FRAMES: tuple[tuple[str, float], ...] = (
+    ("hqdefault", 0.0),
+    ("hq1", 0.25),
+    ("hq2", 0.5),
+    ("hq3", 0.75),
+)
+
+
+def cdn_frame_urls(video_id: str) -> list[dict]:
+    """The unsigned interior frames, in running order.
+
+    `fraction` rather than a timestamp, deliberately. When this tier is reached
+    InnerTube has refused us, so the runtime is unknown — and a frame labelled
+    `1:23` when nothing measured 1:23 is a fabricated clock. The beats are
+    ORDERED and not timed, which is a sequential axis, and the modality layer
+    already knows what to withhold for one.
+    """
+    return [
+        {
+            "name": name,
+            "fraction": fraction,
+            "url": f"https://i.ytimg.com/vi/{video_id}/{name}.jpg",
+        }
+        for name, fraction in CDN_FRAMES
+    ]
+
+
 #: YouTube's own oEmbed endpoint. Public, unauthenticated, and — unlike
 #: InnerTube — not gated behind the bot check that fires on datacentre IPs.
+#: It also answers CORS (measured: reflects the requesting origin), where
+#: InnerTube refuses the preflight outright with a 403.
 _OEMBED = "https://www.youtube.com/oembed?url={url}&format=json"
 
 #: What the bot check says when it fires. Matched so the failure can be
@@ -576,6 +623,7 @@ async def _oembed_manifest(video_id: str, blocked_reason: str) -> Optional[Video
         thumbnail_url=str(doc.get("thumbnail_url") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
         client="oembed",
         blocked_reason=blocked_reason,
+        cdn_frames=cdn_frame_urls(video_id),
     )
 
 
@@ -734,6 +782,10 @@ LADDER = {
     "video": "keyframes from the scrub-bar filmstrip, described by a vision model",
     "audio": "the published transcript, on its own timings",
     "text": "the creator's own chapter list and description — NOT the video itself",
+    "cdn_frames": (
+        "four frames YouTube publishes at the opening, quarter, half and "
+        "three-quarter points — ordered, but with no clock"
+    ),
     "metadata": "the thumbnail and title only — NOT the video itself",
 }
 
@@ -758,6 +810,11 @@ def choose_rung(manifest: VideoManifest, cues: list[dict], frames: list[dict]) -
         return "audio"
     if len(manifest.chapters) >= 2:
         return "text"
+    # The CDN frames. Below a real filmstrip because there are four of them and
+    # their positions are approximate, and far above the thumbnail rung because
+    # four frames spanning the video is a study of the video.
+    if manifest.cdn_frames:
+        return "cdn_frames"
     if manifest.thumbnail_url:
         return "metadata"
     return "none"
@@ -864,6 +921,7 @@ def manifest_envelope(manifest: VideoManifest, cues: list[dict], frames: list[di
             ],
         },
         "keyframes": frames,
+        "cdn_frames": manifest.cdn_frames,
         "storyboard": (
             {
                 "width": board.width,

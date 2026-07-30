@@ -1398,6 +1398,27 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
                 ),
             )
 
+        # ── the route round the bot wall: unsigned CDN frames ───────────
+        #
+        # Four real frames spanning the video, needing no player-API call at
+        # all, so this survives exactly the block that takes out everything
+        # above it. Declared as `video` because that is what it is — the client
+        # relays four images and crops nothing. Their positions are known as
+        # fractions and not as times, which is why they travel with `t_ms: -1`
+        # and land on a sequential axis rather than an invented clock.
+        if rung == "cdn_frames":
+            return {
+                "kind": "video",
+                "final_url": manifest.watch_url,
+                "hops": [request.url],
+                "bytes": 0,
+                "content_type": "application/x-youtube-manifest",
+                "rung": "cdn_frames",
+                "youtube": manifest_envelope(manifest, cues, frames),
+                "asset": {"kind": "video"},
+                "note": manifest_envelope(manifest, cues, frames)["note"],
+            }
+
         # ── the bottom rung: the thumbnail ──────────────────────────────
         #
         # Reached whenever InnerTube refused us and only the public preview

@@ -66,6 +66,9 @@ export interface YouTubeManifest {
     available: { language: string; name: string; auto: boolean }[];
   };
   keyframes: YouTubeKeyframe[];
+  /** Unsigned interior frames, used when the filmstrip is out of reach. Whole
+   *  images rather than tiles, so there is nothing to crop — just relay. */
+  cdn_frames?: { name: string; fraction: number; url: string }[];
   storyboard: {
     width: number;
     height: number;
@@ -78,7 +81,7 @@ export interface YouTubeManifest {
    *  is rate-limited" rather than implying the video is private. */
   blocked_reason?: string;
   note: string;
-  rung: "video" | "audio" | "text" | "metadata";
+  rung: "video" | "audio" | "text" | "cdn_frames" | "metadata";
   rung_basis: string;
   degraded: boolean;
 }
@@ -121,6 +124,17 @@ async function relay(url: string): Promise<Blob> {
  * filmstrip touch three or four sheets; fetching per frame would pull the same
  * 25 kB image up to eight times and, worse, decode it eight times.
  */
+/** A relayed image as base64, without the data-URL prefix. */
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  // Chunked: spreading a large array into fromCharCode throws a RangeError.
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
 async function cropKeyframes(
   keyframes: YouTubeKeyframe[],
   onProgress: (done: number, total: number, phase: "fetch" | "crop") => void
@@ -206,6 +220,45 @@ export async function ingestYouTube(
         ? "rate-limited by YouTube"
         : "none published"
   );
+
+  // ── the CDN frames: whole images, no cropping ───────────────────────
+  //
+  // Reached when the player API refused us, which from a datacentre address is
+  // most of the time. These are complete JPEGs rather than tiles in a sheet, so
+  // the canvas work the storyboard path does is skipped entirely — relay each
+  // one and hand it over. `t_ms: -1` marks the position as unknown; the server
+  // reads that as a sequential axis rather than fabricating a runtime.
+  if (manifest.rung === "cdn_frames" && (manifest.cdn_frames?.length ?? 0) >= 2) {
+    const sources = manifest.cdn_frames!;
+    onStage("filmstrip", "active", `0/${sources.length} frames`);
+    const frames: { t_ms: number; image_b64: string; media_type: string }[] = [];
+    for (const [i, source] of sources.entries()) {
+      try {
+        const blob = await relay(source.url);
+        frames.push({
+          t_ms: -1,
+          image_b64: await blobToBase64(blob),
+          media_type: blob.type && blob.type !== "application/octet-stream" ? blob.type : "image/jpeg",
+        });
+      } catch {
+        // One missing frame is a thinner study, not a failed one.
+      }
+      onStage("filmstrip", "active", `${i + 1}/${sources.length} frames`);
+    }
+    if (frames.length < 2) throw new Error("Could not retrieve enough frames for this video.");
+    onStage("filmstrip", "done", `${frames.length} frames`);
+    onStage("crop", "done", "no cropping needed");
+    return {
+      kind: "video",
+      asset: {
+        kind: "video",
+        frames,
+        transcript_cues: cues,
+        brief: `YouTube: "${manifest.title}"${manifest.author ? ` by ${manifest.author}` : ""}.`,
+      },
+      manifest,
+    };
+  }
 
   // ── the top rung: real keyframes ────────────────────────────────────
   if (manifest.rung === "video" && manifest.keyframes.length >= 2) {
