@@ -61,6 +61,7 @@ from typing import AsyncIterator, Optional, Sequence
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import bayesian_ab, bootstrap_ci, thompson_allocate
 from .config import (
     LOAD_TO_TEMPERATURE,
@@ -892,13 +893,12 @@ async def stream_copy_optimizer(
         async def run_batch(allocation: dict[str, int]):
             nonlocal failed
             texts = {v["id"]: v["text"] for v in population}
-            tasks = [
-                asyncio.create_task(tagged(vid, texts[vid]))
+            batch = as_they_land(
+                tagged(vid, texts[vid])
                 for vid, count in allocation.items()
                 for _ in range(count)
-            ]
-            for coro in asyncio.as_completed(tasks):
-                vid, score = await coro
+            )
+            async for vid, score in batch:
                 if score is None:
                     failed += 1
                     yield {"type": "agent_failed", "generation": g, "variant": vid}

@@ -13,7 +13,7 @@ import {
 } from "recharts";
 import dynamic from "next/dynamic";
 import { CognitiveLoad, WalkAggregate } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
@@ -25,6 +25,7 @@ const FunnelSim = dynamic(() => import("./sim/FunnelSim"), { ssr: false });
 
 export default function FlowPanel({ personaCount }: { personaCount: number }) {
   const entrance = useEntranceEnabled();
+  const streamRun = useStreamRun();
   const [stepsText, setStepsText] = useState("");
   const [twins, setTwins] = useState(2);
   const [load, setLoad] = useState<CognitiveLoad>("high");

@@ -16,7 +16,7 @@ import {
 } from "recharts";
 import dynamic from "next/dynamic";
 import { CognitiveLoad, PriceSensitivityResult } from "@/lib/api";
-import { streamRun } from "@/lib/stream";
+import { useStreamRun } from "@/lib/useStreamRun";
 import { LoadToggle } from "./LoadToggle";
 import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
@@ -27,6 +27,7 @@ const DemandSim = dynamic(() => import("./sim/DemandSim"), { ssr: false });
 
 export default function PricePanel({ personaCount }: { personaCount: number }) {
   const entrance = useEntranceEnabled();
+  const streamRun = useStreamRun();
   const [product, setProduct] = useState("");
   const [pricesText, setPricesText] = useState("19, 29, 49, 79, 99");
   const [twins, setTwins] = useState(3);

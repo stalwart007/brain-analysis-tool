@@ -33,6 +33,7 @@ from typing import AsyncIterator, Optional, Sequence
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import bootstrap_ci, simultaneous_band
 from .modality import UnsupportedAsset, extract_beats
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
@@ -1059,13 +1060,11 @@ async def stream_content_study(
     }
 
     semaphore = asyncio.Semaphore(SWARM_CONCURRENCY)
-    tasks = [
-        asyncio.create_task(_content_twin(p, segments, request.cognitive_load, semaphore))
-        for p in roster
-    ]
+    dispatch = as_they_land(
+        _content_twin(p, segments, request.cognitive_load, semaphore) for p in roster
+    )
     responses: list[TwinContentResponse] = []
-    for fut in asyncio.as_completed(tasks):
-        resp = await fut
+    async for resp in dispatch:
         if resp is None:
             yield {"type": "agent_failed"}
             continue

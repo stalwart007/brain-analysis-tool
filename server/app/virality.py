@@ -31,6 +31,7 @@ from typing import AsyncIterator, Callable, Optional, Sequence
 
 import openai
 
+from .streaming import as_they_land
 from .analytics import bootstrap_ci
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
 from .oai import Refusal, async_client, parse_completion, response_format_for
@@ -959,13 +960,11 @@ async def stream_virality(
     k = request.fanout
     yield {"type": "start", "total": len(roster), "fanout": k}
     semaphore = asyncio.Semaphore(SWARM_CONCURRENCY)
-    tasks = [
-        asyncio.create_task(_share_twin(p, request.content, request.cognitive_load, semaphore))
-        for p in roster
-    ]
+    dispatch = as_they_land(
+        _share_twin(p, request.content, request.cognitive_load, semaphore) for p in roster
+    )
     ps: list[float] = []
-    for fut in asyncio.as_completed(tasks):
-        resp = await fut
+    async for resp in dispatch:
         if resp is None:
             yield {"type": "agent_failed"}
             continue
