@@ -230,6 +230,22 @@ def intersubject_correlation(
         "null_mean_r": round(
             math.tanh(sum(z for z in null_z if z is not None) / max(1, len(null_z))), 4
         ),
+        # The null itself, not just its mean.
+        #
+        # Five hundred permutations are computed to produce `p_value` and then
+        # collapsed to one number, which is the one summary that cannot be
+        # argued with and also the one nobody believes. Shown as a distribution
+        # with the observed statistic standing next to it, "these twins agree
+        # more than chance" stops being a claim and becomes a picture: here is
+        # what agreement looks like when the beats are shuffled, and here is
+        # where this content landed.
+        #
+        # Back-transformed to r rather than shipped as Fisher z, because r is
+        # the axis the observed value is drawn on and asking the client to
+        # tanh() a null is asking it to re-implement the estimator.
+        "null_r_distribution": [
+            round(math.tanh(z), 4) for z in null_z if z is not None
+        ],
         "leave_one_out": loo,
         "grip": grip,
         "method": (

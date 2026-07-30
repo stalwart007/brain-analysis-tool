@@ -37,6 +37,24 @@ const nextConfig = {
               "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob:",
+              // Keyframe extraction decodes video in a `<video>` element fed
+              // from `URL.createObjectURL(file)`, so media has to be allowed
+              // from `blob:` — and it was not. There is no `media-src` in a
+              // default CSP, so it inherited `default-src 'self'`, and every
+              // video the browser tried to decode failed with
+              // `MEDIA_ELEMENT_ERROR: Media load rejected by URL safety check`.
+              //
+              // That silently broke BOTH video paths — uploading a file and
+              // pasting a hosted link — because both end at the same decoder.
+              // The failure surfaced as "Could not decode that video in this
+              // browser", which reads as a codec problem and sends the reader
+              // to re-encode a file that was fine.
+              //
+              // `blob:` only, deliberately: no remote origin is added, so this
+              // permits decoding bytes this page already holds and nothing
+              // else. Video and audio never come from a third party directly —
+              // they come through /api/cs/content/media, same-origin.
+              "media-src 'self' blob:",
               "font-src 'self' data:",
               // The browser only ever talks to this origin: the backend is
               // private and reached server-side through /api/cs.
