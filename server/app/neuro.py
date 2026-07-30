@@ -10,8 +10,9 @@ The science this stands on (and the honest limits of each):
   film grips an audience, their brain responses synchronise. We compute the
   behavioral analogue — correlation of attention trajectories across twins.
   High ISC ⇒ the content controls attention; low ISC ⇒ minds wander apart.
-- Change-point detection (binary segmentation, BIC-penalised): finds the exact
-  beats where audience attention structurally shifts — the drop-off moments.
+- Change-point detection (binary segmentation, permutation-calibrated against
+  a null built by reshuffling each twin's own beats): finds the exact beats
+  where audience attention structurally shifts — the drop-off moments.
 - Peak-end rule (Kahneman): what people *remember* of an experience is
   dominated by its emotional peak and its ending, plus serial-position
   (primacy/recency) effects on recall.
@@ -32,7 +33,7 @@ from typing import AsyncIterator, Optional, Sequence
 
 import openai
 
-from .analytics import bootstrap_ci
+from .analytics import bootstrap_ci, simultaneous_band
 from .modality import UnsupportedAsset, extract_beats
 from .config import LOAD_TO_TEMPERATURE, SWARM_CONCURRENCY, TWIN_MODEL
 from .oai import Refusal, async_client, parse_completion, response_format_for
@@ -245,54 +246,180 @@ def _rss(xs: Sequence[float]) -> float:
     return sum((x - m) ** 2 for x in xs)
 
 
+# Work cap for the twin-level permutation null, in (draws × beats × twins).
+# Sized from measurement: at 120k a 10-beat curve that splits four ways ran
+# 21 ms at 40 twins and 33 ms at 200 — inside the 50 ms streaming budget but
+# not comfortably. At 60k the same worst cases are 12 ms / 25 ms while every
+# curve at 8-20 twins still gets the full 300 draws. See change_points.
+_NULL_WORK_CAP = 60_000
+
+
+def _best_split(
+    seg: Sequence[float], min_size: int
+) -> tuple[Optional[int], float, float]:
+    """Best single split of `seg`: (k, RSS_left + RSS_right, total RSS), the
+    cost minimised over admissible k, via prefix sums so scoring one
+    permutation draw is O(m). The total RSS comes back with it because the
+    caller's statistic is the between-segment SS, total − cost, and a
+    twin-level surrogate is a different curve from the observed one — it has
+    its own total, and must be scored against it.
+
+    `m - min_size` IS an admissible split — it leaves a right segment of
+    exactly min_size, the same size the left segment is allowed. An exclusive
+    bound here once silently required the right segment to hold at least
+    min_size + 1, so the last beat could never end a segment: a collapse in
+    the *ending* returned [] while the identical collapse in the opening
+    returned [1]. For content analysis that is the worst possible asymmetry —
+    peak-end says the ending is the part that gets remembered, and
+    peak_end_memory reads the same curve.
+    """
+    m = len(seg)
+    ps, pss = [0.0], [0.0]
+    for x in seg:
+        ps.append(ps[-1] + x)
+        pss.append(pss[-1] + x * x)
+    total = max(pss[m] - ps[m] * ps[m] / m, 0.0)
+    best_k: Optional[int] = None
+    best_cost = math.inf
+    for k in range(min_size, m - min_size + 1):
+        sl, sl2 = ps[k], pss[k]
+        sr, sr2 = ps[m] - ps[k], pss[m] - pss[k]
+        cost = (sl2 - sl * sl / k) + (sr2 - sr * sr / (m - k))
+        if cost < best_cost:
+            best_k, best_cost = k, cost
+    return best_k, max(best_cost, 0.0), total
+
+
 def change_points(
     xs: Sequence[float],
     min_size: int = 2,
     n_obs: int = 1,
     min_effect: float = 0.01,
+    alpha: float = 0.05,
+    n_permutations: int = 300,
+    observations: Optional[Sequence[Sequence[float]]] = None,
 ) -> list[int]:
-    """BIC-penalised binary segmentation: split where the residual sum of
-    squares drops enough to justify the extra regime. Returns sorted indices of
-    the first sample of each new regime.
+    """Permutation-calibrated binary segmentation: split where the best split
+    buys more than reshuffling the same data ever does. Returns sorted indices
+    of the first sample of each new regime.
 
-    `n_obs` is the number of INDEPENDENT observations behind each point of
-    `xs` — for the beat curves this runs on, the twin count. It is not
-    decoration. BIC's penalty is k·ln(N) with N the number of observations the
-    likelihood was computed from, and the whole consistency argument for BIC
-    depends on N being the real sample size. Running the criterion on a curve of
-    m beat-*means* while the data underneath is m·n_twins twin-beat ratings
-    charges ln(m) where it owes ln(m·n_twins).
+    **Why the BIC criterion this replaces was uncalibrated.** Its statistic,
+    max_k [m·ln(RSS0/RSS_k)], is a MAXIMUM over every admissible split, so it
+    is not χ²(2)-ish; its null distribution depends hard on the segment
+    length; and recursive segmentation added uncorrected multiplicity on top.
+    A fixed penalty — even one charged at the effective sample size m·n_obs —
+    cannot hold a nominal level across those regimes. Measured on pure-noise
+    beat-mean curves as the product makes them (per twin per beat N(0.5,
+    0.15) clipped to [0,1], averaged across twins; min_size=1; 2000
+    trials/cell; nominal 5%), the BIC version's false-positive rate was a
+    function of both counts: at m=8 beats, **19.8% / 9.5% / 5.4% / 3.4%** for
+    3 / 8 / 20 / 40 twins — and on the short curves the product actually
+    produces, far worse: m=4: **43.6% / 28.8% / 18.6% / 12.3%**; m=3:
+    **63.3% / 43.6% / 33.7% / 24.9%**. (The 7.0% this docstring used to claim
+    was one cell of that grid — 8 beats at 20 twins — not a level.)
 
-    The consequence is not a rounding error, because the likelihood-ratio term
-    m·ln(RSS0/RSS1) is scale-free. Averaging shrinks the residual noise of the
-    curve by √n_twins but leaves the ratio untouched, so as the twin count rises
-    *every* systematic wobble — however practically meaningless — produces an
-    arbitrarily large ratio and clears a penalty that never moved. Measured on
-    pure-noise mean curves (8 beats, 20 twins, 200 trials) the old criterion
-    declared a structural break in **36.5%** of them; with the penalty charged
-    at the effective sample size it is 7.0%.
+    **The fix.** The statistic is now the between-segment sum of squares,
+    S = RSS0 − min_k RSS_k: how much of the curve's variation the best split
+    explains, in the units of the series. It is compared against the
+    distribution of the SAME max-over-k statistic on `n_permutations` seeded
+    reshuffles of the segment, and a split is accepted only if
+    p = (1 + #{S_perm ≥ S}) / (draws + 1) ≤ `alpha` AND it clears the
+    `min_effect` ROPE. Two nulls, chosen by what the caller can supply:
 
-    Two further corrections:
+    - **`observations` given** — beats × observations-per-beat; for the
+      product path, each beat's per-twin ratings. Each twin's ratings are
+      reshuffled across the segment's beats INDEPENDENTLY PER TWIN and the
+      beat-mean curve recomputed. That is a stratified test of "no beat
+      structure shared across twins", and it is what the old `n_obs`
+      argument was reaching for: the fact that a 4-point curve rests on 4·20
+      ratings enters through how tight the recomputed means are, not through
+      a ln(m·n_obs) penalty. Calibrated at every beat count, including m=3-4.
+    - **curve only** — the beat means themselves are reshuffled. Valid but
+      structurally conservative, and not by a little: the max statistic is
+      invariant to permutation WITHIN each candidate segment, so at least
+      2·k!(m−k)!/m! of all arrangements tie with the observed one and p can
+      never fall below 2/C(m,k). Measured false positives 0.0% at m ≤ 5,
+      0.1% at m=6, 2.1-2.5% at m=8 and 3.0-4.2% at m=10 — a test that mostly
+      cannot fire on a short curve. Pass the twin ratings if you have them.
 
-    **`best_cost <= 1e-12` auto-ACCEPTED.** A split that drives the residual to
-    zero short-circuited the test entirely, on the reasoning that a perfect fit
-    must be real. It is the opposite: a perfect fit is what a *degenerate* split
-    looks like. Verified — `change_points([0.5, 0.5, 0.500001, 0.500001],
-    min_size=1)` returned `[2]`, announcing an attention collapse on a shift of
-    one part in five hundred thousand. The residual is now floored so a perfect
-    split still has to clear the penalty like everything else.
+    `n_obs` is accepted for signature compatibility and no longer sets any
+    threshold: the null is conditional on the observed data, so it
+    self-calibrates to whatever noise the twin count left on the curve.
 
-    **A practical-significance floor.** Because the criterion is scale-free it
-    cannot, on its own, distinguish a real structural break from a real but
-    negligible one. `min_effect` is a ROPE on the difference between the two
-    segment means, in the units of the series (attention curves are 0-1, so the
-    0.01 default is one point on a 0-100 scale). This is the same gate
+    **Measured after the fix**, twin-level null, min_size=1, 2000
+    trials/cell, at 3 / 8 / 20 / 40 twins:
+
+        m=3   0.3%  4.9%  4.5%  5.4%      m=8    5.1% 4.9% 4.9% 4.9%
+        m=4   3.5%  5.4%  5.2%  4.5%      m=8q   4.8% 5.2% 3.7% 4.0%
+        m=5   4.1%  5.2%  6.5%  5.1%      m=10   5.2% 6.0% 5.1% 5.4%
+        m=6   5.4%  5.2%  4.6%  4.2%      m=10q  4.3% 4.5% 4.3% 4.3%
+
+    (q = the 0.1-quantised variant, since twin scores are quantised; the
+    default min_size=2 measures the same, 4.6-6.1% at m=8-10.) The level is
+    flat in both counts instead of ranging 3% to 63%. The one conservative
+    corner is 3 beats × 3 twins, where the whole randomization support is
+    (3!)³ = 216 arrangements.
+
+    **Power**, true step 0.5 → 0.62 at beat 5 of 8: **70.2% at 8 twins,
+    98.8% at 20, 100% at 40**, against 63.0% / 80.6% for the uncalibrated
+    BIC. The calibration is not paid for in power here — it is *gained*,
+    because the twin-level null replaces a scale-free ratio with a statistic
+    that uses the observation scale. (On the curve-only null the same step
+    scores 32.1% / 65.5%, the price of having no twin data.)
+
+    **Runtime** on 10-beat curves, the streaming path's budget being ~50 ms:
+    0.13 ms curve-level; twin-level 0.10 / 0.22 / 0.22 / 0.69 ms at 8 / 20 /
+    40 / 200 twins on a null curve (the null loop stops as soon as p > alpha
+    is certain), 3.8-13.2 ms when a split IS accepted and every draw must
+    run, and 9.7 ms (40 twins) / 34.0 ms (200 twins) on a pathological
+    4-regime curve that splits at every level.
+
+    Deterministic: the permutation RNG is seeded from the segment's own
+    values, so repeated calls on the same curve agree exactly.
+
+    Two retained corrections from the previous version:
+
+    **A zero-residual split must not short-circuit the test.** A split that
+    drives the residual to zero is what a *degenerate* split looks like, not
+    proof of structure — `change_points([0.5, 0.5, 0.500001, 0.500001],
+    min_size=1)` once returned `[2]`, announcing an attention collapse on a
+    shift of one part in five hundred thousand. The residual is floored so a
+    perfect split still has to beat the null like everything else (and the
+    ROPE below rejects it anyway).
+
+    **A practical-significance floor.** A calibrated test still cannot, on
+    its own, distinguish a real structural break from a real but negligible
+    one. `min_effect` is a ROPE on the difference between the two segment
+    means, in the units of the series (attention curves are 0-1, so the 0.01
+    default is one point on a 0-100 scale). This is the same gate
     `kmeans_auto` applies to centroid spread and for the same reason.
     """
     n = len(xs)
     if n < 2 * min_size + 1:
         return []
-    n_obs = max(1, int(n_obs))
+    obs_ok = (
+        observations is not None
+        and len(observations) == n
+        and all(len(col) == len(observations[0]) for col in observations)
+        and len(observations[0]) >= 2
+    )
+    n_perm = max(1, int(n_permutations))
+    if obs_ok:
+        # The twin-level null costs O(draws · beats · twins), and a study may
+        # carry 200+ twins. Cap the work per segment so the streaming path
+        # keeps its budget; 99 draws is the floor because it is the coarsest
+        # grid on which p = (1 + exceed)/(draws + 1) can still certify 0.05.
+        # A permutation test is exact at any draw count — the cap costs
+        # p-resolution, never level.
+        per_draw = n * len(observations[0])
+        n_perm = max(99, min(n_perm, _NULL_WORK_CAP // max(1, per_draw)))
+    # Rejection needs (1 + exceed) / (n_perm + 1) <= alpha. Once `exceed`
+    # passes this bound the split can no longer be accepted, so the null loop
+    # stops early — the decision is identical, and a clearly-null segment
+    # settles in ~exceed_max/p_true draws instead of n_perm.
+    exceed_max = int(alpha * (n_perm + 1) - 1 + 1e-9)
+    if exceed_max < 0:
+        return []  # alpha below the resolution n_permutations can certify
     out: list[int] = []
 
     def recurse(lo: int, hi: int) -> None:
@@ -303,34 +430,64 @@ def change_points(
         base = _rss(seg)
         if base <= 1e-12:  # a perfectly flat parent has nothing to split
             return
-        best_k, best_cost = None, base
-        # `m - min_size` IS an admissible split — it leaves a right segment of
-        # exactly min_size, the same size the left segment is allowed. The
-        # exclusive bound silently required the right segment to hold at least
-        # min_size + 1, so the last beat could never end a segment: a collapse
-        # in the *ending* returned [] while the identical collapse in the
-        # opening returned [1]. For content analysis that is the worst possible
-        # asymmetry — peak-end says the ending is the part that gets
-        # remembered, and peak_end_memory reads the same curve.
-        for k in range(min_size, m - min_size + 1):
-            cost = _rss(seg[:k]) + _rss(seg[k:])
-            if cost < best_cost:
-                best_k, best_cost = k, cost
+        best_k, best_cost, _ = _best_split(seg, min_size)
         if best_k is None:
             return
         left, right = seg[:best_k], seg[best_k:]
         if abs(sum(left) / len(left) - sum(right) / len(right)) < min_effect:
             return
-        # ΔBIC: m·ln(RSS0/RSS1) must beat 2 extra params (the second mean and
-        # the split location) · ln(effective N). The floor on best_cost keeps a
-        # zero-residual split finite instead of letting it bypass the test.
-        statistic = m * math.log(base / max(best_cost, 1e-300))
-        penalty = 2.0 * math.log(m * n_obs)
-        if statistic > penalty:
-            split = lo + best_k
-            recurse(lo, split)
-            out.append(split)
-            recurse(split, hi)
+        # Between-segment sum of squares — the size of the step the best split
+        # buys, in the units of the series. NOT the scale-free ratio
+        # m·ln(RSS0/RSS_k) the BIC criterion used: under the twin-level null
+        # every surrogate has its own RSS0, and dividing by it discards
+        # exactly the evidence the twin data carries — that the observed mean
+        # curve is far tighter within its segments than reshuffling can make
+        # it. Measured cost of the ratio form on the twin-level null: power on
+        # the 8-beat step fell to 38.8% at 8 twins (70.2% here) and 79.1% at
+        # 20 (98.8% here), and the 4-beat 0.95 → 0.25 collapse in
+        # test_aggregate_content_study_end_to_end went UNDETECTED with nine
+        # twins that all saw it. Under the curve-level null the two forms are
+        # the same test — reshuffling the means leaves RSS0 fixed, so ranking
+        # by RSS0 − cost and by RSS0/cost coincide.
+        observed = base - best_cost
+        # Data-derived seed: identical curves give identical splits on every
+        # call, which the streaming path and the tests both rely on.
+        rng = random.Random(
+            "change_points|" + ",".join(f"{v:.9g}" for v in seg)
+        )
+        if obs_ok:
+            # One list per twin, restricted to this segment's beats.
+            n_twins = len(observations[0])
+            twin_rows = [
+                [observations[lo + j][t] for j in range(m)]
+                for t in range(n_twins)
+            ]
+        else:
+            vals = list(seg)
+        draw = rng.random
+        exceed = 0
+        for _ in range(n_perm):
+            if obs_ok:
+                # Sorting on i.i.d. uniform keys is a uniform permutation, and
+                # measured 2x faster than random.shuffle here because the keys
+                # come from one C-level call each and the sort itself is C.
+                for row in twin_rows:
+                    row.sort(key=lambda _v: draw())
+                surro = [sum(col) / n_twins for col in zip(*twin_rows)]
+            else:
+                rng.shuffle(vals)
+                surro = vals
+            _, cost, total = _best_split(surro, min_size)
+            # Scored against the surrogate's own RSS0 — see _best_split.
+            if total - cost >= observed - 1e-12:
+                exceed += 1
+                if exceed > exceed_max:
+                    return  # p > alpha is already certain
+        # Here (1 + exceed) / (n_perm + 1) <= alpha: accept the split.
+        split = lo + best_k
+        recurse(lo, split)
+        out.append(split)
+        recurse(split, hi)
 
     recurse(0, n)
     return sorted(out)
@@ -690,28 +847,70 @@ def aggregate_content_study(
         return sequence is None or sequence.supports(stat)
 
     n_seg = len(segments)
-    # mean curve + CI per dimension per beat
+    # Mean curve + SIMULTANEOUS band per dimension.
+    #
+    # These were per-beat percentile intervals from independent `bootstrap_ci`
+    # calls, which is wrong twice. Independent resampling at each beat asserts
+    # that a twin's beat-3 rating says nothing about its beat-4 rating — false,
+    # because twins have baselines — and pointwise 95% intervals drawn across a
+    # curve are read as a band while covering the whole curve far less often
+    # than they appear to. Measured coverage of an 8-beat curve: 50.3% at 8
+    # twins, 62.7% at 20, against the 95% the chart is announcing. With nine
+    # dimensions on screen that is dozens of invitations to find the one beat
+    # that looks different, and one of them always does.
+    #
+    # `curve_cis` is now the sup-t band (97-99% measured simultaneous coverage)
+    # because that is the one that gets drawn. The pointwise version is kept
+    # alongside it, clearly named, for anyone comparing a single beat against a
+    # single pre-registered prediction — the one question it is valid for.
     curves: dict[str, list[float]] = {}
-    cis: dict[str, list[list[float]]] = {}
+    cis: dict[str, list[list[float]] | None] = {}
+    pointwise: dict[str, list[list[float]] | None] = {}
+    band_meta: dict[str, dict] = {}
+    attention_by_beat: list[list[float]] = []
     for dim in DIMS:
-        mean_curve, ci_curve = [], []
-        for i in range(n_seg):
-            vals = [getattr(r.appraisals[i], dim) for r in responses]
-            mean_curve.append(round(sum(vals) / len(vals), 4))
-            ci = bootstrap_ci(vals)
-            ci_curve.append([round(ci[0], 4), round(ci[1], 4)] if ci else None)
-        curves[dim] = mean_curve
-        cis[dim] = ci_curve
+        per_beat = [
+            [getattr(r.appraisals[i], dim) for r in responses] for i in range(n_seg)
+        ]
+        if dim == "attention":
+            attention_by_beat = per_beat  # the change-point null needs the raw ratings
+        curves[dim] = [round(sum(col) / len(col), 4) for col in per_beat]
+        band = simultaneous_band(per_beat)
+        if band is None:
+            # Too few twins to resample a curve. An absent band is honest; a
+            # per-beat interval substituted here would be the exact overclaim
+            # the band exists to stop.
+            cis[dim] = None
+            pointwise[dim] = None
+            continue
+        cis[dim] = band["band"]
+        pointwise[dim] = band["pointwise"]
+        band_meta[dim] = {
+            "critical_value": band["critical_value"],
+            "bonferroni_critical_value": band["bonferroni_critical_value"],
+            "se": band["se"],
+            "degenerate": band["degenerate"],
+        }
 
     attention_curves = [[a.attention for a in r.appraisals] for r in responses]
     isc = intersubject_correlation(attention_curves)
-    # Beat curves are short (3-8 points) — allow single-beat regimes. n_obs is
-    # the twin count: `curves["attention"]` is a mean across twins, so the
-    # likelihood behind each point rests on len(responses) ratings, not one.
-    # Without it the BIC penalty is charged at the wrong sample size and the
-    # segmenter fires on averaging noise (36.5% of pure-noise curves).
+    # Beat curves are short (3-8 points) — allow single-beat regimes. The raw
+    # per-beat twin ratings go in as `observations` so the permutation null is
+    # built by reshuffling each twin's beats, not by reshuffling the m beat
+    # means: m means alone carry a p-value floor of ~2/m! and the max
+    # statistic is invariant to permutation within each candidate segment, so
+    # the curve-only null cannot reach 5% below m ≈ 7 and is conservative
+    # above it (measured 0.0-0.4% at m ≤ 6, 2.1-4.2% at m = 8-10, against a
+    # nominal 5%). With the twin ratings the same test holds 4.0-6.2% at every
+    # beat and twin count measured. `n_obs` is passed for continuity of the
+    # public signature; it no longer sets a threshold.
     cps = (
-        change_points(curves["attention"], min_size=1, n_obs=len(responses))
+        change_points(
+            curves["attention"],
+            min_size=1,
+            n_obs=len(responses),
+            observations=attention_by_beat,
+        )
         if _supports("change_points")
         else None
     )
@@ -775,7 +974,18 @@ def aggregate_content_study(
         "twin_count": len(responses),
         "cognitive_load": load,
         "curves": curves,
+        # Simultaneous — safe to read across the whole curve, which is how a
+        # chart is read whatever the caption says.
         "curve_cis": cis,
+        "curve_pointwise_cis": pointwise,
+        "curve_band_meta": band_meta,
+        "band_method": (
+            "sup-t simultaneous confidence bands (studentized subject-level "
+            "bootstrap): 95% coverage of the ENTIRE curve, not of each beat "
+            "separately. Wider than pointwise intervals by design — pointwise "
+            "bands over 8 beats were measured to cover the whole curve only "
+            "50-63% of the time."
+        ),
         "isc": isc,
         "change_points": cps,
         "memory": memory,
@@ -857,7 +1067,11 @@ async def stream_content_study(
 
     yield {"type": "stage", "stage": "isc", "detail": "inter-subject correlation of attention trajectories"}
     if sequence.supports("change_points"):
-        yield {"type": "stage", "stage": "changepoints", "detail": "BIC-penalised change-point detection"}
+        yield {
+            "type": "stage",
+            "stage": "changepoints",
+            "detail": "permutation-calibrated change-point detection",
+        }
     if sequence.supports("peak_end"):
         yield {"type": "stage", "stage": "memory", "detail": "per-twin peak-end + serial-position recall"}
     if sequence.supports("retention"):

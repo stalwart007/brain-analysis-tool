@@ -13,6 +13,7 @@ import { motion } from "framer-motion";
 import { CognitiveLoad, GenerationBand, ViralityResult } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useAgentCanvas } from "./sim/useAgentCanvas";
 import { ChartCursorProvider, useChartCursor, type ChartCursor } from "./charts/cursor";
 import ChartFrame from "./charts/ChartFrame";
@@ -41,6 +42,7 @@ function ViralityInner({ personaCount }: { personaCount: number }) {
   const [fanout, setFanout] = useState(6);
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");
+  const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [shares, setShares] = useState<{ share: number; reason: string }[]>([]);
@@ -70,7 +72,7 @@ function ViralityInner({ personaCount }: { personaCount: number }) {
     try {
       await streamRun(
         "/studies/virality/stream",
-        { content, fanout, twins_per_persona: twins, cognitive_load: load },
+        { content, fanout, twins_per_persona: twins, cognitive_load: load, research_question: question },
         (evt) => {
           if (evt.type === "agent") setShares((s) => [...s, { share: evt.share as number, reason: String(evt.reason) }]);
           else if (evt.type === "generation") setGens((g) => [...g, evt as unknown as Gen]);
@@ -102,6 +104,13 @@ function ViralityInner({ personaCount }: { personaCount: number }) {
         placeholder={SAMPLE}
         className="w-full resize-y rounded-xl border border-hairline bg-surface-2 p-3.5 text-sm outline-none placeholder:text-muted focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
       />
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. is this actually shareable, or just likeable?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <button onClick={() => setContent(SAMPLE)}
           className="rounded-lg border border-dashed border-hairline px-3 py-1.5 text-xs text-muted transition hover:border-accent/50 hover:text-ink-2">
@@ -155,6 +164,7 @@ function ViralityInner({ personaCount }: { personaCount: number }) {
 
       {result && (
         <div className="mt-4 space-y-3">
+        <FindingsPanel findings={result.findings} />
           <div className="grid gap-3 sm:grid-cols-4">
             <Stat label="R₀ (reproduction)" value={result.r0.toFixed(2)}
               sub={result.r0_ci ? `95% CI ${result.r0_ci[0].toFixed(2)}–${result.r0_ci[1].toFixed(2)}` : ""}
@@ -226,25 +236,50 @@ function ViralityInner({ personaCount }: { personaCount: number }) {
               );
             })()
           ) : (
-            result.criticality && (
-              <p className="font-mono text-[10px] text-ink-2">
-                cascade-size tail:{" "}
-                <b className="text-accent">{result.criticality.regime}</b>
-                {result.criticality.alpha != null && (
-                  <>
-                    {" "}(α {result.criticality.alpha.toFixed(2)}
-                    {result.criticality.alpha_se != null &&
-                      ` ± ${result.criticality.alpha_se.toFixed(2)}`}
-                    {result.criticality.xmin != null &&
-                      `, xₘᵢₙ ${result.criticality.xmin.toFixed(1)}`}
-                    )
-                  </>
-                )}
-                {result.criticality.p_value != null &&
-                  ` · p ${result.criticality.p_value.toFixed(3)}`}{" "}
-                — {result.criticality.interpretation}
-              </p>
-            )
+            result.criticality &&
+            (() => {
+              const c = result.criticality;
+              // α is a parameter of a model that may have been REJECTED. Printing
+              // it in the same weight either way is how a fitted number for a
+              // wrong model gets read as the measured tail index — so a rejected
+              // fit is struck through and labelled, not merely accompanied by a
+              // p-value the reader has to interpret unaided.
+              const rejected = c.power_law_plausible === false;
+              return (
+                <p className="font-mono text-[10px] text-ink-2">
+                  cascade-size tail:{" "}
+                  <b className={rejected ? "text-accent-2" : "text-accent"}>{c.regime}</b>
+                  {c.alpha != null && (
+                    <>
+                      {" "}
+                      <span
+                        className={rejected ? "text-muted line-through" : undefined}
+                        title={
+                          rejected
+                            ? "fitted, but the power law was rejected by its goodness-of-fit test — not a measured tail index"
+                            : undefined
+                        }
+                      >
+                        (α {c.alpha.toFixed(2)}
+                        {c.alpha_se != null && ` ± ${c.alpha_se.toFixed(2)}`}
+                        {c.xmin != null && `, xₘᵢₙ ${c.xmin.toFixed(1)}`})
+                      </span>
+                    </>
+                  )}
+                  {c.p_value != null && (
+                    <>
+                      {" "}· goodness-of-fit p {c.p_value.toFixed(3)}
+                      {c.power_law_plausible != null && (
+                        <span className={rejected ? "text-accent-2" : "text-good"}>
+                          {rejected ? " · power law rejected" : " · power law holds"}
+                        </span>
+                      )}
+                    </>
+                  )}{" "}
+                  — {c.interpretation}
+                </p>
+              );
+            })()
           )}
           <p className="font-mono text-[10px] text-muted">{result.method}</p>
           <p className="text-[9px] leading-tight text-muted">{result.disclaimer}</p>

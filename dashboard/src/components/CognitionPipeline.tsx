@@ -295,9 +295,15 @@ function HMMPanel({ hmm }: { hmm: HMMResult }) {
           />
         ))}
       </div>
-      <div className="mt-1 min-h-4 font-mono text-[9px]">
+      {/* Reserved height, tabular figures, and clamped. `min-h-4` held 16px
+          against a four-clause sentence that wraps to two lines at 9px — so
+          every pass along the state ribbon moved the legend, the transition
+          matrix and the metrics below it. The state LABEL is model-authored
+          text of no bounded length, which is what makes the clamp necessary
+          rather than merely tidy. */}
+      <div className="mt-1 min-h-[2.25rem] font-mono text-[9px] leading-relaxed tabular-nums">
         {activeRun !== null && runs[activeRun] ? (
-          <span className="text-ink-2">
+          <span className="line-clamp-2 text-ink-2">
             <span className="text-ink">{hmm.states[runs[activeRun].state]?.label}</span>
             {" · "}
             {runs[activeRun].len} event{runs[activeRun].len === 1 ? "" : "s"}
@@ -454,10 +460,16 @@ function InfoPanel({ info }: { info: InfoDynamics }) {
         </div>
       )}
       {/* The readout, so a transition probability is a sentence rather than a
-          shade of blue to be decoded against its row maximum. */}
-      <div className="mt-1 min-h-4 font-mono text-[9px]">
+          shade of blue to be decoded against its row maximum.
+
+          Same reservation as the state ribbon above: `min-h-4` held one line
+          while both branches wrap to two in this column, so hovering the matrix
+          moved the entropy-rate strip beneath it. The probability is
+          `tabular-nums` because it changes on every cell and proportional
+          digits drag the pinned-✕ button sideways with them. */}
+      <div className="mt-1 min-h-[2.25rem] font-mono text-[9px] leading-relaxed tabular-nums">
         {P && cursor.cell ? (
-          <span className="text-ink-2">
+          <span className="line-clamp-2 text-ink-2">
             P({SYMBOLS[cursor.cell.row]} → {SYMBOLS[cursor.cell.col]}) ={" "}
             <span className="text-accent">
               {(P[cursor.cell.row]?.[cursor.cell.col] ?? 0).toFixed(3)}

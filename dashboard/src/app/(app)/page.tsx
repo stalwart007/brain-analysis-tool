@@ -179,9 +179,9 @@ export default function DashboardPage() {
         <StationHeader
           spec={CALIBRATION}
           title="Calibration"
-          lede="Engagement and intent across every run. Record real outcomes on the Experiments station and this becomes a measured error curve rather than a trend line."
+          lede="Every run as a mean with its 95% interval — not a trend line, because consecutive runs are different studies and nothing joins them. Record a real outcome on the Experiments station and it is drawn beside its prediction, with the gap between them as the error."
         />
-        <div className="card h-72 p-6">
+        <div className="card p-6">
           <RunsChart runs={swarmRuns} />
         </div>
       </Station>

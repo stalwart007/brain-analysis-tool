@@ -1,10 +1,16 @@
 """Known-answer tests for the Galton-Watson virality engine."""
 
+import math
+import random
+
 import pytest
 
+import app.virality as virality
 from app.virality import (
+    cascade_tail_test,
     extinction_probability,
     final_size_bins,
+    hurwitz_zeta,
     simulate_cascades,
     virality_result,
 )
@@ -78,3 +84,167 @@ def test_virality_result_supercritical_has_takeoff():
     assert r["expected_cascade_size"] is None
     assert 0.0 < r["extinction_q_hetero"] < 1.0
     assert r["takeoff_probability"] > 0.5
+
+
+# ───────────────── discrete power-law tail test (Clauset 2009) ────────────
+#
+# Regression tests for the fix to the cascade-size tail fit. The old call site
+# handed integer cascade sizes to the CONTINUOUS Clauset fit in cognition.py
+# and asserted "power-law tail" with no goodness-of-fit test at all.
+
+
+def test_hurwitz_zeta_matches_known_closed_forms():
+    """Euler–Maclaurin ζ(s, q) against values with exact closed forms.
+
+    Measured worst relative error across this set and a 3-million-term brute
+    force at (1.05, 1), (1.5, 6), (1.2, 3) and (5, 2): 1.04e-11.
+    """
+    assert hurwitz_zeta(2.0, 1.0) == pytest.approx(math.pi**2 / 6, rel=1e-10)
+    assert hurwitz_zeta(4.0, 1.0) == pytest.approx(math.pi**4 / 90, rel=1e-10)
+    assert hurwitz_zeta(3.0, 1.0) == pytest.approx(1.2020569031595943, rel=1e-10)
+    assert hurwitz_zeta(1.5, 1.0) == pytest.approx(2.612375348685488, rel=1e-10)
+    # Hurwitz at q = 1/2: ζ(s, 1/2) = (2^s − 1)·ζ(s)
+    assert hurwitz_zeta(2.0, 0.5) == pytest.approx(math.pi**2 / 2, rel=1e-10)
+    # ζ(s, q) − ζ(s, q+1) = q^(−s) exactly, at a hard (near-pole) s
+    assert hurwitz_zeta(1.05, 3.0) - hurwitz_zeta(1.05, 4.0) == pytest.approx(
+        3.0**-1.05, rel=1e-10
+    )
+
+
+def test_hurwitz_zeta_refuses_outside_its_domain():
+    with pytest.raises(ValueError):
+        hurwitz_zeta(1.0, 1.0)  # pole
+    with pytest.raises(ValueError):
+        hurwitz_zeta(2.0, 0.0)
+
+
+def test_discrete_mle_recovers_alpha_on_synthetic_power_law():
+    """The estimator is unbiased on data from its own model.
+
+    Over 100 seeded n=1000 samples the fit measured 1.5011 ± 0.0183 at α = 1.5
+    and 2.5059 ± 0.0517 at α = 2.5. One seeded draw each is pinned here.
+    """
+    for alpha_true in (1.5, 2.5):
+        draw = virality._powerlaw_sampler(alpha_true, 1)
+        rng = random.Random(42)
+        xs = [draw(rng.random()) for _ in range(4000)]
+        fit = virality._fit_discrete_tail(xs)
+        assert fit is not None
+        # within 4 standard errors of truth, and the SE itself is honest
+        assert abs(fit["alpha"] - alpha_true) < 4 * fit["alpha_se"]
+        assert 0.0 < fit["alpha_se"] < 0.1
+
+
+def test_discrete_fit_beats_continuous_on_critical_galton_watson():
+    """Critical GW total progeny has tail exponent exactly 3/2.
+
+    The continuous fit in cognition.py — which this call site used to call —
+    reads α = 1.5795 on this sample; the discrete zeta MLE reads 1.5462, and
+    keeps 722 tail points against the continuous fit's 439. Pinned as a
+    regression: the whole point of the change is that the discrete estimator
+    lands closer to theory on integer data.
+    """
+    from app.cognition import powerlaw_vs_exponential
+
+    original = virality.MAX_GENERATIONS
+    try:
+        # Lift the horizon so censoring is ~0 and the sizes are real
+        # observations rather than lower bounds.
+        virality.MAX_GENERATIONS = 3000
+        sims = simulate_cascades([0.25], 4, n_sims=2000, seed=11)
+    finally:
+        virality.MAX_GENERATIONS = original
+    sizes = [
+        int(f) for f, c in zip(sims["final_sizes"], sims["censored"]) if f > 0 and not c
+    ]
+    assert sims["censored_frac"] < 0.01
+
+    continuous = powerlaw_vs_exponential([float(x) for x in sizes])
+    discrete = virality._fit_discrete_tail(sizes)
+    assert discrete is not None
+    assert abs(discrete["alpha"] - 1.5) < abs(continuous["alpha"] - 1.5)
+    assert discrete["alpha"] == pytest.approx(1.5462, abs=0.02)
+    assert discrete["n"] > continuous["n"]
+
+
+def test_gof_does_not_reject_data_from_its_own_model():
+    """Calibration: 7.0% of p-values fell below 0.1 over 100 seeded trials at
+    n = 1000, α = 1.5 (nominal 10%). This seed is one that does not reject."""
+    draw = virality._powerlaw_sampler(1.5, 1)
+    rng = random.Random(9000)
+    xs = [draw(rng.random()) for _ in range(1000)]
+    r = cascade_tail_test(xs, seed=0)
+    assert r is not None
+    assert r["power_law_plausible"] is True
+    assert r["gof_p_value"] >= 0.1
+    assert r["regime"] == "levy_like"
+    assert r["alpha"] == pytest.approx(1.5, abs=0.1)
+
+
+def test_gof_rejects_geometric_tails_and_never_calls_them_heavy():
+    """Power: over 150 seeded geometric / discretised-exponential samples at
+    n = 1000, rejection rates were 72–80% and ZERO were labelled `levy_like`
+    or `heavy_tailed`. The no-false-heavy-tail property is the one that
+    matters for a product that sells "this could go viral", so it is asserted
+    across seeds rather than pinned to one.
+    """
+    theta = 0.15
+    scale = -math.log(1.0 - theta)
+    for trial in range(6):
+        rng = random.Random(4000 + trial)
+        xs = [1 + int(rng.expovariate(scale)) for _ in range(1000)]
+        r = cascade_tail_test(xs, seed=trial)
+        assert r is not None
+        assert r["regime"] not in ("levy_like", "heavy_tailed")
+        assert r["power_law_plausible"] is False
+
+
+def test_tail_test_is_deterministic_and_reports_its_uncertainty():
+    sizes = [int(f) for f in simulate_cascades([0.2], 4, n_sims=1500, seed=7)["final_sizes"]]
+    a = cascade_tail_test(sizes, seed=11)
+    b = cascade_tail_test(sizes, seed=11)
+    assert a == b
+    # every claim carries the evidence for it
+    for key in (
+        "alpha", "alpha_se", "xmin", "ks_distance", "p_value", "gof_p_value",
+        "power_law_plausible", "vuong_z", "vuong_p_value", "regime",
+        "interpretation", "n", "n_total", "gof_sims", "discrete", "method",
+    ):
+        assert key in a, key
+    assert a["p_value"] == a["gof_p_value"]  # headline p tests the headline claim
+    assert a["discrete"] is True
+    assert isinstance(a["xmin"], int)  # integer support, not a float cut-point
+    assert a["gof_sims"] == 100
+
+
+def test_tail_test_refuses_samples_too_small_to_fit():
+    assert cascade_tail_test([1, 1, 2, 3, 5]) is None
+    assert cascade_tail_test([7] * 40) is None  # degenerate: no spread to fit
+
+
+def test_virality_result_wires_in_the_discrete_test():
+    """The subcritical path publishes a discrete fit with a GoF verdict, and
+    keeps the keys existing consumers read."""
+    r = virality_result([0.2] * 12, 4, "low")  # R0 = 0.8, censoring ~0
+    crit = r["criticality"]
+    assert crit is not None
+    assert crit["discrete"] is True
+    assert crit["power_law_plausible"] in (True, False)
+    # keys ViralityPanel.tsx / api.ts already read
+    for key in ("regime", "interpretation", "alpha", "alpha_se", "xmin", "p_value"):
+        assert key in crit
+    assert crit["censored_frac"] == r["simulated_size"]["censored_frac"]
+    assert crit["n_uncensored"] <= r["n_sims"]
+
+
+def test_censored_regimes_still_skip_the_tail_fit():
+    """`explosive` and `unresolved` must carry no tail fit — the sizes are
+    lower bounds. Guards the branch order after the rewrite, since the fit is
+    now the expensive path and must not run at all in these regimes."""
+    explosive = virality_result([0.9] * 12, 6, "low")["criticality"]
+    assert explosive["regime"] == "explosive"
+    assert "alpha" not in explosive and "gof_p_value" not in explosive
+
+    unresolved = virality_result([0.25] * 12, 4, "low")["criticality"]  # R0 = 1.0
+    assert unresolved["regime"] == "unresolved"
+    assert "alpha" not in unresolved and "gof_p_value" not in unresolved
