@@ -505,6 +505,24 @@ _ingest_limiter = _IngestLimiter(
     window_s=float(os.environ.get("COGNISWARM_INGEST_RATE_WINDOW_S", "60")),
 )
 
+#: The media relay, which is the one authenticated endpoint whose cost is
+#: BANDWIDTH rather than tokens.
+#:
+#: It will fetch up to 80 MB from an arbitrary public URL and stream it back, so
+#: a key-holder — or anything that has got hold of a key — can turn it into an
+#: egress amplifier and the bill lands on the Fly account, not on OpenAI's.
+#: Nothing else here has that shape: every other endpoint is bounded by twin
+#: counts, which `MAX_TWINS_PER_RUN` already caps.
+#:
+#: The legitimate ceiling is small and knowable. A YouTube ingest relays at most
+#: five spritesheets plus four stills plus a thumbnail — ten requests — and a
+#: hosted MP4 is one. Sixty a minute is six full ingests back to back, which no
+#: human reaches and a script exceeds immediately.
+_relay_limiter = _IngestLimiter(
+    limit=int(os.environ.get("COGNISWARM_RELAY_RATE_LIMIT", "60")),
+    window_s=float(os.environ.get("COGNISWARM_RELAY_RATE_WINDOW_S", "60")),
+)
+
 
 _ID_SEGMENT = re.compile(
     r"^(?:"
@@ -1670,7 +1688,9 @@ async def content_fetch(caller: CallerDep, request: PageFetchRequest) -> dict:
 
 
 @app.post("/v1/content/media")
-async def content_media(caller: CallerDep, request: PageFetchRequest) -> StreamingResponse:
+async def content_media(
+    caller: CallerDep, request: PageFetchRequest, http: Request
+) -> StreamingResponse:
     """Relay video/audio bytes to the browser, which decodes them.
 
     THE PROBLEM THIS SOLVES. Keyframe extraction already happens client-side —
@@ -1704,6 +1724,23 @@ async def content_media(caller: CallerDep, request: PageFetchRequest) -> Streami
     relayed through here can be interpreted as script — or as an image — by the
     browser that receives it.
     """
+    # Metered per API key, not per IP: in the deployed topology every request
+    # arrives from the dashboard proxy, so the socket peer is the same for
+    # everyone and the key is the only thing that distinguishes callers. An
+    # unscoped key falls back to a shared bucket, which is the conservative
+    # direction — it throttles the admin key rather than exempting it.
+    client = http.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        http.client.host if http.client else "unknown"
+    )
+    if not _relay_limiter.allow(caller.site_id or "unscoped", client):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many relay requests. This endpoint moves whole media files, "
+                "so it is capped separately from the analysis API."
+            ),
+            headers={"Retry-After": str(int(_relay_limiter.window_s))},
+        )
     if is_player_url(request.url) and not is_youtube_url(request.url):
         raise HTTPException(
             status_code=422, detail="That is a player page, not a media file."
