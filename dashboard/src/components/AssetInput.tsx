@@ -40,12 +40,141 @@ export interface ContentAsset {
 
 export const KINDS: { id: AssetKind; label: string; hint: string }[] = [
   { id: "text", label: "Script / copy", hint: "a video script, ad copy, an article" },
-  { id: "image", label: "Image", hint: "a static ad, poster, banner, screenshot" },
-  { id: "video", label: "Video", hint: "keyframes are extracted here in your browser" },
+  { id: "image", label: "Image", hint: "a static ad, poster, banner — upload or paste a link" },
+  { id: "video", label: "Video", hint: "upload or paste a link; keyframes are extracted in your browser" },
   { id: "audio", label: "Audio", hint: "a transcript, with timings if you have them" },
   { id: "page", label: "Landing page", hint: "paste a link — we read the page for you" },
-  { id: "document", label: "Deck / document", hint: "one block per slide or page" },
+  { id: "document", label: "Deck / document", hint: "paste a PDF link, or one block per slide" },
 ];
+
+/** What came back from POST /content/fetch, whatever kind it turned out to be. */
+export interface FetchedAsset {
+  kind: AssetKind;
+  final_url: string;
+  hops: string[];
+  bytes: number;
+  content_type: string;
+  note?: string;
+  sections?: string[];
+  pages?: string[];
+  page_count?: number;
+  asset: Partial<ContentAsset>;
+  media_relay?: string;
+}
+
+/**
+ * Paste a link, get an asset — for every modality, not just landing pages.
+ *
+ * The server decides what the URL actually IS from its content type and hands
+ * back either a ready asset (image, PDF, page) or a pointer to the media relay
+ * (video, audio). Nothing here guesses from the file extension, because the
+ * server does not either: a `.mp4` served as HTML is a player page.
+ */
+export function LinkInput({
+  kind,
+  onResolved,
+  disabled,
+  placeholder,
+}: {
+  kind: AssetKind;
+  onResolved: (fetched: FetchedAsset) => void | Promise<void>;
+  disabled?: boolean;
+  placeholder: string;
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    const target = url.trim();
+    if (!target) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/cs/content/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Sent as typed. Adding a scheme here would mean guessing https for a
+        // host that only serves http and reporting the wrong failure.
+        body: JSON.stringify({ url: target }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.detail ?? `Could not fetch that link (${res.status})`);
+      // The server may disagree with the picker about what this is — a link
+      // chosen under "Video" that resolves to an image is an image. Surfacing
+      // that beats studying the wrong thing silently.
+      if (data.kind !== kind) {
+        throw new Error(
+          `That link is ${data.kind === "page" ? "a web page" : `a ${data.kind}`} ` +
+            `(${data.content_type}), not ${kind === "image" ? "an image" : `a ${kind}`}. ` +
+            `Switch the content type above, or paste a different link.`
+        );
+      }
+      await onResolved(data as FetchedAsset);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not fetch that link");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="url"
+          inputMode="url"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (!busy && url.trim()) load();
+            }
+          }}
+          disabled={disabled || busy}
+          placeholder={placeholder}
+          aria-label={`${kind} URL`}
+          className="min-w-56 flex-1 rounded-lg border border-hairline bg-surface-2 px-3 py-2 text-sm outline-none placeholder:text-muted focus:border-accent/60 disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={load}
+          disabled={disabled || busy || !url.trim()}
+          className="rounded-lg border border-hairline px-3 py-2 text-xs text-ink-2 transition hover:border-accent/50 hover:text-ink disabled:opacity-40"
+        >
+          {busy ? "fetching…" : "fetch"}
+        </button>
+      </div>
+      {error && <p className="text-[11px] leading-relaxed text-critical">{error}</p>}
+    </div>
+  );
+}
+
+/** Provenance strip: what was actually retrieved, before any twins are spent. */
+function FetchReceipt({ fetched }: { fetched: FetchedAsset }) {
+  const redirected = fetched.hops.length > 1;
+  return (
+    <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
+      <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
+        <span className="text-good">✓ {fetched.kind}</span>
+        <span className="text-muted">{(fetched.bytes / 1024).toFixed(0)} kB</span>
+        <span className="text-muted">{fetched.content_type}</span>
+        {/* Where we ENDED UP, which is not always where they pointed — an apex
+            that lands on a regional or consent URL is a different asset from
+            the one they meant to study. */}
+        <span className="truncate text-muted">{fetched.final_url}</span>
+        {redirected && (
+          <span className="text-accent-2">· redirected {fetched.hops.length - 1}×</span>
+        )}
+      </div>
+      {fetched.note && (
+        <p className="mt-1 font-mono text-[9px] leading-relaxed text-muted">{fetched.note}</p>
+      )}
+    </div>
+  );
+}
 
 /** Sampled evenly across the duration. Ten frames over a 30s spot is one every
  *  three seconds — finer than the beat structure the study can resolve, and
@@ -146,6 +275,7 @@ export function AssetInput({
 }) {
   const [note, setNote] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  const [fetched, setFetched] = useState<FetchedAsset | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const textarea = (
@@ -179,6 +309,7 @@ export function AssetInput({
             if (!file) return;
             setWorking(true);
             setNote(null);
+            setFetched(null);
             try {
               if (isVideo) {
                 const frames = await extractKeyframes(file, (d, t) =>
@@ -198,6 +329,63 @@ export function AssetInput({
             }
           }}
         />
+
+        <div className="flex items-center gap-2">
+          <span className="h-px flex-1 bg-hairline" />
+          <span className="font-mono text-[9px] uppercase tracking-wider text-muted">
+            or paste a link
+          </span>
+          <span className="h-px flex-1 bg-hairline" />
+        </div>
+
+        <LinkInput
+          kind={kind}
+          disabled={disabled || working}
+          placeholder={
+            isVideo ? "https://cdn.yoursite.com/spot.mp4" : "https://yoursite.com/hero-ad.png"
+          }
+          onResolved={async (f) => {
+            setFetched(f);
+            setNote(null);
+            if (!isVideo) {
+              // An image arrives complete — the server already base64'd it.
+              onChange({ ...asset, kind, ...f.asset });
+              return;
+            }
+            // A video does NOT. The server relays the bytes and the BROWSER
+            // decodes them, which is the same boundary the upload path
+            // respects: no media decoder ever runs in the API process.
+            setWorking(true);
+            try {
+              setNote("downloading through the relay…");
+              const res = await fetch("/api/cs/content/media", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: f.final_url }),
+              });
+              if (!res.ok) throw new Error(`Relay failed (${res.status})`);
+              const blob = await res.blob();
+              const file = new File([blob], "remote-video", {
+                type: f.content_type || "video/mp4",
+              });
+              const frames = await extractKeyframes(file, (d, t) =>
+                setNote(`extracting keyframe ${d} of ${t}…`)
+              );
+              onChange({ ...asset, kind, frames });
+              setNote(`${frames.length} keyframes extracted in your browser`);
+            } catch (err) {
+              setNote(
+                err instanceof Error
+                  ? `${err.message} — try downloading the file and uploading it.`
+                  : "Could not decode that video."
+              );
+            } finally {
+              setWorking(false);
+            }
+          }}
+        />
+        {fetched && <FetchReceipt fetched={fetched} />}
+
         {note && <p className="font-mono text-[11px] text-accent">{note}</p>}
         {isVideo &&
           textarea(
@@ -219,6 +407,21 @@ export function AssetInput({
   if (kind === "audio") {
     return (
       <div className="space-y-2">
+        <LinkInput
+          kind="audio"
+          disabled={disabled}
+          placeholder="https://cdn.yoursite.com/episode.mp3"
+          onResolved={(f) => {
+            setFetched(f);
+            // A reachable audio file is confirmed here, but the STUDY still
+            // needs a transcript: nothing in this pipeline transcribes, and
+            // inventing beats from a waveform would be fabricating the content
+            // rather than analysing it. The receipt says the link is good; the
+            // transcript box below is still the input.
+            onChange({ ...asset, kind: "audio" });
+          }}
+        />
+        {fetched && <FetchReceipt fetched={fetched} />}
         {textarea(
           "Transcript. Prefix each line with a timestamp to get a timeline:\n0:00 Welcome back to the show\n0:14 Today we are talking about…",
           asset.transcript_cues?.length
@@ -243,6 +446,26 @@ export function AssetInput({
   if (kind === "document") {
     return (
       <div className="space-y-2">
+        <LinkInput
+          kind="document"
+          disabled={disabled}
+          placeholder="https://yoursite.com/deck.pdf"
+          onResolved={(f) => {
+            setFetched(f);
+            // Pages arrive already separated by the document itself. That is a
+            // FACT about the file, not an inference — re-segmenting a deck with
+            // a model would replace it with a guess.
+            onChange({ ...asset, kind: "document", pages: f.pages ?? [] });
+          }}
+        />
+        {fetched && <FetchReceipt fetched={fetched} />}
+        <div className="flex items-center gap-2">
+          <span className="h-px flex-1 bg-hairline" />
+          <span className="font-mono text-[9px] uppercase tracking-wider text-muted">
+            or paste the pages
+          </span>
+          <span className="h-px flex-1 bg-hairline" />
+        </div>
         {textarea(
           "One slide or page per block, separated by a blank line.",
           (asset.pages ?? []).join("\n\n"),
@@ -294,106 +517,44 @@ function PageInput({
   onChange: (a: ContentAsset) => void;
   textarea: (ph: string, value: string, set: (v: string) => void, rows?: number) => ReactNode;
 }) {
-  const [url, setUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [fetched, setFetched] = useState<{
-    final_url: string;
-    hops: string[];
-    sections: string[];
-  } | null>(null);
+  const [fetched, setFetched] = useState<FetchedAsset | null>(null);
   const [manual, setManual] = useState(false);
-
-  async function load() {
-    const target = url.trim();
-    if (!target) return;
-    setBusy(true);
-    setError(null);
-    setFetched(null);
-    try {
-      const res = await fetch("/api/cs/content/fetch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // Sent as typed. Adding a scheme here would mean guessing https for a
-        // host that only serves http and reporting the wrong failure.
-        body: JSON.stringify({ url: target }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(data?.detail ?? `Could not fetch that page (${res.status})`);
-      setFetched({ final_url: data.final_url, hops: data.hops ?? [], sections: data.sections ?? [] });
-      // The server returns extracted prose, not the page: real marketing HTML
-      // runs to megabytes and would blow the asset's text limit.
-      onChange({ ...asset, text: data.text });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not fetch that page");
-      onChange({ ...asset, text: "" });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const redirected = fetched && fetched.hops.length > 1;
 
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          type="url"
-          inputMode="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              if (!busy && url.trim()) load();
-            }
-          }}
-          disabled={busy}
-          placeholder="https://yourproduct.com/landing"
-          aria-label="Landing page URL"
-          className="min-w-56 flex-1 rounded-lg border border-hairline bg-surface-2 px-3 py-2 text-sm outline-none placeholder:text-muted focus:border-accent/60 disabled:opacity-50"
-        />
-        <button
-          type="button"
-          onClick={load}
-          disabled={busy || !url.trim()}
-          className="rounded-lg border border-hairline px-3 py-2 text-xs text-ink-2 transition hover:border-accent/50 hover:text-ink disabled:opacity-40"
-        >
-          {busy ? "fetching…" : "fetch page"}
-        </button>
-      </div>
-
-      {error && (
-        <p className="text-[11px] leading-relaxed text-critical">
-          {error}{" "}
-          <button type="button" onClick={() => setManual(true)} className="underline hover:text-ink">
-            paste the HTML instead
-          </button>
-        </p>
-      )}
+      <LinkInput
+        kind="page"
+        placeholder="https://yourproduct.com/landing"
+        onResolved={(f) => {
+          setFetched(f);
+          // The server returns extracted prose, not the page: real marketing
+          // HTML runs to megabytes and would blow the asset's text limit.
+          onChange({ ...asset, text: f.asset.text ?? "" });
+        }}
+      />
 
       {fetched && (
         <div className="rounded-lg border border-hairline/60 bg-black/20 p-2.5">
           <div className="flex flex-wrap items-baseline gap-x-2 font-mono text-[10px]">
-            <span className="text-good">✓ {fetched.sections.length} sections</span>
+            <span className="text-good">✓ {(fetched.sections ?? []).length} sections</span>
             {/* Where we ENDED UP, which is not always where they pointed —
                 an apex that lands on a regional or consent URL is a different
                 page from the one they meant to study. */}
             <span className="truncate text-muted">{fetched.final_url}</span>
-            {redirected && (
+            {fetched.hops.length > 1 && (
               <span className="text-accent-2">· redirected {fetched.hops.length - 1}×</span>
             )}
           </div>
           <ol className="mt-1.5 space-y-0.5">
-            {fetched.sections.slice(0, 4).map((s, i) => (
+            {(fetched.sections ?? []).slice(0, 4).map((s, i) => (
               <li key={i} className="truncate text-[11px] leading-snug text-ink-2">
                 <span className="mr-1 font-mono text-[9px] text-muted">{i + 1}</span>
                 {s}
               </li>
             ))}
-            {fetched.sections.length > 4 && (
+            {(fetched.sections ?? []).length > 4 && (
               <li className="font-mono text-[9px] text-muted">
-                +{fetched.sections.length - 4} more
+                +{(fetched.sections ?? []).length - 4} more
               </li>
             )}
           </ol>
@@ -404,7 +565,7 @@ function PageInput({
         </div>
       )}
 
-      {!fetched && !error && !manual && (
+      {!fetched && !manual && (
         <p className="font-mono text-[10px] leading-relaxed text-muted">
           Paste a link and we read the page for you.{" "}
           <button type="button" onClick={() => setManual(true)} className="underline hover:text-ink-2">

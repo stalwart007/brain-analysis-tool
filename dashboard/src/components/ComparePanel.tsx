@@ -15,6 +15,7 @@ import dynamic from "next/dynamic";
 import { BayesianResult, CognitiveLoad, CompareResult } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useEntranceEnabled } from "./Reveal";
 import SimStage from "./sim/SimStage";
 import type { ArenaArrival } from "./sim/ArenaSim";
@@ -42,6 +43,7 @@ export default function ComparePanel({ personaCount }: { personaCount: number })
   ]);
   const [twins, setTwins] = useState(3);
   const [load, setLoad] = useState<CognitiveLoad>("low");
+  const [question, setQuestion] = useState("");
   const [adaptive, setAdaptive] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -78,7 +80,7 @@ export default function ComparePanel({ personaCount }: { personaCount: number })
     try {
       await streamRun(
         "/swarm/compare/stream",
-        { variants, twins_per_persona: twins, cognitive_load: load, adaptive },
+        { variants, twins_per_persona: twins, cognitive_load: load, research_question: question, adaptive },
         (evt) => {
           if (evt.type === "start") setTotal(evt.total as number);
           else if (evt.type === "agent") {
@@ -209,6 +211,13 @@ export default function ComparePanel({ personaCount }: { personaCount: number })
         ))}
       </div>
 
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. which variant reduces hesitation, not just raises intent?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3">
         {variants.length < 8 && (
           <button
@@ -262,6 +271,7 @@ export default function ComparePanel({ personaCount }: { personaCount: number })
             exit={{ opacity: 0 }}
             className="mt-6"
           >
+          <FindingsPanel findings={result.findings} />
             <p className="mb-3 text-sm">
               Winner:{" "}
               <span className="font-display font-semibold text-accent">

@@ -110,8 +110,224 @@ def test_claims_a_win_only_when_both_intervals_clear_the_seed():
     assert out["beat_seed"] is True
     assert out["convergence"] == "improved"
     assert out["posterior_intervals_separated"] is True
-    assert out["intent_intervals_separated"] is True
     assert out["intent_lift_vs_seed"] == pytest.approx(0.9, abs=1e-6)
+    # the gate now runs on the honest quantities, and on a real 0.9 gap they
+    # all agree: adjusted lift positive, its interval clear of zero, and the
+    # act-rate posteriors essentially certain
+    assert out["selection_adjusted_lift"] > 0
+    assert out["selection_adjusted_lift_ci"][0] > 0
+    assert out["p_best_beats_seed"] > 0.99
+
+
+# ───────────────── ranking: shrinkage, not the raw mean ──────────────────
+
+
+def test_a_lucky_two_trial_arm_does_not_outrank_a_solid_forty_trial_seed():
+    """THE RANKING BUG. Raw-mean sorting put a 2-trial 0.90 above a 40-trial
+    0.85 outright. Empirical-Bayes shrinkage pulls the thin arm most of the way
+    to the grand mean while the seed barely moves.
+
+    Measured on this exact population: grand mean 0.8068, within-arm variance
+    0.0294, between-arm variance 0.0009 → τ̂ = 31.98 prior trials. The seed
+    goes 0.8500 → 0.8308, the challenger 0.9000 → 0.8123, so the seed ranks
+    first. Over 400 random mutant populations of this shape (realistic twin
+    noise, sd 0.18–0.30) the shrunk ranking puts the seed above the lucky
+    2-trial arm in 86.8% of them; the raw-mean ranking never did.
+    """
+    seed_rows = [1.0] * 11 + [0.9] * 8 + [0.8] * 11 + [0.7] * 10  # n=40, mean 0.85
+    others = {
+        "g0v2": [0.7, 0.9, 0.6, 0.8, 0.9],
+        "g0v3": [0.6, 1.0, 0.6, 0.7, 1.0, 0.6, 0.7, 1.0],
+        "g0v4": [0.4, 0.7, 1.0, 1.0, 0.6, 0.7, 0.9, 0.5, 1.0, 1.0, 0.4, 0.3, 0.9],
+        "g0v5": [0.7, 0.7, 0.7, 0.5, 0.9, 0.4, 1.0, 0.8, 0.9, 0.6,
+                 0.5, 1.0, 0.9, 1.0, 0.8, 1.0, 0.9, 0.5, 1.0, 0.9],
+    }
+    lineage = [SEED, _variant("g0v1", 0, "lucky pair", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(x) for x in seed_rows],
+        "g0v1": [_score(0.9), _score(0.9)],
+    }
+    for vid, rows in others.items():
+        lineage.append(_variant(vid, 0, f"mutant {vid}", parents=["g0v0"]))
+        scores[vid] = [_score(x) for x in rows]
+
+    out = _result(lineage, scores)
+    by_id = {v["id"]: v for v in out["population"]}
+
+    # the raw means are exactly the ones that used to drive the sort…
+    assert by_id["g0v1"]["mean_intent"] == pytest.approx(0.9, abs=1e-6)
+    assert by_id["g0v0"]["mean_intent"] == pytest.approx(0.85, abs=1e-6)
+    # …and the raw mean is still reported, unchanged
+    assert by_id["g0v1"]["mean_intent"] > by_id["g0v0"]["mean_intent"]
+    # …but the ranking key is the shrunk one, and it puts the seed first
+    assert by_id["g0v0"]["shrunk_intent"] > by_id["g0v1"]["shrunk_intent"]
+    assert out["best_variant_id"] == "g0v0"
+    assert out["convergence"] == "seed_wins"
+    assert out["shrinkage"]["prior_strength"] == pytest.approx(31.98, abs=0.1)
+
+
+def test_full_pooling_when_arms_differ_by_no_more_than_their_own_noise():
+    """τ̂² ≤ 0 — the arm means are no more spread than within-arm sampling
+    noise alone predicts. Full pooling is the honest answer: every arm gets the
+    grand mean and the ranking falls to the tie-breakers (p_best, then trials),
+    which is what keeps a 2-trial arm off the top."""
+    rows = {
+        "g0v0": [0.9, 0.7, 0.5, 0.3, 0.9, 0.7, 0.5, 0.3],
+        "g0v1": [0.3, 0.9, 0.5, 0.7, 0.7, 0.5, 0.9, 0.3],
+        "g0v2": [0.5, 0.5, 0.7, 0.7, 0.3, 0.3, 0.9, 0.9],
+    }
+    shrunk, info = optimizer._shrunk_means(rows)
+    assert info["pooled"] is True
+    assert len(set(round(v, 9) for v in shrunk.values())) == 1
+    assert shrunk["g0v0"] == pytest.approx(info["grand_mean"], abs=1e-6)
+
+
+def test_shrinkage_edge_cases_do_not_invent_a_ranking():
+    # a single arm has nothing to shrink toward — its own mean stands
+    shrunk, info = optimizer._shrunk_means({"a": [0.2, 0.8]})
+    assert shrunk == {"a": pytest.approx(0.5)}
+    assert info["prior_strength"] == 0.0
+    # every arm a single reading: within-arm noise is inestimable, and calling
+    # it zero would rank pure luck. Pool.
+    shrunk, info = optimizer._shrunk_means({"a": [0.9], "b": [0.1], "c": [0.5]})
+    assert info["pooled"] is True
+    assert len(set(shrunk.values())) == 1
+    # no arm with any reading at all
+    assert optimizer._shrunk_means({"a": []})[0] == {}
+
+
+# ──────────── the honest lift: selection-adjusted, not in-sample ─────────
+
+
+def test_naive_and_adjusted_lift_are_both_reported_and_differ():
+    """Repo precedent (sequence.py): keep the naive number beside the honest
+    one so the size of the correction is visible."""
+    lineage = [SEED]
+    scores = {"g0v0": [_score(x) for x in (0.5, 0.4, 0.6, 0.5, 0.5, 0.6, 0.4, 0.5)]}
+    for i, rows in enumerate(
+        [(0.6, 0.7, 0.5, 0.6), (0.5, 0.6, 0.4, 0.5), (0.7, 0.6, 0.8, 0.5)], start=1
+    ):
+        vid = f"g0v{i}"
+        lineage.append(_variant(vid, 0, f"mutant {i}", parents=["g0v0"]))
+        scores[vid] = [_score(x) for x in rows]
+    out = _result(lineage, scores)
+
+    # every key the honest reading needs is present
+    for key in (
+        "naive_intent_lift",
+        "selection_adjusted_lift",
+        "selection_adjusted_lift_ci",
+        "selection_bias",
+        "p_best_beats_seed",
+    ):
+        assert key in out
+    # the legacy key still carries the naive number, byte for byte
+    assert out["intent_lift_vs_seed"] == out["naive_intent_lift"]
+    # and the correction is real: the in-sample margin exceeds the honest one
+    assert out["naive_intent_lift"] > out["selection_adjusted_lift"]
+    assert out["selection_bias"] == pytest.approx(
+        out["naive_intent_lift"] - out["selection_adjusted_lift"], abs=1e-9
+    )
+
+
+def test_not_supported_does_not_showcase_the_naive_lift():
+    """The audit finding: the naive lift was reported as a headline even when
+    convergence said the search proved nothing. The verdict must now name the
+    honest quantity, and may mention the naive one only as the bias it was."""
+    lineage = [SEED, _variant("g0v1", 0, "marginally different copy", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(i) for i in (0.4, 0.6, 0.5, 0.45, 0.55, 0.5, 0.5, 0.45)],
+        "g0v1": [_score(i) for i in (0.5, 0.7, 0.6, 0.55, 0.65, 0.6, 0.6, 0.55)],
+    }
+    out = _result(lineage, scores)
+
+    assert out["convergence"] == "not_supported"
+    assert out["beat_seed"] is False
+    assert "did NOT beat" in out["verdict"]
+    # the naive lift is positive — and precisely the number that must not be
+    # sold as the finding
+    assert out["naive_intent_lift"] > 0
+    naive_pct = f"{out['naive_intent_lift'] * 100:.1f}%"
+    assert naive_pct not in out["verdict"]
+    # the verdict must be about selection / overlap, not about a margin won
+    assert any(
+        phrase in out["verdict"]
+        for phrase in ("selection", "overlap", "includes zero", "thinly sampled")
+    )
+
+
+def test_the_gate_needs_the_adjusted_interval_not_the_naive_one():
+    """A win requires posterior separation AND an adjusted-lift interval clear
+    of zero. An act rate that separates on its own is not enough.
+
+    The two arms carry the SAME spread of intents — the challenger's twins
+    merely crossed the would_act threshold — so the act-rate posteriors
+    separate completely while the honest intent lift has nothing to find.
+    """
+    intents = (0.3, 0.7, 0.4, 0.6, 0.5, 0.5, 0.45, 0.55, 0.35, 0.65, 0.4, 0.6)
+    lineage = [SEED, _variant("g0v1", 0, "acts more, likes it the same", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(i, acts=False) for i in intents],
+        "g0v1": [_score(i, acts=True) for i in intents],
+    }
+    out = _result(lineage, scores)
+
+    assert out["posterior_intervals_separated"] is True
+    assert out["p_best_beats_seed"] > 0.99
+    # identical intent samples: the honest lift is exactly nothing
+    assert out["selection_adjusted_lift"] == pytest.approx(0.0, abs=1e-9)
+    assert out["beat_seed"] is False  # the intent side never cleared
+    assert out["convergence"] == "not_supported"
+
+
+def test_thin_challengers_cannot_produce_an_honest_lift_and_so_cannot_win():
+    """Every challenger with a single reading: no split can both select and
+    evaluate, so the adjusted lift is None — which must read as 'cannot
+    support a claim', never as zero."""
+    lineage = [SEED]
+    scores = {"g0v0": [_score(0.3) for _ in range(10)]}
+    for i in (1, 2, 3):
+        vid = f"g0v{i}"
+        lineage.append(_variant(vid, 0, f"one-shot {i}", parents=["g0v0"]))
+        scores[vid] = [_score(1.0)]
+    out = _result(lineage, scores)
+
+    if out["best_variant_id"] != "g0v0":
+        assert out["selection_adjusted_lift"] is None
+        assert out["beat_seed"] is False
+        assert out["convergence"] == "not_supported"
+        assert "thinly sampled" in out["verdict"]
+
+
+def test_p_beats_is_a_seeded_beta_comparison_and_is_deterministic():
+    a = optimizer._p_beats((9, 10), (1, 10))
+    b = optimizer._p_beats((9, 10), (1, 10))
+    assert a == b  # seeded
+    assert a > 0.99
+    # symmetric-ish: reversing the arms reverses the verdict
+    assert optimizer._p_beats((1, 10), (9, 10)) < 0.01
+    # no data on either side is a coin flip, not a claim
+    assert optimizer._p_beats((0, 0), (0, 0)) == pytest.approx(0.5, abs=0.02)
+
+
+def test_result_is_deterministic_across_repeated_calls():
+    """All randomness is seeded — the same twin outputs must produce the same
+    lift, interval and verdict every time."""
+    lineage = [SEED, _variant("g0v1", 0, "a challenger", parents=["g0v0"])]
+    scores = {
+        "g0v0": [_score(i) for i in (0.4, 0.6, 0.5, 0.45, 0.55, 0.5, 0.4, 0.6)],
+        "g0v1": [_score(i) for i in (0.6, 0.7, 0.5, 0.65, 0.55, 0.6, 0.7, 0.5)],
+    }
+    a, b = _result(lineage, scores), _result(lineage, scores)
+    for key in (
+        "selection_adjusted_lift",
+        "selection_adjusted_lift_ci",
+        "p_best_beats_seed",
+        "convergence",
+        "verdict",
+        "best_variant_id",
+    ):
+        assert a[key] == b[key]
 
 
 def test_refuses_to_claim_a_win_when_intervals_overlap():

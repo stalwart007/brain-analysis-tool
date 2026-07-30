@@ -238,3 +238,101 @@ def test_html_entities_are_decoded():
     joined = " ".join(_beats_from_page(ContentAsset(kind="page", text=html)).beats)
     assert "&#39;" not in joined and "&gt;" not in joined and "&amp;" not in joined
     assert "'Banana'" in joined and ">>>" in joined
+
+
+# ── the parser rewrite ───────────────────────────────────────────────────
+
+
+def test_nested_containers_do_not_truncate_a_block():
+    """The regression that made the landing-page path fail on real sites.
+
+    The old extractor matched `<(div|section|…)>(.*?)</\\1>` non-greedily, so on
+    `<div><div>copy</div></div>` the OUTER match closed at the INNER `</div>`.
+    Modern marketing pages are nothing but nested divs: measured against
+    stripe.com, 11,162 characters of visible prose yielded ZERO usable
+    sections, and the failure was reported to the user as "this page builds its
+    copy in the browser" — which was false and sent them to fix nothing.
+    """
+    from app.modality import extract_blocks
+
+    html = (
+        "<div><div><div>"
+        "Financial infrastructure to grow your revenue. Accept payments online "
+        "and in person with a fully integrated suite of products."
+        "</div></div></div>"
+    )
+    blocks = extract_blocks(html)
+    assert len(blocks) == 1
+    assert blocks[0].startswith("Financial infrastructure")
+    assert blocks[0].endswith("suite of products.")
+
+
+def test_a_wrapper_does_not_repeat_the_copy_its_children_already_emitted():
+    """A <section> around five <p>s must not emit all five again as one block —
+    otherwise the same copy is studied twice and the beat count is doubled."""
+    from app.modality import extract_blocks
+
+    html = "<section>" + "".join(
+        f"<p>This is paragraph number {i} and it carries enough words to read "
+        f"as real prose rather than as a navigation label.</p>"
+        for i in range(4)
+    ) + "</section>"
+    blocks = extract_blocks(html)
+    assert len(blocks) == 4
+    assert all(b.startswith("This is paragraph") for b in blocks)
+
+
+def test_unbalanced_markup_does_not_lose_the_page():
+    """Real HTML is unbalanced constantly. A stray </div> must not close an
+    outer <section>, and unterminated tags must still flush their content."""
+    from app.modality import extract_blocks
+
+    html = (
+        "<section><div>A headline that is long enough to count as prose and "
+        "then some.</div></div></span>"
+        "<div>A second block, also long enough to be read as real copy here."
+    )
+    blocks = extract_blocks(html)
+    assert len(blocks) == 2
+
+
+def test_navigation_is_excluded_but_a_hero_in_a_header_is_not():
+    """`<header>` is usually the nav bar, but it is also the correct element for
+    a hero — headline, subhead, call to action — which is the single most
+    important beat on a landing page. Judging a block by what it SAYS survives
+    a hero in a header; judging it by its wrapper does not."""
+    from app.modality import extract_blocks
+
+    html = (
+        "<nav><a>Products</a><a>Solutions</a><a>Developers</a><a>Pricing</a>"
+        "<a>Sign in</a><a>Contact sales</a></nav>"
+        "<header><h1>Financial infrastructure to grow your revenue</h1>"
+        "<p>Millions of companies use our platform to accept payments online, "
+        "automate finance operations and grow revenue.</p>"
+        "<a>Start now</a><a>Contact sales</a></header>"
+    )
+    blocks = extract_blocks(html)
+    joined = " ".join(blocks)
+    assert "Financial infrastructure" in joined
+    assert "Millions of companies" in joined
+    assert "Products Solutions Developers" not in joined
+
+
+def test_hidden_and_unrendered_content_never_becomes_a_beat():
+    """A closed menu, a cookie modal and a <script> are all in the markup on
+    arrival. Counting them as beats reports an audience reaction to something
+    nobody looked at."""
+    from app.modality import extract_blocks
+
+    html = (
+        '<script>var copy = "this is script text and must never be a beat";</script>'
+        '<div aria-hidden="true">A hidden cookie banner with plenty of words in '
+        "it so that it would otherwise qualify as prose.</div>"
+        '<div style="display:none">Another hidden block long enough to be read '
+        "as copy if it were ever shown to anyone at all.</div>"
+        "<div>The only visible copy on this page, and it is long enough to "
+        "read as genuine prose.</div>"
+    )
+    blocks = extract_blocks(html)
+    assert len(blocks) == 1
+    assert blocks[0].startswith("The only visible copy")

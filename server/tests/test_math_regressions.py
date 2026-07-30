@@ -37,7 +37,14 @@ def test_entropy_normalises_against_the_possible_outcome_set():
     """
     two_way = shannon_entropy_normalised([10, 0, 0, 10], k=4)
     four_way = shannon_entropy_normalised([5, 5, 5, 5], k=4)
-    assert two_way == pytest.approx(math.log(2) / math.log(4))  # 0.5
+    # log2/log4 = 0.5 is the PLUG-IN value. The estimator now carries the
+    # Miller-Madow correction (K̂−1)/2N for the downward bias of plug-in
+    # entropy, which at K̂=2, N=20 adds 0.025 nats — 0.018 after normalising.
+    # The correction is the point, so it is pinned rather than tolerated: a
+    # future change that silently drops it would otherwise pass here.
+    plug_in = math.log(2) / math.log(4)
+    assert two_way == pytest.approx(plug_in + 0.025 / math.log(4), abs=1e-6)
+    assert two_way > plug_in  # debiased upward, never downward
     assert four_way == pytest.approx(1.0)
     assert two_way < four_way
 
@@ -367,14 +374,35 @@ def test_change_points_detects_a_collapse_at_the_ending():
     returned [1]. For content analysis that is the worst possible asymmetry,
     since peak-end theory says the ending is what gets remembered.
     """
+    import random
+
     from app.neuro import change_points
 
-    ending = change_points([0.8] * 7 + [0.1], min_size=1, n_obs=20)
-    opening = change_points([0.8] + [0.1] * 7, min_size=1, n_obs=20)
+    def ratings(curve, twins=20, sd=0.05, seed=3):
+        """Per-beat twin ratings around `curve`. The permutation null needs the
+        observations the curve was averaged from — see below."""
+        rng = random.Random(seed)
+        return [
+            [min(1.0, max(0.0, rng.gauss(mu, sd))) for _ in range(twins)]
+            for mu in curve
+        ]
+
+    # `observations` is what the production caller passes (neuro.py's
+    # aggregate_content_study hands over the raw per-beat twin ratings) and it is
+    # required here, not incidental. Given only m beat MEANS, the max statistic
+    # is invariant to permutation within each candidate segment, so p has a hard
+    # floor of 2/C(m,k) — at m = 8 splitting off a single end beat that floor is
+    # 2/8 = 0.25 and no amount of signal can reach 0.05. The asymmetry this test
+    # exists to catch would be invisible under a null that cannot fire at either
+    # end, so the test asserts symmetry on the null that can.
+    down, up = [0.8] * 7 + [0.1], [0.8] + [0.1] * 7
+    ending = change_points(down, min_size=1, n_obs=20, observations=ratings(down))
+    opening = change_points(up, min_size=1, n_obs=20, observations=ratings(up))
     assert ending, "a collapse in the final beat must be detectable"
     assert opening, "sanity: the mirror image was already detected"
-    # mirror-image series must yield mirror-image split counts
+    # mirror-image series must yield mirror-image split counts AND positions
     assert len(ending) == len(opening)
+    assert ending == [7] and opening == [1]
 
 
 def test_change_points_is_mirror_symmetric_on_reversed_input():

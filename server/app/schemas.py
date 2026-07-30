@@ -246,10 +246,97 @@ class AudienceInference(BaseModel):
     segments: list[AudienceSegment] = Field(description="3-5 behaviourally distinct segments.")
 
 
+# ------------------------------------------------------- findings / question
+
+
+class StudyRequest(BaseModel):
+    """Base for every study: what the researcher is actually trying to find out.
+
+    Until this field existed, no part of the pipeline knew what question a run
+    was meant to answer, so no part of it could be specific to one. Every study
+    computed the same battery and ended in the same template sentence, whether
+    the researcher wanted to know why a signup flow leaks or whether an ad
+    reads as threatening.
+
+    It is optional, and stays optional. A blank question falls back to the one
+    the study kind exists to answer, so nothing regresses for callers that do
+    not set it.
+
+    THE TWINS NEVER SEE IT, and that restriction is the point rather than an
+    omission. Telling a synthetic audience "the researcher wants to know
+    whether the pricing section creates anxiety" produces an audience that
+    reports anxiety at the pricing section — the oldest failure mode in survey
+    design, and one this platform is unusually exposed to because a language
+    model is far more agreeable than a person. The question would contaminate
+    the measurement it was asked to inform, and the resulting number would look
+    exactly like a discovery.
+
+    So it enters strictly downstream of measurement: it ranks the evidence and
+    aims the synthesis. The numbers are identical whether or not a question was
+    asked; what changes is which of them lead, and what they are read as
+    meaning. That separation is what makes the answer specific without making
+    it self-fulfilling.
+
+    Not a prompt-injection surface in any interesting way: it is quoted into a
+    system message as the researcher's stated goal, and the model's reply is
+    schema-constrained and citation-validated against evidence harvested by
+    code — so a hostile string can misdirect emphasis but cannot introduce a
+    measurement, and cannot reach the twins at all.
+    """
+
+    research_question: str = Field(
+        default="",
+        max_length=2_000,
+        description=(
+            "What you want to know. e.g. 'Does the pricing section create "
+            "anxiety for first-time buyers?' Steers twin attention and ranks "
+            "the findings; blank falls back to the study's default question."
+        ),
+    )
+
+
+class Finding(BaseModel):
+    """One claim, tied to the measurements that license it."""
+
+    headline: str = Field(
+        description="One specific sentence. Name the beat/variant/step, not the category."
+    )
+    detail: str = Field(
+        description="2-4 sentences: the mechanism, why it happens, what it implies."
+    )
+    evidence_ids: list[str] = Field(
+        description="Ids from the evidence table. A finding with none is discarded."
+    )
+    direction: Literal["strength", "risk", "opportunity", "neutral"]
+    confidence: Literal["high", "moderate", "low"]
+    answers_question: bool = Field(
+        description="True if this bears directly on what the researcher asked."
+    )
+    recommended_action: str = Field(
+        description="Something doable to THIS asset. Empty string if none is warranted."
+    )
+
+
+class FindingsReport(BaseModel):
+    answer: str = Field(
+        description=(
+            "Direct answer to the question asked, in 2-4 sentences. If the study "
+            "cannot answer it, say that and say why."
+        )
+    )
+    findings: list[Finding] = Field(description="Ordered by decision value, most consequential first.")
+    what_would_change_the_answer: str = Field(
+        description="The specific additional evidence that would move this conclusion."
+    )
+    limits: str = Field(
+        description="What this design cannot establish, in the researcher's terms."
+    )
+
+
 # ---------------------------------------------------------------- swarm
 
 
-class SwarmRunRequest(BaseModel):
+class SwarmRunRequest(StudyRequest):
     scenario: str = Field(
         min_length=1,
         description=(
@@ -345,7 +432,7 @@ class ScenarioVariant(BaseModel):
     scenario: str = Field(min_length=1)
 
 
-class CompareRequest(BaseModel):
+class CompareRequest(StudyRequest):
     variants: list[ScenarioVariant] = Field(min_length=2, max_length=8)
     session_ids: list[str] = Field(default_factory=list)
     #: A curated panel, supplied directly. Takes precedence over session_ids
@@ -395,7 +482,7 @@ class CompareResult(BaseModel):
 # ---------------------------------------------------------------- flow walkthrough
 
 
-class WalkRequest(BaseModel):
+class WalkRequest(StudyRequest):
     steps: list[str] = Field(
         min_length=2,
         max_length=12,
@@ -475,6 +562,15 @@ class MetricCalibration(BaseModel):
     calibrated one with slope 1.00 and r = 0.80 both post MAE 0.17 / bias 0.00.
     The regression terms below are what tell them apart, so they are reported
     together or not at all.
+
+    The interval and reliability fields are the same principle applied one level
+    up. `slope` is estimated from a handful of shipped runs, so a bare point
+    estimate invites exactly the over-reading the verdict text refuses to make:
+    the model carries `slope_ci` and `r_ci` because the verdict is gated on
+    them, and a consumer that renders the adjective without the interval is
+    showing a conclusion while hiding what licenses it. All of them are
+    optional: they are None below n = 8, where an interval would be resampling
+    noise rather than an uncertainty statement.
     """
 
     n: int
@@ -494,6 +590,47 @@ class MetricCalibration(BaseModel):
     slope_r2: Optional[float] = Field(default=None, description="R² of the calibration fit.")
     mae_ci: Optional[list[float]] = Field(default=None, description="95% bootstrap CI on MAE.")
     bias_ci: Optional[list[float]] = Field(default=None, description="95% bootstrap CI on bias.")
+    slope_ci: Optional[list[float]] = Field(
+        default=None,
+        description=(
+            "95% pairs-bootstrap CI on the calibration slope. The verdict is "
+            "gated on this: 'compressed' is asserted only when the whole "
+            "interval sits below 1. None below n=8."
+        ),
+    )
+    r_ci: Optional[list[float]] = Field(
+        default=None, description="95% pairs-bootstrap CI on Pearson r. None below n=8."
+    )
+    slope_bracket_ci: Optional[list[float]] = Field(
+        default=None,
+        description=(
+            "The range of calibration slopes consistent with this data under ANY "
+            "assumption about which axis is noisier — the actual arrives without "
+            "replicate counts, so that ratio is unknowable and every point "
+            "estimate encodes a guess about it. `verdict` is gated on this, not "
+            "on slope_ci: an adjective survives only if no admissible ratio "
+            "contradicts it. None below n=8."
+        ),
+    )
+    reliability_curve: Optional[list[list[float]]] = Field(
+        default=None,
+        description=(
+            "Isotonic (PAV) reliability diagram as [predicted, actual] knots — "
+            "where along the range the predictor drifts, which a single slope "
+            "cannot show. None below n=8."
+        ),
+    )
+    brier_score: Optional[float] = Field(
+        default=None, description="Mean squared error, heading the decomposition below."
+    )
+    brier_decomposition: Optional[dict[str, float]] = Field(
+        default=None,
+        description=(
+            "CORP split of brier_score into miscalibration / discrimination / "
+            "uncertainty. Separates 'wrong' from 'uninformative': a predictor "
+            "can be perfectly calibrated and still useless. None below n=8."
+        ),
+    )
     verdict: Optional[str] = Field(
         default=None, description="Plain-language read of the calibration."
     )
@@ -508,7 +645,7 @@ class CalibrationReport(BaseModel):
 # ---------------------------------------------------------------- price sensitivity
 
 
-class PriceSensitivityRequest(BaseModel):
+class PriceSensitivityRequest(StudyRequest):
     product: str = Field(min_length=1, description="What's being sold, described in words.")
     prices: list[float] = Field(
         min_length=2, max_length=8, description="Candidate price points to test."
@@ -614,7 +751,7 @@ class VideoFrameRead(BaseModel):
 # ---------------------------------------------------------------- objection radar
 
 
-class ContentStudyRequest(BaseModel):
+class ContentStudyRequest(StudyRequest):
     """A neuro-impact study over any digital content.
 
     `asset` is the general path — text, image, video keyframes, audio
@@ -663,7 +800,7 @@ class TwinContentResponse(BaseModel):
     would_share: float = Field(description="0..1 likelihood of sharing/discussing it.")
 
 
-class ViralityRequest(BaseModel):
+class ViralityRequest(StudyRequest):
     content: str = Field(min_length=20, description="The shareable asset (post, ad, video script).")
     fanout: int = Field(default=6, ge=1, le=25, description="Contacts exposed per sharer (k).")
     session_ids: list[str] = Field(default_factory=list)
@@ -680,7 +817,7 @@ class TwinShare(BaseModel):
     reason: str = Field(description="The single real reason, one line.")
 
 
-class ObjectionRequest(BaseModel):
+class ObjectionRequest(StudyRequest):
     pitch: str = Field(min_length=1, description="The claim / pitch / copy to stress-test.")
     session_ids: list[str] = Field(default_factory=list)
     #: A curated panel, supplied directly. Takes precedence over session_ids
@@ -747,7 +884,7 @@ class ObjectionResult(BaseModel):
 # ---------------------------------------------------------------- copy optimizer
 
 
-class CopyOptimizerRequest(BaseModel):
+class CopyOptimizerRequest(StudyRequest):
     """An evolutionary search over copy, not a one-shot score.
 
     Cost is population_size × generations × (personas × twins_per_persona)
@@ -821,7 +958,7 @@ class CopyMutantBatch(BaseModel):
 # ---------------------------------------------------------------- message sequence
 
 
-class SequenceRequest(BaseModel):
+class SequenceRequest(StudyRequest):
     """Order effects: which ORDER of these messages ends with the most intent."""
 
     messages: list[str] = Field(
@@ -867,3 +1004,180 @@ class TwinSequenceWalk(BaseModel):
         description="Exactly one step per message, in the delivered order."
     )
     gist: str = Field(description="One line: what this persona was left with at the end.")
+
+
+# ══════════════════════════════ the white room ══════════════════════════════
+#
+# Every other study in this product fans out to ISOLATED twins on purpose: no
+# inter-agent chatter, so the spread you read is genuine disagreement rather
+# than a herd. The white room deliberately breaks that isolation, which makes it
+# a different instrument answering a different question — not "what does the
+# audience think" but "what happens to what they think when they can hear each
+# other".
+#
+# That difference is the whole design. Because the isolated condition already
+# exists, the room can run BOTH on the same cast and report the delta, which is
+# a within-subjects experiment with the control arm built in. Deliberation is
+# the treatment; the private round-0 ballot is the control.
+
+
+class RoomMemberSpec(BaseModel):
+    """One character at the table.
+
+    The disposition numbers are DECLARED, never measured — a model was asked to
+    instantiate a character from prose and these are what it asserted. They are
+    used as the room's *seating* parameters (who speaks when, who sees whom) and
+    as priors the analysis is free to contradict: `openness` is what the
+    character claims about itself, while `susceptibility` in the fitted results
+    is what its actual behaviour showed. Keeping both, and never overwriting one
+    with the other, is what lets the report say "the CFO described himself as
+    open and moved less than anyone in the room".
+    """
+
+    name: str = Field(description="Short name, as it would appear on a place card.")
+    role: str = Field(description="Their job or standing in this room.")
+    archetype: str = Field(description="One line: what they are, in the abstract.")
+    stake: str = Field(description="What they personally stand to gain or lose here.")
+    system_prompt: str = Field(
+        description="Second-person conditioning prompt. Voice, history, priors, what they fear."
+    )
+    openness: float = Field(description="0 immovable .. 1 persuaded by anything. Declared.")
+    assertiveness: float = Field(description="0 speaks only if asked .. 1 dominates. Declared.")
+    seniority: float = Field(description="0 junior .. 1 the room defers by default. Declared.")
+    risk_appetite: float = Field(description="0 protects downside .. 1 chases upside. Declared.")
+    expertise: list[str] = Field(description="Domains they are actually credible in.")
+
+
+class RoomCast(BaseModel):
+    members: list[RoomMemberSpec]
+
+
+class RoomTurn(BaseModel):
+    """What one member does on one round.
+
+    THE PUBLIC/PRIVATE SPLIT IS THE POINT. `public_statement` is what they say
+    at the table and every other member sees it; `private_position` is never
+    shown to anyone, including in the next round's context. The gap between them
+    is preference falsification (Kuran), and it is the one thing a real boardroom
+    cannot measure about itself — everyone knows their own gap and nobody knows
+    the room's.
+    """
+
+    public_statement: str = Field(description="What they say out loud. In character, 1-3 sentences.")
+    public_position: float = Field(
+        description="0 fully against the motion .. 1 fully for it — the position their WORDS convey."
+    )
+    private_position: float = Field(
+        description="0..1 what they actually believe now. May differ from public_position."
+    )
+    private_note: str = Field(
+        description="One line, unspoken. Why they said what they said, if it differs from what they think."
+    )
+    conceded_to: list[str] = Field(
+        description="Names whose argument genuinely moved them. Self-reported; a diagnostic, never the influence estimate."
+    )
+
+
+class RoomRequest(StudyRequest):
+    """Convene a room and put a motion to it."""
+
+    motion: str = Field(
+        min_length=10,
+        max_length=4_000,
+        description="The situation, decision or scenario the room is reacting to.",
+    )
+    cast_brief: str = Field(
+        default="",
+        max_length=4_000,
+        description=(
+            "Describe the characters in prose. Blank means infer a plausible "
+            "room from the motion itself, which is marked as inferred."
+        ),
+    )
+    members: list[RoomMemberSpec] = Field(
+        default_factory=list,
+        max_length=9,
+        description="A cast the researcher already approved. Wins over cast_brief.",
+    )
+    seats: int = Field(default=5, ge=3, le=9, description="How many characters to cast.")
+    rounds: int = Field(
+        default=4,
+        ge=2,
+        le=8,
+        description=(
+            "Deliberation rounds after the private opening ballot. The influence "
+            "matrix needs enough updates per member to be identifiable — see "
+            "room.fit_social_influence, which refuses rather than regularising "
+            "an underdetermined fit into a confident-looking answer."
+        ),
+    )
+    replicates: int = Field(
+        default=5,
+        ge=1,
+        le=8,
+        description=(
+            "Independent runs of the same room, each with a different seeded "
+            "speaking order. Order is a confound, not a setting: one run cannot "
+            "tell a real convergence from an artefact of who happened to speak "
+            "first, and replicates are also what make the influence fit "
+            "identifiable at realistic round counts. THE CHEAP AXIS — each "
+            "replicate buys (rounds − 1) fresh observations per member, so 5 "
+            "replicates identify more than 8 rounds do, at lower cost."
+        ),
+    )
+    placebo_replicates: int = Field(
+        default=1,
+        ge=0,
+        le=4,
+        description=(
+            "Runs where the statements each member is shown come from a "
+            "DIFFERENT room. The critical control: a language model is "
+            "agreeable, so convergence and a public/private gap can both be "
+            "artefacts of its disposition rather than anything about these "
+            "characters. If the placebo arm converges as hard, the deliberation "
+            "measured nothing, and only this arm can tell you."
+        ),
+    )
+    decision_threshold: Optional[float] = Field(
+        default=None,
+        description="If set, the position above which a member counts as voting FOR — enables coalition power indices.",
+    )
+
+    #: WHAT EACH SETTING CAN AND CANNOT SUPPORT — measured on synthetic rooms
+    #: with a known influence matrix, not asserted. Read this before changing a
+    #: default; several of these limits are structural and no amount of
+    #: deliberation quality gets around them.
+    #:
+    #: The influence fit needs ≥1.5 observations per free parameter, where
+    #: observations = replicates × (rounds − 1) and parameters = seats + 1.
+    #: Below that the fitted weights lose to a uniform guess outright. The
+    #: previous default of 3 replicates at 5 seats and 4 rounds sat at exactly
+    #: 1.50 — on the refusal boundary, so one dropped replicate refused the
+    #: whole fit. 5 replicates gives 2.50.
+    #:
+    #: A SINGLE W ENTRY is never quotable. An individual weight only beats a
+    #: uniform-row guess above 9 observations per parameter, and the schema
+    #: maximum — 9 seats × 8 rounds × 8 replicates — reaches 6.22. Only a
+    #: 5-seat room at 8 rounds × 8 replicates (11.2) clears it. That is why
+    #: `w_entries_supported` ships False on essentially every real run and why
+    #: the network is drawn as a pattern rather than labelled with numbers.
+    #: What DOES recover is everything derived from the whole matrix:
+    #: equilibrium MAE 0.019 against a 0.085 baseline with rank correlation
+    #: 0.96-0.99, which is why the counterfactuals are trustworthy while the
+    #: edges they are computed from are not individually.
+    #:
+    #: CENTRALITY IS THE WEAKEST HEADLINE. Identifying the single most central
+    #: member correctly runs 31-38% at 5 seats × 4 rounds × 3 replicates against
+    #: a 20% chance rate, rising to 49-57% at 8 rounds × 8 replicates. Read it
+    #: as a ranking with real uncertainty, never as "this person ran the room".
+    #:
+    #: TWO p-VALUE FLOORS ARE COMBINATORIAL. A permutation test cannot report a
+    #: p below 2/(number of arrangements): the public/private gap floors at
+    #: 2/2^seats, so a 5-seat room cannot reach p < 0.05 (floor 0.0625) however
+    #: large the gap; and the speaking-order effect floors at 2/replicates!, so
+    #: 3 replicates floor at 0.333 and 5 are the minimum that can reach 0.05.
+    #: Both floors are reported next to their p-values.
+    #:
+    #: CONFORMITY power comes from replicates, not rounds — 48% → 91% going from
+    #: 3 to 8 replicates, while 4 → 8 rounds changes nothing. Its false-positive
+    #: rate is 2-7% against a nominal 5% and flat across designs.

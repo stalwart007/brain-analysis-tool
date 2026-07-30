@@ -257,6 +257,19 @@ def _quantised_decay(n: int, lam: float = 0.15, a: float = 3.0):
     return ts, [round(a * math.exp(-lam * t), 1) for t in ts]
 
 
+# This fixture quantises by ROUNDING, so a reported 0 means the true value was
+# below 0.05 — half the smallest positive value it can report. The production
+# collector instead THRESHOLDS (velocity is |Δy|/Δt with Δy in whole pixels, so
+# a 0 means nothing moved at all), where a 0 means the value was below the
+# smallest positive reading, not below half of it. Those are different censoring
+# points, and `habituation_fit` truncates at the smallest positive value by
+# default because that is what the real collector produces. Passing the limit
+# explicitly here keeps these tests measuring what they were written to measure
+# — the censored-tail and smearing corrections — rather than silently testing a
+# censoring model the fixture does not use.
+_FIXTURE_LOD = 0.05
+
+
 def test_habituation_does_not_discard_the_decayed_tail():
     """`if y > 0` deleted every sample where the person had stopped moving.
 
@@ -271,7 +284,10 @@ def test_habituation_does_not_discard_the_decayed_tail():
     changed nothing, because everything past the quantum was thrown away.
     True λ = 0.15.
     """
-    fits = [habituation_fit(*_quantised_decay(n)) for n in (32, 41, 50)]
+    fits = [
+        habituation_fit(*_quantised_decay(n), censoring_limit=_FIXTURE_LOD)
+        for n in (32, 41, 50)
+    ]
     assert all(f is not None for f in fits)
 
     # every sample is now in the fit, and the censored share is reported
@@ -293,7 +309,7 @@ def test_habituation_applies_the_smearing_correction():
     contributes. Before: initial_engagement 2.7418 against a true A = 3.0.
     """
     ts, ys = _quantised_decay(41)
-    f = habituation_fit(ts, ys)
+    f = habituation_fit(ts, ys, censoring_limit=_FIXTURE_LOD)
     assert f is not None
     assert f["initial_engagement"] > f["initial_engagement_median"]
     assert f["initial_engagement"] == pytest.approx(2.84, abs=0.03)
@@ -399,34 +415,78 @@ def test_change_points_rejects_a_microscopic_shift():
     i.e. a declared attention collapse on a shift of one part in 500,000.
     """
     assert change_points([0.5, 0.5, 0.500001, 0.500001], min_size=1) == []
-    # the same shape at a magnitude anyone would act on is still detected
-    assert change_points([0.5, 0.5, 0.9, 0.9], min_size=1) == [2]
+    # The same shape at a magnitude anyone would act on is still detected — but
+    # only on the twin-level null, which is the one the product uses. On four
+    # beat MEANS alone the permutation p cannot go below 2/C(4,2) = 0.33, so a
+    # 4-point curve can never clear 0.05 however large the step; the ratings the
+    # means came from are what make the test able to fire at all.
+    rng = random.Random(9)
+    curve = [0.5, 0.5, 0.9, 0.9]
+    ratings = [
+        [min(1.0, max(0.0, rng.gauss(mu, 0.05))) for _ in range(20)] for mu in curve
+    ]
+    assert change_points(curve, min_size=1, observations=ratings) == [2]
+    # and the microscopic version stays rejected even with the sharper null
+    tiny = [0.5, 0.5, 0.500001, 0.500001]
+    tiny_ratings = [
+        [min(1.0, max(0.0, rng.gauss(mu, 0.05))) for _ in range(20)] for mu in tiny
+    ]
+    assert change_points(tiny, min_size=1, observations=tiny_ratings) == []
 
 
-def test_change_points_penalty_scales_with_the_twin_count():
-    """The criterion runs on a mean across twins but was penalised as if each
-    beat were a single independent observation.
+def test_change_points_holds_its_level_across_twin_counts():
+    """The false-positive rate must be a NOMINAL LEVEL, not a function of how
+    many twins ran.
 
-    m·ln(RSS0/RSS1) is scale-free, so averaging shrinks the curve's residual
-    noise by √n_twins while leaving the statistic untouched: every systematic
-    wobble clears a penalty that never moved. Measured over 200 pure-noise mean
-    curves (8 beats, 20 twins, σ = 0.15), the old criterion declared a
-    structural break in **36.5%** of them. Charging the penalty at the
-    effective sample size m·n_twins gives **7.0%**.
+    Two generations of this test. The original criterion ran a BIC on a mean
+    curve while charging the penalty as if each beat were one observation: since
+    m·ln(RSS0/RSS1) is scale-free, averaging shrank the residual noise by
+    √n_twins while leaving the statistic untouched, so every wobble cleared a
+    penalty that never moved — 36.5% false positives at 8 beats × 20 twins.
+    Charging the penalty at the effective sample size m·n_twins pulled that to
+    7.0% *at that one cell*, which is what this test used to pin, and the cell
+    was mistaken for a level: the same criterion measured 19.8% / 9.5% / 5.4% /
+    3.4% at 3 / 8 / 20 / 40 twins and 63.3% on a 3-beat curve. A fixed penalty
+    cannot hold a level across those regimes, so there is no `n_obs` to tune.
+
+    The test is now a permutation test calibrated against the study's own
+    ratings, and `n_obs` sets no threshold at all. The property worth pinning is
+    therefore the one the old design could not have: the level is FLAT in the
+    twin count, in both directions. Measured at 600 trials/cell it sits in
+    3.8-7.0% for every combination of 3/8/20 twins and 3/4/8/10 beats.
     """
-    fired_naive = fired_scaled = 0
-    trials = 200
-    for s in range(trials):
-        rng = random.Random(1000 + s)
-        curves = [[0.6 + rng.gauss(0, 0.15) for _ in range(8)] for _ in range(20)]
-        mean_curve = [sum(c[i] for c in curves) / 20 for i in range(8)]
-        if change_points(mean_curve, min_size=1, n_obs=1, min_effect=0.0):
-            fired_naive += 1
-        if change_points(mean_curve, min_size=1, n_obs=20):
-            fired_scaled += 1
-    assert fired_naive / trials > 0.30
-    assert fired_scaled / trials < 0.12
-    assert fired_scaled < fired_naive
+    trials = 150
+    rates = {}
+    for twins in (3, 8, 20):
+        fired = 0
+        for s in range(trials):
+            rng = random.Random(1000 + s)
+            per_beat = [
+                [min(1.0, max(0.0, rng.gauss(0.6, 0.15))) for _ in range(twins)]
+                for _ in range(8)
+            ]
+            mean_curve = [sum(col) / len(col) for col in per_beat]
+            if change_points(
+                mean_curve, min_size=1, n_obs=twins, observations=per_beat
+            ):
+                fired += 1
+        rates[twins] = fired / trials
+
+    for twins, rate in rates.items():
+        assert rate < 0.13, (twins, rate)  # a level, at every twin count
+    # and it does not GROW with the twin count, which was the original defect
+    assert rates[20] < 3 * rates[3] + 0.05
+
+    # `n_obs` is inert now: it is accepted for signature compatibility, and
+    # passing a wrong value must not change a verdict.
+    rng = random.Random(4)
+    curve = [0.9] * 5 + [0.4] * 5
+    ratings = [
+        [min(1.0, max(0.0, rng.gauss(mu, 0.05))) for _ in range(12)] for mu in curve
+    ]
+    assert change_points(curve, min_size=1, n_obs=1, observations=ratings) == (
+        change_points(curve, min_size=1, n_obs=999, observations=ratings)
+    )
 
 
 def test_change_points_still_finds_a_planted_collapse():
@@ -636,11 +696,23 @@ def test_mae_and_bias_alone_cannot_grade_a_predictor():
 
     # the new report: opposite diagnoses
     assert comp["calibration_slope"] == pytest.approx(0.15, abs=1e-3)
-    assert noisy["calibration_slope"] == pytest.approx(1.0, abs=1e-3)
     assert comp["pearson_r"] == pytest.approx(1.0, abs=1e-3)
     assert noisy["pearson_r"] == pytest.approx(0.80, abs=0.02)
     assert "compressed" in comp["interpretation"]
     assert "well-calibrated" in noisy["interpretation"]
+
+    # The NOISY fixture's actuals are exact — it adds error to the prediction
+    # only — so the reported Deming slope (δ = 1, which assumes both axes are
+    # equally noisy) over-corrects past 1 rather than landing on it: 1.3124, not
+    # the 1.0 an OLS fit would give here. That is a property of the fixture, not
+    # a defect: no fixed δ is right in both noise regimes, which is exactly why
+    # the VERDICT is gated on the identification bracket instead. The bracket
+    # must contain the structural slope of 1.0, and it is what makes the verdict
+    # above come out "well-calibrated" despite the point estimate sitting high.
+    assert noisy["calibration_slope"] == pytest.approx(1.3124, abs=1e-3)
+    lo, hi = noisy["calibration_slope_bracket_ci"]
+    assert lo <= 1.0 <= hi
+    assert "exaggerated" not in noisy["interpretation"]
     # rmse separates them too: concentrated misses vs evenly spread error
     assert comp["rmse"] > comp["mae"]
     assert noisy["rmse"] == pytest.approx(noisy["mae"], abs=1e-4)

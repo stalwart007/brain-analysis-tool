@@ -21,10 +21,12 @@ import { motion } from "framer-motion";
 import { CognitiveLoad } from "@/lib/api";
 import { streamRun } from "@/lib/stream";
 import { LoadToggle } from "./LoadToggle";
+import FindingsPanel, { ResearchQuestion, type FindingsBlock } from "./FindingsPanel";
 import { useMatrixCursor } from "./charts/cursor";
 import SimStage from "./sim/SimStage";
 
 interface SequenceResult {
+  findings?: FindingsBlock | null;
   twin_count: number;
   failed_walks: number;
   messages: string[];
@@ -134,13 +136,22 @@ function AdvantageMatrix({ m, labels }: { m: number[][]; labels: string[] }) {
       </svg>
 
       {/* The readout, in words. A signed number in a coloured square is the
-          kind of thing that gets read backwards under time pressure. */}
-      <div className="mt-1.5 min-h-8 font-mono text-[10px] leading-relaxed">
+          kind of thing that gets read backwards under time pressure.
+
+          Reserved height, and clamped. `min-h-8` held 32px while the longest
+          branch — two message labels, a signed advantage and the clause after
+          it — reaches three lines at 10px/relaxed, so hovering the matrix moved
+          the recommended ordering and the gain verdict beneath it. Message
+          labels are caller-supplied text of no bounded length, which is exactly
+          the case a fixed strip cannot absorb. */}
+      <div className="mt-1.5 min-h-[3.5rem] font-mono text-[10px] leading-relaxed tabular-nums">
         {active && m[active.row] ? (
           active.row === active.col ? (
-            <span className="text-muted">{labels[active.row]} against itself — not defined.</span>
+            <span className="line-clamp-3 text-muted">
+              {labels[active.row]} against itself — not defined.
+            </span>
           ) : (
-            <span className="text-ink-2">
+            <span className="line-clamp-3 text-ink-2">
               <span className="text-ink">{labels[active.col]}</span> after{" "}
               <span className="text-ink">{labels[active.row]}</span>:{" "}
               <span className={m[active.row][active.col] >= 0 ? "text-good" : "text-critical"}>
@@ -170,6 +181,7 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
   const [orderings, setOrderings] = useState(6);
   const [twins, setTwins] = useState(2);
   const [load, setLoad] = useState<CognitiveLoad>("low");
+  const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SequenceResult | null>(null);
@@ -192,7 +204,7 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
           messages,
           orderings_sampled: orderings,
           twins_per_persona: twins,
-          cognitive_load: load,
+          cognitive_load: load, research_question: question,
         },
         (evt) => {
           // `ordering` is the DESIGN announcement — the server emits every
@@ -280,6 +292,13 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
         use sample sequence
       </button>
 
+      <ResearchQuestion
+        value={question}
+        onChange={setQuestion}
+        disabled={busy}
+        examples={["e.g. does the order matter enough to justify re-sequencing?"]}
+      />
+
       <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted">
         <span className="soma">{messages.length} messages</span>
         <label className="flex items-center gap-2">
@@ -309,6 +328,7 @@ export default function SequencePanel({ personaCount }: { personaCount: number }
 
       {result && (
         <div className="mt-5 space-y-4">
+        <FindingsPanel findings={result.findings} />
           <div
             className={`border p-3 ${
               result.gain_supported

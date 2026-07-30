@@ -240,3 +240,110 @@ def test_abandonment_is_absorbing():
     assert len(r["steps"]) == 4
     assert steps[2]["entered"] == 0 and steps[2]["hazard"] is None
     assert steps[3]["hazard"] is None
+
+
+# ── change_points: the permutation calibration ────────────────────────────
+
+
+def _beat_ratings(curve, twins=20, sd=0.15, seed=0, quantise=False):
+    """Per-beat twin ratings whose beat-means track `curve` — the shape the
+    production caller passes as `observations`."""
+    rng = random.Random(seed)
+    out = []
+    for mu in curve:
+        col = [min(1.0, max(0.0, rng.gauss(mu, sd))) for _ in range(twins)]
+        if quantise:
+            col = [round(v, 1) for v in col]
+        out.append(col)
+    return out
+
+
+def test_change_points_holds_a_nominal_level_at_every_twin_count():
+    """The defect was that the false-positive rate tracked the twin count.
+
+    The BIC criterion's statistic is a MAXIMUM over admissible splits, so it is
+    not χ²-distributed, its null depends on the segment length, and recursive
+    segmentation piled on uncorrected multiplicity. Measured on pure-noise
+    beat-mean curves at nominal 5%, it fired at 19.8% / 9.5% / 5.4% / 3.4% for
+    3 / 8 / 20 / 40 twins on an 8-beat curve, and 63.3% / 43.6% / 33.7% / 24.9%
+    on a 3-beat one — a number that moved between 3% and 63% depending only on
+    how much data you had. Against the permutation null it measured 3.8-7.0%
+    across every twin and beat count tried (600 trials/cell).
+
+    150 trials/cell here keeps the suite fast; the ceiling is loose enough to
+    absorb that Monte Carlo error and tight enough to catch a return to 20%+.
+    """
+    for twins in (3, 8, 20):
+        for beats in (4, 8):
+            fired = 0
+            trials = 150
+            for s in range(trials):
+                obs = _beat_ratings([0.5] * beats, twins=twins, seed=7000 + s)
+                curve = [sum(c) / len(c) for c in obs]
+                if change_points(curve, min_size=1, n_obs=twins, observations=obs):
+                    fired += 1
+            assert fired / trials < 0.13, (twins, beats, fired / trials)
+
+
+def test_change_points_still_finds_a_real_step_it_should():
+    """Calibration must not be bought with power. A 0.12 step at beat 5 of 8 is
+    detected 72% of the time at 8 twins, 98.8% at 20 and 100% at 40 — measured
+    higher than the uncalibrated BIC's 63.0% / 80.6%, because the twin-level
+    null replaces a scale-free ratio with a statistic on the observation scale.
+    """
+    curve = [0.5] * 5 + [0.62] * 3
+    hits = 0
+    for s in range(40):
+        obs = _beat_ratings(curve, twins=20, seed=900 + s)
+        mean_curve = [sum(c) / len(c) for c in obs]
+        cps = change_points(mean_curve, min_size=1, n_obs=20, observations=obs)
+        if any(abs(c - 5) <= 1 for c in cps):
+            hits += 1
+    assert hits >= 34  # ~98.8% measured; 34/40 leaves room for the tail
+
+
+def test_change_points_is_deterministic():
+    """The permutation seed is derived from the segment's own values, so the
+    same curve must give the same answer every time — a study re-read from
+    history cannot disagree with the study as it streamed."""
+    curve = [0.9] * 4 + [0.35] * 4
+    obs = _beat_ratings(curve, twins=12, seed=5)
+    first = change_points(curve, min_size=1, n_obs=12, observations=obs)
+    for _ in range(4):
+        assert change_points(curve, min_size=1, n_obs=12, observations=obs) == first
+    assert first, "sanity: this curve does have a break"
+
+
+def test_change_points_quantised_ratings_do_not_break_the_level():
+    """Twin scores arrive quantised to 0.1, which shrinks the randomization
+    support and could inflate the level. Measured 4.3-5.2% on the quantised
+    variant against 4.8-6.0% unquantised."""
+    fired = 0
+    trials = 150
+    for s in range(trials):
+        obs = _beat_ratings([0.5] * 8, twins=20, seed=6000 + s, quantise=True)
+        curve = [sum(c) / len(c) for c in obs]
+        if change_points(curve, min_size=1, n_obs=20, observations=obs):
+            fired += 1
+    assert fired / trials < 0.13
+
+
+def test_change_points_curve_only_null_is_conservative_not_wrong():
+    """Without ratings the test is structurally conservative, and that is a
+    documented limitation rather than a bug: the max statistic is invariant to
+    permutation within each candidate segment, so p cannot fall below
+    2/C(m,k) — 0.33 on a 4-beat curve, which no signal can beat. It must fail
+    CLOSED (no split claimed) rather than open."""
+    assert change_points([0.5, 0.5, 0.9, 0.9], min_size=1) == []
+    # and with the ratings the same curve resolves
+    obs = _beat_ratings([0.5, 0.5, 0.9, 0.9], twins=20, sd=0.05, seed=2)
+    assert change_points([0.5, 0.5, 0.9, 0.9], min_size=1, observations=obs) == [2]
+
+
+def test_change_points_rejects_a_negligible_but_real_shift():
+    """A calibrated test still cannot tell a real break from a negligible one,
+    so the min_effect ROPE stays. One part in 500,000 is not an attention
+    collapse however clean the statistics are."""
+    curve = [0.5, 0.5, 0.500001, 0.500001]
+    obs = _beat_ratings(curve, twins=20, sd=0.02, seed=1)
+    assert change_points(curve, min_size=1, observations=obs) == []
