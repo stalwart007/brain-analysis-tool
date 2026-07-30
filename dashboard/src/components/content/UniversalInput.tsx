@@ -198,7 +198,7 @@ export default function UniversalInput({
       // it off the end of the ladder into `chaptersAsText` and submit a text
       // asset containing one sentence, discarding the thumbnail the server had
       // already fetched and encoded.
-      if (data.youtube && data.rung === "metadata") {
+      if (data.youtube && data.rung === "metadata" && data.kind === "image") {
         mark("identify", "done", "youtube · preview only");
         mark("retrieve", "done", `${(receipt.bytes / 1024).toFixed(0)} kB`);
         mark("prepare", "done", "thumbnail");

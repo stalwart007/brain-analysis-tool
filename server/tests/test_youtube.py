@@ -296,9 +296,15 @@ def test_rung_prefers_picture_then_speech_then_the_creators_own_words():
     assert choose_rung(_manifest(), cues, board_frames) == "video"
     assert choose_rung(_manifest(), cues, []) == "audio"
     assert choose_rung(_manifest(chapters=chapters), [], []) == "text"
-    # The floor: a thumbnail and nothing else. Not an edge case — measured from
-    # Fly, InnerTube answers "Sign in to confirm you're not a bot" for most
-    # videos, so this is the rung production actually lands on.
+    # No filmstrip, but the unsigned CDN frames are always there — measured
+    # present for every video tested, including a 19-second clip with no
+    # storyboard at all. Four ordered frames beats one thumbnail by enough that
+    # it is worth its own rung.
+    from app.youtube import cdn_frame_urls
+    assert choose_rung(
+        _manifest(storyboard=None, cdn_frames=cdn_frame_urls("dQw4w9WgXcQ")), [], []
+    ) == "cdn_frames"
+    # The floor: a thumbnail and nothing else.
     assert choose_rung(_manifest(storyboard=None), [], []) == "metadata"
     # Nothing readable at all, not even a still, is refused rather than studied.
     assert choose_rung(_manifest(storyboard=None, thumbnail_url=""), [], []) == "none"
@@ -327,7 +333,7 @@ def test_a_metadata_rung_manifest_reports_the_cause_before_anything_else():
         storyboard=None, client="oembed", blocked_reason="Sign in to confirm you’re not a bot"
     )
     envelope = manifest_envelope(blocked, [], [])
-    assert envelope["rung"] == "metadata"
+    assert envelope["rung"] == "metadata"  # constructed without cdn_frames
     assert envelope["degraded"] is True
     assert envelope["note"].startswith("YouTube refused to describe this video")
     assert "blocks datacentre addresses" in envelope["note"]
@@ -471,7 +477,10 @@ def test_innertube_refusal_falls_back_to_the_public_preview(monkeypatch):
     assert yt._is_bot_wall(manifest.blocked_reason)
 
     envelope = yt.manifest_envelope(manifest, [], [])
-    assert envelope["rung"] == "metadata"
+    # The preview fallback now carries the CDN frames, so it lands on the
+    # frames rung rather than the thumbnail one.
+    assert envelope["rung"] == "cdn_frames"
+    assert len(envelope["cdn_frames"]) == len(yt.CDN_FRAMES)
     assert "blocks datacentre addresses" in envelope["note"]
 
 
@@ -591,3 +600,62 @@ def test_a_refusal_is_never_cached(monkeypatch):
     before = len(calls)
     asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
     assert len(calls) > before, "a degraded result must not be cached as if it were the answer"
+
+
+def test_cdn_frames_span_the_video_and_need_no_api_call(monkeypatch):
+    """THE route round the bot wall.
+
+    `hqdefault`/`hq1`/`hq2`/`hq3` are unsigned, sit on the image CDN rather than
+    behind the player API, and answer `Access-Control-Allow-Origin: *`. Measured
+    present for every video tried, including a 19-second clip that has no
+    storyboard at all. Four ordered frames is a study of the video; the
+    thumbnail alone is a study of a thumbnail.
+    """
+    from app.youtube import CDN_FRAMES, cdn_frame_urls
+
+    frames = cdn_frame_urls("bBC-nXj3Ng4")
+    assert [f["name"] for f in frames] == [n for n, _ in CDN_FRAMES]
+    # Spread across the video, in order, and never past the end.
+    fractions = [f["fraction"] for f in frames]
+    assert fractions == sorted(fractions)
+    assert fractions[0] == 0.0 and fractions[-1] < 1.0
+    # Unsigned: no `sigh`, no key, nothing that expires.
+    assert all(f["url"].startswith("https://i.ytimg.com/vi/bBC-nXj3Ng4/") for f in frames)
+    assert all("?" not in f["url"] for f in frames)
+
+
+def test_untimed_frames_produce_a_sequential_axis_not_an_invented_clock():
+    """When the player API refuses, the runtime is unknown.
+
+    The frames are known to be IN ORDER and not known to be at any second, so
+    the axis is sequential and `timestamps_ms` is absent. Inventing a duration
+    would put a number on every beat that nothing measured — and retention
+    would then be reported in seconds that do not exist.
+    """
+    import asyncio as _aio
+
+    from app.modality import BeatAxis, _beats_from_video
+    from app.schemas import ContentAsset, VideoFrame
+
+    async def fake_describe(b64, media_type, t_ms, semaphore):
+        return f"frame at {t_ms}"
+
+    import app.modality as m
+
+    original = m._describe_frame
+    m._describe_frame = fake_describe
+    try:
+        asset = ContentAsset(
+            kind="video",
+            frames=[VideoFrame(t_ms=-1, image_b64="AA==", media_type="image/jpeg") for _ in range(4)],
+        )
+        seq = _aio.run(_beats_from_video(asset))
+    finally:
+        m._describe_frame = original
+
+    assert seq.axis is BeatAxis.SEQUENTIAL
+    assert seq.timestamps_ms is None
+    assert seq.beats[0].startswith("[opening]")
+    assert "[a quarter in]" in seq.beats[1]
+    # No fabricated seconds anywhere.
+    assert not any("s]" in b.split("]")[0] + "]" for b in seq.beats)
