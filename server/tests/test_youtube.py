@@ -330,7 +330,7 @@ def test_a_metadata_rung_manifest_reports_the_cause_before_anything_else():
     assert envelope["rung"] == "metadata"
     assert envelope["degraded"] is True
     assert envelope["note"].startswith("YouTube refused to describe this video")
-    assert "rate-limiting us" in envelope["note"]
+    assert "blocks datacentre addresses" in envelope["note"]
     # The unrelated explanations must not also appear and confuse the cause.
     assert "too short" not in envelope["note"]
     assert "no captions published" not in envelope["note"]
@@ -452,34 +452,27 @@ def test_innertube_refusal_falls_back_to_the_public_preview(monkeypatch):
             url,
         )
 
-    slept: list[float] = []
-
-    async def no_sleep(seconds):
-        slept.append(seconds)
-
     monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
-    # Patched so the suite does not actually wait out the backoff. The DELAYS
-    # are asserted instead, which is the part that could regress.
-    monkeypatch.setattr(yt.asyncio, "sleep", no_sleep)
+    yt._MANIFEST_CACHE.clear()
     manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
 
     assert manifest.client == "oembed"
     assert manifest.title == "Me at the zoo"
     assert manifest.author == "jawed"
     assert manifest.thumbnail_url.endswith("hqdefault.jpg")
-    # Every client, THEN the backoff retries, before settling for the preview.
-    # Measured from the production host, the wall is rate-based rather than
-    # per-video — so giving up on the first refusal permanently downgrades a
-    # study that a retry three seconds later would have served in full.
-    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS) + len(yt._RETRY_DELAYS)
-    assert slept == list(yt._RETRY_DELAYS)
+    # EXACTLY ONE InnerTube call. The wall is keyed to the address, so the
+    # second client shares it and would meet the same refusal — and spending the
+    # request deepens the throttle for the next caller. Measured: a burst of
+    # probing took this host from "ANDROID answers with a storyboard" to "every
+    # client and every HTTP library refuses".
+    assert sum(1 for c in calls if "youtubei" in c) == 1
     # Duration is NOT invented. Every downstream timestamp derives from it.
     assert manifest.duration_s == 0
     assert yt._is_bot_wall(manifest.blocked_reason)
 
     envelope = yt.manifest_envelope(manifest, [], [])
     assert envelope["rung"] == "metadata"
-    assert "rate-limiting us" in envelope["note"]
+    assert "blocks datacentre addresses" in envelope["note"]
 
 
 def test_a_real_permission_failure_is_not_softened_into_retry_advice(monkeypatch):
@@ -498,7 +491,7 @@ def test_a_real_permission_failure_is_not_softened_into_retry_advice(monkeypatch
     manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
     note = yt.manifest_envelope(manifest, [], [])["note"]
     assert "This video is private" in note
-    assert "rate-limiting" not in note
+    assert "blocks datacentre" not in note
 
 
 def test_everything_failing_still_raises(monkeypatch):
@@ -513,30 +506,88 @@ def test_everything_failing_still_raises(monkeypatch):
         asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
 
 
-def test_a_permanent_refusal_is_not_retried(monkeypatch):
-    """Backoff is for the RATE LIMITER only.
+def test_a_permanent_refusal_still_tries_every_client(monkeypatch):
+    """The early exit is for the BOT WALL only.
 
-    A private, deleted or region-blocked video answers identically however many
-    times it is asked, so retrying spends five seconds of an interactive
-    request to reach the same refusal. The reason string is what separates the
-    transient case from the permanent one.
+    The wall is keyed to our address, so every client meets it and fanning out
+    is wasted volume. A permission failure is keyed to the VIDEO, and a second
+    client genuinely can be permitted where the first was not — so that case
+    must still fan out. The reason string is what separates them.
     """
     import app.youtube as yt
 
-    slept: list[float] = []
-
-    async def no_sleep(seconds):
-        slept.append(seconds)
+    calls: list[str] = []
 
     async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
         if "youtubei" in url:
             return ({"playabilityStatus": {"status": "ERROR", "reason": "This video is private"},
                      "videoDetails": {}}, url)
         return ({"title": "T", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
 
     monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
-    monkeypatch.setattr(yt.asyncio, "sleep", no_sleep)
+    yt._MANIFEST_CACHE.clear()
     yt_manifest = asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
 
     assert yt_manifest.client == "oembed"
-    assert slept == []   # no backoff burned on a permanent condition
+    # A permission failure is per-VIDEO, not per-address, so the other client is
+    # worth trying — it is only the bot wall that makes fanning out pointless.
+    assert sum(1 for c in calls if "youtubei" in c) == len(yt._CLIENTS)
+
+
+def test_a_repeated_link_costs_no_requests(monkeypatch):
+    """The only lever that helps: ask less.
+
+    The wall is earned by VOLUME, so a researcher pasting the same link twice,
+    re-running a study, or a colleague studying the same video must not each
+    spend a request. Caching successes is what keeps the budget for links
+    nobody has looked at yet.
+    """
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        return (
+            {
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {"title": "T", "author": "A", "lengthSeconds": "100",
+                                 "shortDescription": "", "viewCount": "5"},
+            },
+            url,
+        )
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    first = asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    second = asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    assert len(calls) == 1
+    assert second is first
+
+    # A DIFFERENT video is not served from the first one's entry.
+    asyncio_run(yt.fetch_manifest("jNQXAC9IVRw"))
+    assert len(calls) == 2
+
+
+def test_a_refusal_is_never_cached(monkeypatch):
+    """Caching a refusal would turn one throttled second into an hour of them,
+    for a link that would have worked on the very next attempt."""
+    import app.youtube as yt
+
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, body=None, user_agent=None, max_bytes=0):
+        calls.append(url)
+        if "youtubei" in url:
+            return ({"playabilityStatus": {"status": "LOGIN_REQUIRED",
+                                           "reason": "Sign in to confirm you’re not a bot"},
+                     "videoDetails": {}}, url)
+        return ({"title": "T", "thumbnail_url": "https://i.ytimg.com/vi/x/hqdefault.jpg"}, url)
+
+    monkeypatch.setattr(yt, "fetch_json", fake_fetch_json)
+    yt._MANIFEST_CACHE.clear()
+    asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    before = len(calls)
+    asyncio_run(yt.fetch_manifest("dQw4w9WgXcQ"))
+    assert len(calls) > before, "a degraded result must not be cached as if it were the answer"
